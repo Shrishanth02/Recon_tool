@@ -1,0 +1,7 @@
+line-length = 100
+target-version = "py311"
+
+[lint]
+# Ignore line-length errors in generated Alembic migrations.
+[lint.per-file-ignores]
+"migrations/**" = ["E501"]

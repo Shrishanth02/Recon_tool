@@ -1,0 +1,108 @@
+# RECON-X — Phase 0 container stack.
+#
+# Services:
+#   postgres  - primary datastore (Phase 0 migrates off SQLite)
+#   redis     - queue/broker backend (used by arq in Phase 2)
+#   backend   - FastAPI API (uvicorn on :8002)
+#   frontend  - static SPA served by nginx (:80), published on host :5173
+#
+# A worker service placeholder is included (commented out) for Phase 2.
+
+services:
+  postgres:
+    image: postgres:16
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: reconx
+      POSTGRES_USER: reconx
+      POSTGRES_PASSWORD: reconx
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      # Exposed for local inspection; the backend reaches it over the compose
+      # network as host "postgres".
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U reconx -d reconx"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  backend:
+    build: ./backend
+    restart: unless-stopped
+    environment:
+      # psycopg v3 driver (matches psycopg[binary] in requirements.txt).
+      DATABASE_URL: postgresql+psycopg://reconx:reconx@postgres:5432/reconx
+      REDIS_URL: redis://redis:6379/0
+      JWT_SECRET: ${JWT_SECRET:-dev-insecure-change-me}
+      DEBUG: ${DEBUG:-false}
+      # Phase 2 execution core & safety gates. The app reads the RECONX_*
+      # aliases; the compose-level names come from .env. Defaults keep the
+      # verified Phase 0/1 inline flow (no queue, no docker sandbox).
+      RECONX_EXECUTION_BACKEND: ${EXECUTION_BACKEND:-inline}
+      RECONX_SANDBOX: ${SANDBOX_MODE:-none}
+      RECONX_REQUIRE_VERIFIED_ASSET: ${REQUIRE_VERIFIED_ASSET:-false}
+      RECONX_BLOCK_PRIVATE_TARGETS: ${BLOCK_PRIVATE_TARGETS:-true}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    ports:
+      - "8002:8002"
+
+  frontend:
+    build:
+      context: ./frontend
+      args:
+        # Browser-facing base URL. The SPA runs in the user's browser, so this
+        # must be reachable from the host, not the compose-internal hostname.
+        VITE_API_BASE: ${VITE_API_BASE:-http://localhost:8002}
+    restart: unless-stopped
+    environment:
+      VITE_API_BASE: ${VITE_API_BASE:-http://localhost:8002}
+    depends_on:
+      - backend
+    ports:
+      - "5173:80"
+
+  # --- Phase 2 background scan worker ----------------------------------------
+  # Pulls scan jobs off Redis and runs them out of process. Built from a
+  # dedicated image that bundles the scanner toolchain (nmap + subfinder /
+  # httpx / nuclei / ffuf). Shares the backend's env, but forces the queue
+  # execution backend regardless of the backend's own EXECUTION_BACKEND.
+  worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile.worker
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgresql+psycopg://reconx:reconx@postgres:5432/reconx
+      REDIS_URL: redis://redis:6379/0
+      JWT_SECRET: ${JWT_SECRET:-dev-insecure-change-me}
+      DEBUG: ${DEBUG:-false}
+      # This service IS the queue backend.
+      RECONX_EXECUTION_BACKEND: queue
+      RECONX_SANDBOX: ${SANDBOX_MODE:-none}
+      RECONX_REQUIRE_VERIFIED_ASSET: ${REQUIRE_VERIFIED_ASSET:-false}
+      RECONX_BLOCK_PRIVATE_TARGETS: ${BLOCK_PRIVATE_TARGETS:-true}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+volumes:
+  postgres_data:

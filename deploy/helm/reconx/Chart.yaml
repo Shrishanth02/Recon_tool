@@ -1,0 +1,13 @@
+apiVersion: v2
+name: reconx
+description: Helm chart for self-hosting RECON-X (on-prem delivery)
+type: application
+version: 0.1.0
+appVersion: "4.0.0"
+keywords:
+  - reconx
+  - self-hosted
+  - on-prem
+home: https://reconx.local
+maintainers:
+  - name: RECON-X Platform Team

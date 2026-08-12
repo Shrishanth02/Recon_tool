@@ -1,0 +1,80 @@
+# RECON-X background scan worker image (Phase 2)
+#
+# Same Python base and app install as backend/Dockerfile, but this image also
+# bundles the SCANNER TOOLCHAIN the worker shells out to:
+#
+#   nmap       - port/service scanner (apt)
+#   subfinder  - passive subdomain enumeration (ProjectDiscovery release binary)
+#   httpx      - fast HTTP probing                (ProjectDiscovery release binary)
+#   nuclei     - templated vulnerability scanning (ProjectDiscovery release binary)
+#   ffuf       - content/parameter fuzzing        (ffuf release binary)
+#
+# The release binaries are version-pinned below and a RUN check verifies each
+# one is present and executable before the image is considered good. The
+# container's entrypoint is the arq worker (arq app.worker.WorkerSettings).
+
+FROM python:3.11-slim
+
+# Don't buffer stdout/stderr (so logs stream straight to docker), don't write
+# .pyc files, and keep pip from caching wheels into the image layer.
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
+
+# --- Pinned scanner toolchain versions -------------------------------------- #
+# Bump deliberately; the verify step below fails the build if a download breaks.
+ARG SUBFINDER_VERSION=2.6.6
+ARG HTTPX_VERSION=1.6.9
+ARG NUCLEI_VERSION=3.3.7
+ARG FFUF_VERSION=2.1.0
+ARG TARGETARCH=amd64
+
+# System dependencies:
+#   nmap             - port/service scanner
+#   ca-certificates  - TLS roots for outbound HTTPS (release downloads + scans)
+#   curl / unzip     - fetch and unpack the release archives (build-time only)
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        nmap \
+        ca-certificates \
+        curl \
+        unzip \
+    && rm -rf /var/lib/apt/lists/*
+
+# Download the pinned scanner release binaries into /usr/local/bin. The three
+# ProjectDiscovery tools ship as .zip, ffuf ships as .tar.gz.
+RUN set -eux; \
+    cd /tmp; \
+    pd_base="https://github.com/projectdiscovery"; \
+    curl -fsSL -o subfinder.zip "${pd_base}/subfinder/releases/download/v${SUBFINDER_VERSION}/subfinder_${SUBFINDER_VERSION}_linux_${TARGETARCH}.zip"; \
+    curl -fsSL -o httpx.zip     "${pd_base}/httpx/releases/download/v${HTTPX_VERSION}/httpx_${HTTPX_VERSION}_linux_${TARGETARCH}.zip"; \
+    curl -fsSL -o nuclei.zip    "${pd_base}/nuclei/releases/download/v${NUCLEI_VERSION}/nuclei_${NUCLEI_VERSION}_linux_${TARGETARCH}.zip"; \
+    curl -fsSL -o ffuf.tar.gz   "https://github.com/ffuf/ffuf/releases/download/v${FFUF_VERSION}/ffuf_${FFUF_VERSION}_linux_${TARGETARCH}.tar.gz"; \
+    unzip -o subfinder.zip subfinder -d /usr/local/bin; \
+    unzip -o httpx.zip     httpx     -d /usr/local/bin; \
+    unzip -o nuclei.zip    nuclei    -d /usr/local/bin; \
+    tar -xzf ffuf.tar.gz -C /usr/local/bin ffuf; \
+    chmod +x /usr/local/bin/subfinder /usr/local/bin/httpx /usr/local/bin/nuclei /usr/local/bin/ffuf; \
+    rm -f /tmp/*.zip /tmp/*.tar.gz
+
+# Fail the build unless every scanner tool is present and executable.
+RUN set -eux; \
+    nmap --version; \
+    subfinder -version; \
+    httpx -version; \
+    nuclei -version; \
+    ffuf -V
+
+WORKDIR /app
+
+# Install Python dependencies first so this layer is cached across code changes.
+COPY requirements.txt ./
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copy the application source.
+COPY . .
+
+# Run the arq worker. It pulls scan jobs off Redis and executes them out of
+# process (settings.EXECUTION_BACKEND == "queue").
+CMD ["arq", "app.worker.WorkerSettings"]

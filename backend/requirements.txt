@@ -1,0 +1,46 @@
+# --- Existing runtime dependencies (scanner engine + API) ---
+fastapi>=0.110
+uvicorn[standard]>=0.27
+websockets>=12
+python-whois>=0.9
+builtwith>=1.3
+requests>=2.31
+
+# --- Persistence / migrations ---
+sqlalchemy>=2.0
+alembic>=1.13
+psycopg[binary]>=3.1
+
+# --- Config / validation ---
+pydantic>=2.6
+pydantic-settings>=2.2
+email-validator>=2.1
+
+# --- Auth (JWT / passwords / MFA) ---
+PyJWT>=2.8
+passlib[bcrypt]>=1.7
+# passlib 1.7.4's bcrypt backend is incompatible with bcrypt>=4.1 (its backend
+# probe raises on the removed __about__ / 72-byte guard). Pin to the last known
+# good release until passlib ships a fix.
+bcrypt<4.1
+pyotp>=2.9
+python-multipart>=0.0.9
+
+# --- Queue scaffold (Phase 2) ---
+redis>=5.0
+arq>=0.25
+
+# --- Asset ownership verification ---
+dnspython>=2.6
+
+# --- Phase 3: billing core ---
+# Both are optional at runtime: app.billing / app.licensing import them lazily
+# and degrade gracefully when absent, so the app still boots without them.
+stripe>=9
+cryptography>=42
+
+# --- Phase 5: enterprise / compliance core ---
+# Optional at runtime: app.observability imports prometheus_client lazily and
+# falls back to no-op metrics + a plain-text /metrics stub when it is absent, so
+# the app still boots and every test passes without it installed.
+prometheus-client>=0.20

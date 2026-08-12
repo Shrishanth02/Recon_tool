@@ -1,0 +1,129 @@
+# Default values for the reconx chart.
+# This is a YAML-formatted file.
+
+# Number of replicas for each workload (overridable per-component below).
+replicaCount: 1
+
+nameOverride: ""
+fullnameOverride: ""
+
+image:
+  pullPolicy: IfNotPresent
+  # Registry-wide pull secrets (list of {name: my-secret}).
+  pullSecrets: []
+
+backend:
+  replicaCount: 1
+  image:
+    repository: registry.reconx.local/reconx-backend
+    tag: "4.0.0"
+  # Container port the backend listens on.
+  containerPort: 8000
+  service:
+    type: ClusterIP
+    port: 8000
+  resources:
+    requests:
+      cpu: 250m
+      memory: 512Mi
+    limits:
+      cpu: "1"
+      memory: 1Gi
+
+frontend:
+  replicaCount: 1
+  image:
+    repository: registry.reconx.local/reconx-frontend
+    tag: "4.0.0"
+  # Container port the frontend listens on.
+  containerPort: 80
+  service:
+    type: ClusterIP
+    port: 80
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      cpu: 500m
+      memory: 256Mi
+
+# Shared service defaults (individual components may override above).
+service:
+  type: ClusterIP
+
+ingress:
+  enabled: false
+  className: nginx
+  annotations: {}
+    # nginx.ingress.kubernetes.io/proxy-body-size: "50m"
+  host: reconx.local
+  # Path routing: frontend serves "/", backend serves "/api".
+  paths:
+    frontend: /
+    backend: /api
+  tls:
+    enabled: false
+    secretName: reconx-tls
+
+# In-cluster PostgreSQL. When enabled, deploy via a dependency/subchart.
+# When disabled, provide externalDatabase.url (or env.databaseUrl) instead.
+postgresql:
+  enabled: true
+  auth:
+    username: reconx
+    password: "change-me"
+    database: reconx
+  # Used to build the in-cluster DATABASE_URL when postgresql.enabled is true.
+  host: reconx-postgresql
+  port: 5432
+
+externalDatabase:
+  # Full connection URL used when postgresql.enabled is false.
+  url: "postgresql://reconx:change-me@postgres.external.local:5432/reconx"
+
+# In-cluster Redis. When enabled, deploy via a dependency/subchart.
+# When disabled, provide externalRedis.url (or env.redisUrl) instead.
+redis:
+  enabled: true
+  host: reconx-redis-master
+  port: 6379
+
+externalRedis:
+  # Full connection URL used when redis.enabled is false.
+  url: "redis://redis.external.local:6379/0"
+
+# Application environment / secrets.
+# Secret values here are placeholders; supply real values via --set,
+# a values override file, or an external secret manager.
+env:
+  # JWT signing secret. Rendered into the chart Secret and consumed
+  # by the backend via a secretKeyRef.
+  jwtSecret: "REPLACE_WITH_JWT_SECRET"
+  # Explicit overrides for the DB / Redis connection strings.
+  # Leave empty to derive them from postgresql/redis or external* blocks.
+  databaseUrl: ""
+  redisUrl: ""
+  # Self-hosted licensing key placeholder.
+  licenseKey: "REPLACE_WITH_LICENSE_KEY"
+  # Extra non-secret env vars injected into the backend via the ConfigMap.
+  extra:
+    LOG_LEVEL: info
+    RECONX_MODE: self-hosted
+
+# Reference an existing Secret instead of rendering templates/secret.yaml.
+# When set, the chart wires env vars to keys in this Secret.
+existingSecret: ""
+
+serviceAccount:
+  create: true
+  name: ""
+  annotations: {}
+
+podAnnotations: {}
+podSecurityContext: {}
+securityContext: {}
+
+nodeSelector: {}
+tolerations: []
+affinity: {}

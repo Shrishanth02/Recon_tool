@@ -1,0 +1,162 @@
+/* ===================================================================
+   RECON-X — design system / global styles
+   =================================================================== */
+
+/* Shape + type tokens are theme-independent. */
+:root {
+  --radius: 12px;
+  --radius-sm: 8px;
+  --font-sans: "Inter", system-ui, -apple-system, "Segoe UI", sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, "Cascadia Code", monospace;
+}
+
+/* -------------------------------------------------------------------
+   LIGHT theme (default) — professional, standard-tool workspace.
+   The sidebar, live console and status bar stay dark (see App.css)
+   for the classic "dark chrome / light content" look.
+   ------------------------------------------------------------------- */
+:root,
+:root[data-theme="light"] {
+  /* surfaces */
+  --bg: #eef1f4;
+  --bg-elev: #f7f9fb;
+  --panel: #ffffff;
+  --panel-2: #eff3f6;
+  --border: #dde3e8;
+  --border-soft: #e8edf1;
+
+  /* text */
+  --text: #14232b;
+  --text-dim: #4c5a63;
+  --text-faint: #7d8a92;
+
+  /* brand / accents (darker teal reads well on light) */
+  --accent: #0d9488;
+  --accent-2: #0284c7;
+  --accent-glow: rgba(13, 148, 136, 0.15);
+  --ok: #059669;
+  --warn: #d97706;
+  --danger: #dc2626;
+  --info: #2563eb;
+  --purple: #7c3aed;
+
+  --shadow: 0 1px 2px rgba(15, 35, 43, 0.05), 0 10px 26px rgba(15, 35, 43, 0.07);
+  --scroll-thumb: #c7d0d7;
+  --scroll-thumb-hover: #a9b5bd;
+  color-scheme: light;
+}
+
+/* -------------------------------------------------------------------
+   DARK theme (toggle) — the full-dark security console.
+   ------------------------------------------------------------------- */
+:root[data-theme="dark"] {
+  --bg: #070a0f;
+  --bg-elev: #0c1119;
+  --panel: #0e141d;
+  --panel-2: #121a25;
+  --border: #1c2533;
+  --border-soft: #161e2a;
+
+  --text: #e6edf3;
+  --text-dim: #9aa7b8;
+  --text-faint: #5b6878;
+
+  --accent: #2dd4bf;
+  --accent-2: #38bdf8;
+  --accent-glow: rgba(45, 212, 191, 0.16);
+  --ok: #34d399;
+  --warn: #fbbf24;
+  --danger: #f87171;
+  --info: #60a5fa;
+  --purple: #a78bfa;
+
+  --shadow: 0 10px 30px rgba(0, 0, 0, 0.45);
+  --scroll-thumb: #1b2432;
+  --scroll-thumb-hover: #28354a;
+  color-scheme: dark;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  background:
+    radial-gradient(1100px 560px at 88% -12%, rgba(13, 148, 136, 0.05), transparent 60%),
+    var(--bg);
+  color: var(--text);
+  font-family: var(--font-sans);
+  font-size: 14px;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+  transition: background-color 0.2s ease, color 0.2s ease;
+}
+
+:root[data-theme="dark"] body {
+  background:
+    radial-gradient(1200px 600px at 80% -10%, rgba(56, 189, 248, 0.06), transparent 60%),
+    radial-gradient(900px 500px at -10% 110%, rgba(45, 212, 191, 0.06), transparent 55%),
+    var(--bg);
+}
+
+h1, h2, h3, h4 {
+  margin: 0;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+}
+
+button {
+  font-family: inherit;
+  cursor: pointer;
+  border: none;
+  background: none;
+  color: inherit;
+}
+
+input,
+select {
+  font-family: inherit;
+  color: var(--text);
+}
+
+::selection {
+  background: var(--accent-glow);
+}
+
+/* scrollbars */
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: var(--scroll-thumb);
+  border-radius: 8px;
+  border: 2px solid transparent;
+  background-clip: padding-box;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: var(--scroll-thumb-hover);
+  background-clip: padding-box;
+}
+
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}
+@keyframes pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.35; }
+}
+@keyframes fadeIn {
+  from { opacity: 0; transform: translateY(4px); }
+  to { opacity: 1; transform: none; }
+}
