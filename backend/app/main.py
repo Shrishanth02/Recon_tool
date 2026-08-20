@@ -16,6 +16,7 @@ Wiring:
 * ``GET /`` and ``GET /health`` are unauthenticated liveness endpoints.
 """
 
+import logging
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, status
@@ -23,7 +24,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
 from sqlalchemy import text
 
-from . import crud, observability
+from . import crud, observability, preflight
 from .config import settings
 from .database import SessionLocal, init_models
 from .middleware import (
@@ -67,6 +68,19 @@ async def lifespan(app: FastAPI):
     observability.configure_logging(json_logs=settings.JSON_LOGS)
     init_models()
     _bootstrap_seed()
+    # Preflight: clearly report which REQUIRED scanner tools are present. Missing
+    # required tools are logged loudly (never silent) but do NOT block startup;
+    # optional tools stay optional. Status is queryable at GET /preflight.
+    preflight.log_startup_report()
+    # P1-H2: never silently ship a non-DEBUG deployment with rate limiting off —
+    # that leaves the auth endpoints open to brute force. Warn loudly (do not
+    # refuse boot, so an operator can still make a deliberate choice).
+    if not settings.DEBUG and not settings.RATE_LIMIT_ENABLED:
+        logging.getLogger("reconx.startup").warning(
+            "SECURITY: rate limiting is DISABLED in a non-DEBUG environment; "
+            "authentication endpoints are unprotected against brute force. "
+            "Set RECONX_RATE_LIMIT_ENABLED=true."
+        )
     yield
 
 
@@ -90,8 +104,13 @@ app.add_middleware(SecurityHeadersMiddleware)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.ALLOWED_ORIGINS,
-    # Accept the Vite dev server on any local port (5173, 5174, …).
-    allow_origin_regex=r"https?://(localhost|127\.0\.0\.1)(:\d+)?",
+    # Trust localhost (any port) ONLY in local dev — a production build must not
+    # reflect credentialed CORS for localhost origins (that lets other local apps
+    # on a victim's machine call the API with the user's session). In prod, only
+    # the explicit ALLOWED_ORIGINS list is honored.
+    allow_origin_regex=(
+        r"https?://(localhost|127\.0\.0\.1)(:\d+)?" if settings.DEBUG else None
+    ),
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -129,6 +148,18 @@ def ready():
     finally:
         db.close()
     return {"status": "ready"}
+
+
+@app.get("/preflight")
+def preflight_status():
+    """Report scanner-tool availability (unauthenticated, read-only).
+
+    Clearly surfaces which REQUIRED scanner binaries are present vs missing and
+    which OPTIONAL ones are installed, so operators can confirm a deployment has
+    the tools the auto-pentest pipeline needs. ``ok`` is True iff every required
+    tool is on PATH. Always 200 (a health/inventory view, never a hard failure).
+    """
+    return preflight.check_tools()
 
 
 @app.get("/metrics")

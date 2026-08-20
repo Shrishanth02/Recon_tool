@@ -41,21 +41,34 @@ export default function ScanForm({
           />
         </div>
 
-        {(tool.options || []).map((opt) => (
-          <div className="field field-select" key={opt.key}>
-            <label>{opt.label}</label>
-            <select
-              value={options[opt.key] ?? opt.default}
-              onChange={(e) => onOptionChange(opt.key, e.target.value)}
-            >
-              {opt.choices.map((c) => (
-                <option key={c.value} value={c.value}>
-                  {c.label}
-                </option>
-              ))}
-            </select>
-          </div>
-        ))}
+        {(tool.options || []).map((opt) =>
+          opt.type === "text" ? (
+            <div className="field" key={opt.key}>
+              <label>{opt.label}</label>
+              <input
+                value={options[opt.key] ?? opt.default ?? ""}
+                onChange={(e) => onOptionChange(opt.key, e.target.value)}
+                placeholder={opt.placeholder || ""}
+                spellCheck={false}
+                autoComplete="off"
+              />
+            </div>
+          ) : (
+            <div className="field field-select" key={opt.key}>
+              <label>{opt.label}</label>
+              <select
+                value={options[opt.key] ?? opt.default}
+                onChange={(e) => onOptionChange(opt.key, e.target.value)}
+              >
+                {opt.choices.map((c) => (
+                  <option key={c.value} value={c.value}>
+                    {c.label}
+                  </option>
+                ))}
+              </select>
+            </div>
+          )
+        )}
 
         {isRunning ? (
           <button type="button" className="btn btn-stop" onClick={onStop}>

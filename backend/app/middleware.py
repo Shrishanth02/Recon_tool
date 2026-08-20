@@ -26,7 +26,7 @@ from starlette.responses import JSONResponse, Response
 
 from . import observability
 from .config import settings
-from .ratelimit import TokenBucketRateLimiter
+from . import ratelimit
 
 __all__ = [
     "SecurityHeadersMiddleware",
@@ -35,7 +35,9 @@ __all__ = [
 ]
 
 # Paths that infrastructure probes hit; never rate-limited.
-_RATE_LIMIT_EXEMPT: frozenset[str] = frozenset({"/health", "/ready", "/metrics"})
+_RATE_LIMIT_EXEMPT: frozenset[str] = frozenset(
+    {"/health", "/ready", "/metrics", "/preflight"}
+)
 
 _REQUEST_ID_HEADER = "X-Request-ID"
 
@@ -147,50 +149,36 @@ class RequestContextMiddleware(BaseHTTPMiddleware):
 
 
 class RateLimitMiddleware(BaseHTTPMiddleware):
-    """In-memory per-client token-bucket rate limiting (opt-in).
+    """Distributed (Redis-backed) per-category rate limiting.
 
-    A no-op unless ``settings.RATE_LIMIT_ENABLED`` is set. The client key is the
-    authenticated principal when a bearer/API-key credential is present (so a
-    single tenant behind a shared NAT is not throttled as one), otherwise the
-    peer IP. Exempt paths bypass the limiter entirely.
+    A no-op unless ``settings.RATE_LIMIT_ENABLED``. Each request is classified
+    into an ``auth`` / ``scan`` / ``general`` bucket (see
+    :func:`app.ratelimit.classify_path`) and limited per CLIENT IP so N backend
+    processes sharing Redis enforce one shared budget. The client IP is resolved
+    proxy-aware (``X-Forwarded-For`` is trusted only from a configured trusted
+    proxy). If Redis is down, ``general`` fails open while ``auth``/``scan`` fall
+    back to a per-process limiter — a Redis outage never becomes an app outage,
+    and auth is never left unlimited. Exempt paths (health probes) bypass it.
 
-    The underlying :class:`~app.ratelimit.TokenBucketRateLimiter` is created
-    lazily and rebuilt if ``RATE_LIMIT_PER_MINUTE`` changes at runtime.
+    The bucket is keyed by IP (not account) on purpose: it avoids letting an
+    attacker lock out a victim's account and avoids a user-enumeration side
+    channel — the 429 is identical whether or not the account exists.
     """
-
-    def __init__(self, app) -> None:
-        super().__init__(app)
-        self._limiter: TokenBucketRateLimiter | None = None
-        self._configured_rate: int | None = None
-
-    def _get_limiter(self) -> TokenBucketRateLimiter:
-        rate = int(settings.RATE_LIMIT_PER_MINUTE)
-        if self._limiter is None or self._configured_rate != rate:
-            self._limiter = TokenBucketRateLimiter(rate_per_minute=rate)
-            self._configured_rate = rate
-        return self._limiter
-
-    @staticmethod
-    def _client_key(request: Request) -> str:
-        # Prefer a stable per-credential key so shared egress IPs aren't lumped
-        # together. We only read the raw header value (no DB lookup) to keep the
-        # hot path cheap; it is a bucketing key, not an authorization decision.
-        api_key = request.headers.get("x-api-key")
-        if api_key:
-            return f"key:{api_key[:24]}"
-        auth = request.headers.get("authorization")
-        if auth and auth.lower().startswith("bearer "):
-            return f"tok:{auth[7:].strip()[:32]}"
-        client = request.client
-        return f"ip:{client.host if client else 'unknown'}"
 
     async def dispatch(self, request: Request, call_next) -> Response:
         if not settings.RATE_LIMIT_ENABLED:
             return await call_next(request)
-        if request.url.path in _RATE_LIMIT_EXEMPT:
+        path = request.url.path
+        if path in _RATE_LIMIT_EXEMPT:
             return await call_next(request)
 
-        decision = self._get_limiter().check(self._client_key(request))
+        category = ratelimit.classify_path(path)
+        ip = ratelimit.resolve_client_ip(
+            request.client.host if request.client else None,
+            request.headers.get("x-forwarded-for"),
+            settings.rate_limit_trusted_proxies,
+        )
+        decision, _mode = ratelimit.limiter().check(category, ip)
         if not decision.allowed:
             retry_after = max(1, int(decision.retry_after + 0.999))
             return JSONResponse(
@@ -205,7 +193,5 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
 
         response = await call_next(request)
         response.headers.setdefault("X-RateLimit-Limit", str(decision.limit))
-        response.headers.setdefault(
-            "X-RateLimit-Remaining", str(decision.remaining)
-        )
+        response.headers.setdefault("X-RateLimit-Remaining", str(decision.remaining))
         return response

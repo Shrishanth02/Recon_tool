@@ -15,14 +15,136 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      - name: Install dependencies
-        run: pip install -r requirements.txt -r requirements-dev.txt
+      # Reproducible install from the fully-pinned, hash-verified locks (generated
+      # by pip-compile from the .in files). --require-hashes refuses any package
+      # whose artifact hash doesn't match, so CI never silently installs a
+      # different or tampered version.
+      - name: Install dependencies (locked + hash-verified)
+        run: pip install --require-hashes -r requirements.txt -r requirements-dev.txt
+      # Dependency-security policy: FAIL the build on any known vulnerability in a
+      # PRODUCTION dependency (requirements.txt). Development-only tooling
+      # (requirements-dev.txt) is intentionally NOT gated here, so a dev-tool
+      # advisory can never make CI permanently red. To accept an unavoidable or
+      # false-positive advisory, add `--ignore-vuln <ID>` below with a comment
+      # explaining why — never by loosening a version constraint.
+      - name: Dependency security audit (pip-audit, production lock)
+        run: |
+          pip install pip-audit
+          # FAIL the build on any NEW advisory affecting a production dependency.
+          # The reviewed pre-existing baseline (with rationale + fix versions)
+          # lives in .pip-audit-ignores and is tracked for upgrade; dev-only
+          # tooling (requirements-dev.txt) is intentionally not gated here.
+          IGNORES=$(grep -vE '^[[:space:]]*#|^[[:space:]]*$' .pip-audit-ignores | sed 's/^/--ignore-vuln /' | tr '\n' ' ')
+          pip-audit --no-deps --requirement requirements.txt $IGNORES --desc
       - name: Lint (ruff)
         run: ruff check .
       - name: Test (pytest)
         env:
           DATABASE_URL: sqlite:///./test.db
         run: pytest -q
+
+  # ------------------------------------------------------------------------- #
+  # PostgreSQL migration & schema-compatibility gate (P1-H4).
+  #
+  # SQLite compatibility does NOT prove PostgreSQL compatibility, so this job
+  # exercises the PRODUCTION database engine end-to-end:
+  #   1. spins up a real PostgreSQL service (CI infrastructure — NOT local Docker)
+  #      and waits until it is healthy,
+  #   2. runs the full Alembic chain from an EMPTY database to head,
+  #   3. asserts the final revision equals head (no skipped/partial migration),
+  #   4. boots the application against the migrated schema with create_all
+  #      DISABLED — proving Alembic alone produces a schema the app can run on,
+  #   5. runs the dedicated migration test-suite against PostgreSQL (fresh
+  #      upgrade, ORM/schema parity WITHOUT create_all, existing-data migration),
+  #   6. runs the relevant DB/application tests against PostgreSQL.
+  #
+  # The job FAILS (never silently passes) if a migration fails, the head is
+  # wrong, the app cannot connect, or the schema is missing something.
+  postgres:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: reconx
+          POSTGRES_PASSWORD: reconx
+          POSTGRES_DB: reconx
+        ports:
+          - 5432:5432
+        # Gate every step below on the DB actually being ready to accept
+        # connections — no arbitrary sleeps, no "connection refused" flakes.
+        options: >-
+          --health-cmd "pg_isready -U reconx -d reconx"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 15
+    env:
+      # A strong, clearly-fake secret so the non-DEBUG JWT fail-closed guard is
+      # satisfied when `import app.config` runs (alembic + app boot). Never real.
+      JWT_SECRET: reconx-ci-postgres-secret-not-for-production-0123456789
+      APP_DB_URL: postgresql+psycopg://reconx:reconx@localhost:5432/reconx
+      MIG_DB_URL: postgresql+psycopg://reconx:reconx@localhost:5432/reconx_migrations
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install dependencies (locked + hash-verified)
+        run: pip install --require-hashes -r requirements.txt -r requirements-dev.txt
+      # A DEDICATED empty database for the from-scratch migration checks, kept
+      # separate from the app-suite database so neither can clobber the other.
+      - name: Create dedicated migration database
+        run: PGPASSWORD=reconx psql -h localhost -U reconx -d reconx -v ON_ERROR_STOP=1 -c "CREATE DATABASE reconx_migrations;"
+      # (2) Migrate a TRULY EMPTY Postgres database from the initial revision to
+      # head. A failing migration fails the build here.
+      - name: Alembic upgrade head (from an empty PostgreSQL database)
+        env:
+          DATABASE_URL: ${{ env.MIG_DB_URL }}
+        run: alembic upgrade head
+      # (3) The applied head must equal the scripts' head — catches a partial or
+      # skipped migration that would otherwise leave the schema behind.
+      - name: Verify applied revision equals head
+        env:
+          DATABASE_URL: ${{ env.MIG_DB_URL }}
+        run: |
+          alembic current 2>&1 | tee current.txt
+          grep -q "0013_finding_correlation (head)" current.txt
+      # (4) The app must BOOT and operate against the migrated schema with
+      # create_all DISABLED — Alembic is the sole schema authority. Registration
+      # writes across organizations/users/workspaces/memberships.
+      - name: Application starts against the migrated DB (create_all disabled)
+        env:
+          DATABASE_URL: ${{ env.MIG_DB_URL }}
+          RECONX_DB_AUTO_CREATE: "false"
+          RECONX_RATE_LIMIT_ENABLED: "false"
+        run: |
+          python - <<'PY'
+          import uuid
+          from fastapi.testclient import TestClient
+          from app.main import app
+          with TestClient(app) as c:
+              email = "ci-%s@example.com" % uuid.uuid4().hex[:8]
+              r = c.post("/auth/register", json={"email": email, "password": "password123", "full_name": "CI"})
+              assert r.status_code == 201, (r.status_code, r.text)
+          print("APP_STARTS_OK")
+          PY
+      # (5) The dedicated Alembic migration test-suite AGAINST PostgreSQL: fresh
+      # upgrade-from-empty, ORM/schema parity WITHOUT create_all, and existing-
+      # data migration. RECONX_PG_TEST_URL activates the @pytest.mark.postgres
+      # variants that are skipped locally as PENDING CI POSTGRES VERIFICATION.
+      - name: Migration tests (PostgreSQL)
+        env:
+          RECONX_PG_TEST_URL: ${{ env.MIG_DB_URL }}
+        run: pytest tests/test_migrations.py -v -m postgres
+      # (6) Relevant DB/application tests exercised against the PRODUCTION engine
+      # (not SQLite). conftest honours RECONX_TEST_DATABASE_URL.
+      - name: Database/application tests (PostgreSQL)
+        env:
+          RECONX_TEST_DATABASE_URL: ${{ env.APP_DB_URL }}
+        run: pytest tests/test_auth.py tests/test_scans.py tests/test_scheduled_scan_security.py tests/test_pipeline_p0.py tests/test_pipeline_session_isolation.py -q
 
   frontend:
     runs-on: ubuntu-latest

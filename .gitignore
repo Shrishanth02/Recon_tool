@@ -8,10 +8,18 @@ venv/
 # Environment / secrets
 .env
 
-# Databases
+# Databases, backups & dumps (never commit real data)
 *.db
 *.sqlite
 *.sqlite3
+*.bak
+*.bak-*
+*.backup
+*.sql
+
+# Generated reports (may contain findings / client PII)
+_purple_report.html
+*_report.html
 
 # Logs
 *.log
@@ -27,3 +35,9 @@ frontend/dist/
 # OS
 .DS_Store
 Thumbs.db
+
+# External products / client deliverables — never commit (large + sensitive).
+# Kept in the working tree for convenience; ideally relocate out of the repo.
+/SOC Tool/
+docs/*.pdf
+docs/*.docx

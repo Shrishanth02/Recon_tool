@@ -9,7 +9,10 @@ the database.
 from datetime import datetime
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, EmailStr, Field
+from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator
+
+from .branding import is_hex_color, is_safe_logo_url
+from .severity import normalize_severity
 
 Role = Literal["owner", "admin", "analyst", "viewer"]
 Severity = Literal["critical", "high", "medium", "low", "info"]
@@ -233,6 +236,87 @@ class FindingOut(ORMModel):
     cvss: float | None = None
     status: FindingStatus
     created_at: datetime
+    # Purple-Team P1: MITRE ATT&CK mapping (NULL when the tool is unmapped or the
+    # finding predates P1). ``technique_id`` is e.g. "T1046"; ``tactic`` is the
+    # tactic id e.g. "discovery".
+    technique_id: str | None = None
+    tactic: str | None = None
+    # --- P0: detection tier / classification / confidence / evidence -------- #
+    # ``detection_tier`` is the SIGNAL | VALIDATED | EXPLOITED trust level;
+    # ``kind`` is vuln | hardening | recon | info; ``confidence`` is 0-100;
+    # ``evidence`` holds source-specific supporting data (never invented).
+    detection_tier: str = "signal"
+    kind: str = "vuln"
+    confidence: int = 50
+    evidence: dict = Field(default_factory=dict)
+    seen_count: int = 1
+    # --- P1: cross-scanner correlation ------------------------------------- #
+    # ``correlation_id`` groups same-issue findings; ``related`` lists the other
+    # scanner results supporting this one ([{id, source, name}]).
+    correlation_id: str | None = None
+    related: list = Field(default_factory=list)
+
+    @field_validator("severity", mode="before")
+    @classmethod
+    def _normalize_severity(cls, v):
+        """Coerce any stored/scanner severity to a valid canonical value.
+
+        A finding persisted with an out-of-vocabulary severity (e.g. nuclei's
+        ``"unknown"``, an empty string, or NULL) would otherwise fail the strict
+        ``Severity`` Literal and 500 the ENTIRE findings/report/risk/triage
+        surface. Normalizing here means one malformed finding degrades to a safe
+        ``info`` instead of taking down the whole workspace. The original value,
+        when it was written, is preserved in ``evidence.raw_severity``.
+        """
+        return normalize_severity(v)
+
+    @field_validator("cve", "cwe", mode="before")
+    @classmethod
+    def _coerce_id_list(cls, v):
+        """Tolerate legacy rows where cve/cwe was stored as a bare scalar.
+
+        Findings persisted before cve/cwe were normalized to lists may hold a
+        single string (e.g. ``"CWE-693"``) or ``None``. Coerce any scalar to a
+        one-element list so serializing an old finding can never 500 the whole
+        findings/report endpoint. New writes already store proper lists.
+        """
+        if v is None:
+            return []
+        if isinstance(v, (list, tuple)):
+            return list(v)
+        return [str(v)]
+
+    # Legacy rows created before these columns existed can surface as NULL;
+    # collapse each to its safe default rather than failing serialization.
+    @field_validator("detection_tier", mode="before")
+    @classmethod
+    def _default_tier(cls, v):
+        return v or "signal"
+
+    @field_validator("kind", mode="before")
+    @classmethod
+    def _default_kind(cls, v):
+        return v or "vuln"
+
+    @field_validator("confidence", mode="before")
+    @classmethod
+    def _default_confidence(cls, v):
+        return 50 if v is None else v
+
+    @field_validator("seen_count", mode="before")
+    @classmethod
+    def _default_seen(cls, v):
+        return 1 if v is None else v
+
+    @field_validator("evidence", mode="before")
+    @classmethod
+    def _default_evidence(cls, v):
+        return v if isinstance(v, dict) else {}
+
+    @field_validator("related", mode="before")
+    @classmethod
+    def _default_related(cls, v):
+        return v if isinstance(v, (list, tuple)) else []
 
 
 class FindingPatchIn(BaseModel):
@@ -471,6 +555,45 @@ class BrandingIn(BaseModel):
     report_footer: str | None = None
     sso_default_role: Role | None = None
 
+    @field_validator("brand_primary_color", mode="before")
+    @classmethod
+    def _validate_brand_color(cls, v):
+        """Reject anything that is not a plain hex color at the write boundary.
+
+        The value is rendered inside a report ``<style>`` block, so it is treated
+        as untrusted: only a hex color may be stored. ``None``/empty clears it
+        (the report falls back to its default). A CSS-injection / ``</style>`` /
+        ``url()`` / ``javascript:`` / SVG payload can never match and is rejected
+        with 422 rather than being persisted.
+        """
+        if v is None:
+            return None
+        s = str(v).strip()
+        if not s:
+            return None
+        if is_hex_color(s):
+            return s.lower()
+        raise ValueError("brand_primary_color must be a hex color, e.g. #0d9488")
+
+    @field_validator("brand_logo_url", mode="before")
+    @classmethod
+    def _validate_brand_logo(cls, v):
+        """Restrict the logo URL to a safe scheme (http(s) or raster data:image).
+
+        Blocks ``javascript:``, ``data:text/html`` and ``data:image/svg+xml``
+        (SVG can carry script). ``None``/empty clears it.
+        """
+        if v is None:
+            return None
+        s = str(v).strip()
+        if not s:
+            return None
+        if is_safe_logo_url(s):
+            return s
+        raise ValueError(
+            "brand_logo_url must be an http(s) URL or a data:image/* (non-SVG) URI"
+        )
+
 
 class BrandingOut(ORMModel):
     """An org's current branding settings."""
@@ -506,3 +629,296 @@ class OrgExportOut(BaseModel):
     exported_at: str | None = None
 
     model_config = ConfigDict(extra="allow")
+
+
+# --------------------------------------------------------------------------- #
+# Purple-Team P1: MITRE ATT&CK coverage matrix
+# --------------------------------------------------------------------------- #
+class AttackCoverageOut(BaseModel):
+    """The workspace's MITRE ATT&CK coverage matrix.
+
+    Deliberately loose/dict-friendly: the payload produced by
+    :func:`app.crud.attack_coverage` is passed through verbatim. Only tactics and
+    techniques with at least one finding are present; ``tactics`` is ordered by
+    the ATT&CK kill-chain, and each tactic's ``techniques`` carry a per-severity
+    breakdown.
+    """
+
+    tactics: list[dict[str, Any]] = Field(default_factory=list)
+    total_techniques: int = 0
+    total_findings: int = 0
+
+    model_config = ConfigDict(extra="allow")
+
+
+# --------------------------------------------------------------------------- #
+# Purple-Team P2: SAFE ATT&CK emulation
+# --------------------------------------------------------------------------- #
+class EmulationRunIn(BaseModel):
+    """Request body for launching a SAFE ATT&CK emulation.
+
+    ``target`` is the authorized host/URL to emulate against (scope + netguard +
+    billing gated by the router). ``techniques`` optionally restricts the run to
+    specific emulation ids (``["E1", "E4"]``); when omitted the whole registry
+    runs.
+    """
+
+    target: str = Field(min_length=1, max_length=500)
+    techniques: list[str] | None = None
+
+
+class TechniqueResultOut(ORMModel):
+    """One emulated ATT&CK technique's outcome within an emulation run."""
+
+    id: int
+    emulation_run_id: int
+    technique_id: str
+    technique_name: str = ""
+    tactic: str = ""
+    status: str
+    evidence: str = ""
+    detail: str = ""
+    created_at: datetime
+
+
+class EmulationRunOut(ORMModel):
+    """A SAFE emulation run with its ordered per-technique results."""
+
+    id: int
+    workspace_id: int
+    created_by: int | None = None
+    target: str
+    status: str
+    executed: int = 0
+    blocked: int = 0
+    failed: int = 0
+    summary: dict[str, Any] = Field(default_factory=dict)
+    started_at: datetime | None = None
+    finished_at: datetime | None = None
+    created_at: datetime
+    technique_results: list[TechniqueResultOut] = Field(default_factory=list)
+
+
+# --------------------------------------------------------------------------- #
+# Purple-Team P3: detection connectors + correlation (BLUE side)
+# --------------------------------------------------------------------------- #
+ConnectorType = Literal["mock", "http", "splunk", "elastic"]
+
+
+class DetectionConnectorIn(BaseModel):
+    """Request body for creating a detection connector.
+
+    ``ctype`` selects the SIEM/EDR implementation; ``config`` carries the
+    type-specific settings and may contain secrets (tokens, API keys). Secrets
+    are accepted here but never echoed back by :class:`DetectionConnectorOut`.
+    """
+
+    name: str = Field(min_length=1, max_length=200)
+    ctype: ConnectorType
+    config: dict[str, Any] = Field(default_factory=dict)
+    enabled: bool = True
+
+
+# Config keys whose values are secret and must never be echoed back. Their
+# presence is reported via ``config_keys``; their value is masked in ``config``.
+_SECRET_CONFIG_KEYS: frozenset[str] = frozenset(
+    {"token", "api_key", "auth", "password", "secret", "headers"}
+)
+
+
+class DetectionConnectorOut(ORMModel):
+    """A detection connector as returned to the API — secrets are masked.
+
+    The raw ``config`` is **never** echoed. Instead:
+
+    * ``config_keys`` lists the configured keys (so the UI can show what's set),
+    * ``config`` is a redacted copy where secret-bearing keys are replaced with
+      the string ``"***"`` and non-secret scalars are passed through.
+    """
+
+    id: int
+    org_id: int
+    name: str
+    ctype: str
+    enabled: bool
+    created_at: datetime
+    config_keys: list[str] = Field(default_factory=list)
+    config: dict[str, Any] = Field(default_factory=dict)
+
+    @classmethod
+    def from_connector(cls, connector: Any) -> "DetectionConnectorOut":
+        """Build a masked view from a :class:`~app.models.DetectionConnector`."""
+        raw = dict(getattr(connector, "config", None) or {})
+        redacted: dict[str, Any] = {}
+        for key, value in raw.items():
+            if key in _SECRET_CONFIG_KEYS:
+                redacted[key] = "***"
+            elif isinstance(value, (str, int, float, bool)) or value is None:
+                redacted[key] = value
+            else:
+                # Nested/complex values may themselves carry secrets — mask them.
+                redacted[key] = "***"
+        return cls(
+            id=connector.id,
+            org_id=connector.org_id,
+            name=connector.name,
+            ctype=connector.ctype,
+            enabled=connector.enabled,
+            created_at=connector.created_at,
+            config_keys=sorted(raw.keys()),
+            config=redacted,
+        )
+
+
+class DetectionResultOut(ORMModel):
+    """One technique's detection verdict within an emulation run."""
+
+    id: int
+    emulation_run_id: int
+    connector_id: int | None = None
+    technique_id: str
+    technique_name: str = ""
+    tactic: str = ""
+    detected: bool
+    count: int = 0
+    source: str = ""
+    evidence: str = ""
+    created_at: datetime
+
+
+class DetectionSummaryOut(BaseModel):
+    """The aggregate detection-coverage summary for a validation run."""
+
+    total: int = 0
+    detected: int = 0
+    missed: int = 0
+    coverage_pct: int = 0
+    window_seconds: int = 0
+    source: str = ""
+
+
+class DetectionValidateOut(BaseModel):
+    """The envelope returned by the validate endpoint: results + summary."""
+
+    results: list[DetectionResultOut] = Field(default_factory=list)
+    summary: DetectionSummaryOut = Field(default_factory=DetectionSummaryOut)
+
+
+# --------------------------------------------------------------------------- #
+# Purple-Team P4: continuous purple loop + coverage dashboard
+# --------------------------------------------------------------------------- #
+class PurpleRunIn(BaseModel):
+    """Request body for a continuous purple run.
+
+    ``target`` is the authorized host/URL (scope + netguard + billing gated by
+    the router). ``connector_id`` optionally selects the same-org detection
+    connector to validate against — when omitted the run only emulates (no
+    detection scoring). ``techniques`` optionally restricts the emulation to
+    specific ids (``["E1", "E4"]``).
+    """
+
+    target: str = Field(min_length=1, max_length=500)
+    connector_id: int | None = None
+    techniques: list[str] | None = None
+
+
+class PurpleRunOut(BaseModel):
+    """The envelope returned by the purple-run endpoint.
+
+    ``summary`` is the loose engine summary (emulation tallies plus, when
+    validated, ``detected``/``missed``/``coverage_pct`` and the ``drift`` key).
+    ``drift`` surfaces the dispatched drift event (or ``None``) at the top level
+    for convenience; it is the same object as ``summary["drift"]``.
+    """
+
+    emulation_run: EmulationRunOut
+    detections: list[DetectionResultOut] = Field(default_factory=list)
+    summary: dict[str, Any] = Field(default_factory=dict)
+    drift: dict[str, Any] | None = None
+
+
+class CoverageDashboardOut(BaseModel):
+    """The continuous-purple coverage dashboard (dict-friendly / loose).
+
+    Shapes mirror :func:`app.crud.coverage_dashboard`; nested rows are left as
+    open dicts so the engine can evolve fields without a schema churn.
+    """
+
+    summary: dict[str, Any] = Field(default_factory=dict)
+    techniques: list[dict[str, Any]] = Field(default_factory=list)
+    tactics: list[dict[str, Any]] = Field(default_factory=list)
+    trend: list[dict[str, Any]] = Field(default_factory=list)
+    gaps: list[dict[str, Any]] = Field(default_factory=list)
+
+
+class PentestRunOut(ORMModel):
+    """A single auto-pentest run summary for the Purple Team history view."""
+
+    id: int
+    workspace_id: int
+    target: str
+    status: str
+    risk_score: int
+    risk_label: str
+    summary: dict[str, Any] = Field(default_factory=dict)
+    started_at: datetime | None = None
+    finished_at: datetime | None = None
+    created_at: datetime | None = None
+
+
+class PentestRunDetailOut(PentestRunOut):
+    """A run WITH its full stage-by-stage process, for the history detail view."""
+
+    process: dict[str, Any] = Field(default_factory=dict)
+
+
+# --------------------------------------------------------------------------- #
+# Purple-Team P5: human-gated, non-destructive exploitation proposals
+# --------------------------------------------------------------------------- #
+class ExploitProposalOut(ORMModel):
+    """A single human-gated, non-destructive exploitation proposal.
+
+    Read straight off :class:`app.models.ExploitProposal`. ``result`` is the
+    recorded probe evidence once the (approved) proposal has been executed, or
+    ``None`` while it is still proposed/approved/rejected.
+    """
+
+    id: int
+    workspace_id: int
+    finding_id: int | None = None
+    technique_id: str | None = None
+    title: str = ""
+    rationale: str = ""
+    status: str = "proposed"
+    created_by: int | None = None
+    approved_by: int | None = None
+    result: dict[str, Any] | None = None
+    created_at: datetime
+    updated_at: datetime
+
+
+class ProposeOut(BaseModel):
+    """The envelope returned when the exploit engine proposes probes."""
+
+    proposals: list[ExploitProposalOut] = Field(default_factory=list)
+
+
+class ExecuteIn(BaseModel):
+    """Request body for executing an approved proposal's SAFE validation probe.
+
+    ``target`` is the authorized host/URL the benign probe runs against; the
+    router scope + netguard gates it before :func:`app.exploit.execute` acts.
+    """
+
+    target: str = Field(min_length=1, max_length=500)
+
+
+class ExecuteOut(BaseModel):
+    """The envelope returned after executing an approved proposal.
+
+    ``proposal`` is the (now ``executed``/``failed``) proposal row and ``result``
+    is the recorded non-destructive probe evidence dict.
+    """
+
+    proposal: ExploitProposalOut
+    result: dict[str, Any] = Field(default_factory=dict)

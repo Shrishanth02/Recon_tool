@@ -1,0 +1,67 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% block title %}{{ store.name }}{% endblock %} · {{ store.name }}</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+</head>
+<body>
+  <header class="site-header">
+    <div class="header-inner">
+      <a class="brand" href="{{ url_for('index') }}">
+        <span class="brand-mark">⚡</span>
+        <span class="brand-name">{{ store.name }}</span>
+      </a>
+
+      <form class="search" action="{{ url_for('search') }}" method="get" role="search">
+        <input type="search" name="q" placeholder="Search products…" aria-label="Search products">
+        <button type="submit" aria-label="Search">🔍</button>
+      </form>
+
+      <nav class="header-nav">
+        {% if current_user %}
+          <a href="{{ url_for('account') }}" class="nav-link">Hi, {{ current_user }}</a>
+          <a href="{{ url_for('logout') }}" class="nav-link">Logout</a>
+        {% else %}
+          <a href="{{ url_for('login') }}" class="nav-link">Sign in</a>
+        {% endif %}
+        <a href="{{ url_for('cart') }}" class="nav-cart" aria-label="Cart">
+          🛒 <span class="cart-badge" id="cart-badge">{{ cart_count }}</span>
+        </a>
+      </nav>
+    </div>
+
+    <div class="catbar">
+      <div class="catbar-inner">
+        <a href="{{ url_for('index') }}" class="cat-pill {{ 'active' if not request.args.get('category') }}">All</a>
+        {% for c in categories %}
+          <a href="{{ url_for('index', category=c) }}"
+             class="cat-pill {{ 'active' if request.args.get('category') == c }}">{{ c }}</a>
+        {% endfor %}
+      </div>
+    </div>
+  </header>
+
+  <main class="content">
+    {% block body %}{% endblock %}
+  </main>
+
+  <footer class="site-footer">
+    <div class="footer-inner">
+      <div>
+        <strong>{{ store.name }}</strong> — {{ store.tagline }}
+        <p class="footer-warn">⚠️ Intentionally vulnerable demo app for security-tool testing. Do not deploy publicly.</p>
+      </div>
+      <div class="footer-links">
+        <a href="{{ url_for('api_products') }}">API</a>
+        <a href="/robots.txt">robots.txt</a>
+        <a href="{{ url_for('admin') }}">Admin</a>
+      </div>
+    </div>
+  </footer>
+
+  <script src="{{ url_for('static', filename='js/main.js') }}"></script>
+  {% block scripts %}{% endblock %}
+</body>
+</html>

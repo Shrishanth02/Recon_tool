@@ -8,15 +8,19 @@ from typing import Iterator, Optional
 
 from .base import clean_target, error, log, result, stream_command
 
+# -Pn ("treat host as up, skip ping discovery") is on EVERY profile: real targets
+# — especially anything behind a CDN/WAF/firewall — routinely drop ICMP/ping
+# probes, which makes a ping-first nmap wrongly report "host down" and scan
+# nothing. -Pn is the standard pentest default so those hosts still get scanned.
 SCAN_PROFILES = {
-    "quick": ["-T4", "-F"],
-    "service": ["-sV", "-T4"],
+    "quick": ["-T4", "-F", "-Pn"],
+    "service": ["-sV", "-T4", "-Pn"],
     "full": ["-p-", "-sV", "--min-rate", "1000", "-T4", "-Pn", "--stats-every", "2s"],
     "aggressive": [
         "-A", "-sV", "--version-intensity", "5", "-O",
         "--script=default,safe", "-T4", "-Pn", "--stats-every", "2s",
     ],
-    "os": ["-O"],
+    "os": ["-O", "-Pn"],
     "udp": ["-sU", "--top-ports", "20", "--max-retries", "1", "-T4", "-Pn"],
 }
 
@@ -58,6 +62,13 @@ def _parse_xml(xml_text: str, scan_type: str) -> dict:
                 item["version"] = (
                     service.attrib.get("version", "") if service is not None else ""
                 )
+                # nmap emits one or more <cpe> children for a fingerprinted
+                # service (e.g. cpe:/a:openbsd:openssh:8.2p1). Keep them: they are
+                # the strongest evidence for a version->CVE match downstream.
+                if service is not None:
+                    cpes = [c.text for c in service.findall("cpe") if c.text]
+                    if cpes:
+                        item["cpe"] = cpes
             ports.append(item)
 
     extra = {}

@@ -9,6 +9,7 @@ import {
 } from "react";
 import {
   authHeader,
+  createWorkspace,
   fetchMe,
   fetchWorkspaces,
   loginUser,
@@ -173,6 +174,23 @@ export function AuthProvider({ children }) {
     setActiveWorkspace((cur) => list.find((w) => w.id === cur?.id) || cur);
   }, [activeOrg]);
 
+  // Create a new engagement (workspace) in the active org, then re-pull the
+  // list and make the new one active — all atomically, so callers never race a
+  // stale `workspaces` closure. Returns the newly-active workspace.
+  const createEngagement = useCallback(
+    async ({ name, description = "", scope = [] }) => {
+      if (!activeOrg) return null;
+      const created = await createWorkspace(activeOrg.id, { name, description, scope });
+      const list = await fetchWorkspaces(activeOrg.id);
+      setWorkspaces(list);
+      const chosen = list.find((w) => w.id === created.id) || created;
+      setActiveWorkspace(chosen);
+      writeLS(LS.ws, chosen.id);
+      return chosen;
+    },
+    [activeOrg]
+  );
+
   // ---- 401 -> silent refresh (registered once) --------------------------- //
   useEffect(() => {
     setUnauthorizedHandler(async () => {
@@ -242,6 +260,7 @@ export function AuthProvider({ children }) {
       selectOrg,
       selectWorkspace,
       refreshWorkspaces,
+      createEngagement,
       authHeader,
     }),
     [
@@ -257,6 +276,7 @@ export function AuthProvider({ children }) {
       selectOrg,
       selectWorkspace,
       refreshWorkspaces,
+      createEngagement,
     ]
   );
 

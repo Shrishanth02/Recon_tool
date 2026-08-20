@@ -1,0 +1,44 @@
+{% extends "base.html" %}
+{% block title %}{{ p['name'] }}{% endblock %}
+{% block body %}
+
+<nav class="crumbs"><a href="{{ url_for('index') }}">Home</a> / <a href="{{ url_for('index', category=p['category']) }}">{{ p['category'] }}</a> / <span>{{ p['name'] }}</span></nav>
+
+<section class="product">
+  <div class="product-media">
+    <img class="product-img" src="{{ url_for('static', filename='img/' ~ (p['image'] or 'box') ~ '.svg') }}" alt="{{ p['name'] }}">
+    {% if p['badge'] %}<span class="badge">{{ p['badge'] }}</span>{% endif %}
+  </div>
+  <div class="product-info">
+    <span class="card-cat">{{ p['category'] }}</span>
+    <h1>{{ p['name'] }}</h1>
+    <div class="price price-lg">${{ '%.2f'|format(p['price']) }}</div>
+    <p class="stock {{ 'low' if p['stock'] < 10 }}">
+      {% if p['stock'] > 0 %}In stock — {{ p['stock'] }} available{% else %}Out of stock{% endif %}
+    </p>
+    <p class="desc">{{ p['description'] }}</p>
+    <div class="product-actions">
+      <button class="btn btn-primary btn-lg" data-add="{{ p['id'] }}">Add to cart</button>
+      <a class="btn btn-ghost btn-lg" href="{{ url_for('cart') }}">View cart</a>
+    </div>
+  </div>
+</section>
+
+{% if related %}
+<section class="catalog">
+  <div class="catalog-head"><h2>Related</h2></div>
+  <div class="grid">
+    {% for r in related %}
+    <article class="card">
+      <a class="card-media" href="{{ url_for('product', pid=r['id']) }}"><img class="card-img" src="{{ url_for('static', filename='img/' ~ (r['image'] or 'box') ~ '.svg') }}" alt="{{ r['name'] }}" loading="lazy"></a>
+      <div class="card-body">
+        <h3 class="card-title"><a href="{{ url_for('product', pid=r['id']) }}">{{ r['name'] }}</a></h3>
+        <div class="card-foot"><span class="price">${{ '%.2f'|format(r['price']) }}</span>
+          <button class="btn btn-add" data-add="{{ r['id'] }}">Add</button></div>
+      </div>
+    </article>
+    {% endfor %}
+  </div>
+</section>
+{% endif %}
+{% endblock %}

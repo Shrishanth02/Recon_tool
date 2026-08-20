@@ -1,0 +1,32 @@
+{% extends "base.html" %}
+{% block title %}Search: {{ q }}{% endblock %}
+{% block body %}
+
+<section class="catalog">
+  <div class="catalog-head">
+    <!-- VULN: reflected XSS — `q` is emitted without escaping (|safe). -->
+    <h2>Results for “{{ q|safe }}”</h2>
+    <span class="muted">{{ products|length }} match{{ 'es' if products|length != 1 }}</span>
+  </div>
+
+  {% if sql_error %}
+  <div class="notice notice-error">Query error: {{ sql_error }}</div>
+  {% endif %}
+
+  <div class="grid">
+    {% for p in products %}
+    <article class="card">
+      <a class="card-media" href="{{ url_for('product', pid=p['id']) }}"><span class="card-emoji">{{ p['emoji'] or '📦' }}</span></a>
+      <div class="card-body">
+        <span class="card-cat">{{ p['category'] }}</span>
+        <h3 class="card-title"><a href="{{ url_for('product', pid=p['id']) }}">{{ p['name'] }}</a></h3>
+        <div class="card-foot"><span class="price">${{ '%.2f'|format(p['price'] or 0) }}</span>
+          <button class="btn btn-add" data-add="{{ p['id'] }}">Add</button></div>
+      </div>
+    </article>
+    {% else %}
+    <p class="empty">Nothing matched your search.</p>
+    {% endfor %}
+  </div>
+</section>
+{% endblock %}

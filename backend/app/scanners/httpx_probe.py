@@ -17,7 +17,17 @@ _SPLIT = re.compile(r"[\s,]+")
 
 
 def _targets(raw: str):
-    return [t.strip() for t in _SPLIT.split(raw or "") if t.strip()]
+    from .base import reject_optionlike
+
+    out = []
+    for t in _SPLIT.split(raw or ""):
+        t = t.strip()
+        if not t:
+            continue
+        host = t.split("://", 1)[-1].split("/")[0]
+        reject_optionlike(host)  # refuse option-like targets (arg-injection guard)
+        out.append(t)
+    return out
 
 
 def stream(target: str, cancel: Optional[threading.Event] = None, **_) -> Iterator[dict]:

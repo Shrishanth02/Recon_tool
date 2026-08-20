@@ -19,7 +19,7 @@ from fastapi import APIRouter, Depends, HTTPException, Path, Query, status
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
-from .. import ai, crud, diffing, models, risk, schemas, security
+from .. import ai, crud, diffing, models, risk, schemas, scope, security
 from ..deps import get_current_user, get_db, get_workspace_for_user, require_role
 
 router = APIRouter(tags=["intel"])
@@ -167,6 +167,25 @@ def create_schedule(
     """Create a recurring scan schedule (analyst+)."""
     ws, membership = ctx
     _require_ws_role(membership, "analyst")
+    # P1-B4: validate the scheduled target against the SAME boundary as a manual
+    # scan (engagement scope + verified-asset gate) so an out-of-scope/unverified
+    # schedule can't be created. Fail-fast only — the scheduler and the worker
+    # re-validate (incl. netguard) at enqueue and execution time, because a
+    # target's scope/DNS can change after the schedule is created.
+    allowed, reason = scope.check(payload.target or "", ws.scope)
+    if not allowed:
+        crud.audit(db, ws.org_id, membership.user_id, "scope-denied",
+                   f"schedule {payload.tool} {payload.target}: {reason}")
+        db.commit()
+        raise HTTPException(status.HTTP_403_FORBIDDEN, reason)
+    if not crud.is_target_authorized(db, ws.id, payload.target or ""):
+        crud.audit(db, ws.org_id, membership.user_id, "asset-denied",
+                   f"schedule {payload.tool} {payload.target}")
+        db.commit()
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            "Target is not a verified asset for this workspace.",
+        )
     sched = crud.create_schedule(
         db,
         workspace_id=ws.id,
@@ -248,10 +267,16 @@ def list_notifications(
 def create_notification(
     payload: schemas.ChannelIn,
     org_id: int = Path(...),
-    membership: models.Membership = Depends(require_role("analyst")),
+    membership: models.Membership = Depends(require_role("admin")),
     db: Session = Depends(get_db),
 ):
-    """Create a notification channel for an org (analyst+)."""
+    """Create a notification channel for an org (ADMIN+).
+
+    Admin-gated because a channel's config is an external sink (Slack/webhook/
+    email) that receives every new finding — a low-trust analyst must not be able
+    to point org findings at an attacker-controlled webhook. Matches the admin
+    gate on the other secret-bearing org integrations (connectors, API keys, SSO).
+    """
     channel = crud.create_channel(
         db,
         org_id=org_id,
@@ -271,14 +296,14 @@ def delete_notification(
     user: models.User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    """Delete a notification channel (analyst+ within its org)."""
+    """Delete a notification channel (ADMIN+ within its org)."""
     channel = db.get(models.NotificationChannel, channel_id)
     if not channel:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Channel not found")
     membership = crud.get_membership(db, user.id, channel.org_id)
     if not membership:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Channel not found")
-    _require_ws_role(membership, "analyst")
+    _require_ws_role(membership, "admin")
     crud.delete_channel(db, channel)
     crud.audit(db, channel.org_id, user.id, "channel-delete", f"#{channel_id}")
     db.commit()

@@ -27,6 +27,7 @@ from typing import Any
 from pydantic import BaseModel, Field
 
 from .config import settings
+from .severity import normalize_severity
 
 # System instruction shared by both the parse and json_schema code paths.
 _SYSTEM_PROMPT = (
@@ -84,7 +85,7 @@ def _compact_findings(findings: list[dict]) -> list[dict]:
         compact.append(
             {
                 "id": int(fid) if isinstance(fid, int) else idx,
-                "severity": f.get("severity", "info"),
+                "severity": normalize_severity(f.get("severity")),
                 "name": f.get("name", ""),
                 "location": f.get("location", ""),
                 "description": f.get("description", ""),

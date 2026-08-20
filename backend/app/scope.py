@@ -33,6 +33,13 @@ def _match_entry(target: str, entry: str) -> bool:
     if not entry:
         return False
 
+    # Global wildcard — the operator explicitly authorizes ANY target. This is
+    # the "engagement scope = everything" declaration; it is recorded on the
+    # workspace and referenced by the audit log, so the authorization is still
+    # attributable even though it permits all hosts.
+    if entry in ("*", "*.*", "0.0.0.0/0"):
+        return True
+
     # CIDR range
     if "/" in entry:
         try:

@@ -1,0 +1,32 @@
+# pip-audit vulnerability baseline (P1-H3) — REMEDIATED 2026-08-20.
+#
+# STATUS: the production lock (requirements.txt) has ZERO known advisories.
+# `pip-audit --no-deps -r requirements.txt` reports "No known vulnerabilities
+# found", so this baseline carries NO active ignore entries. The CI gate below
+# therefore FAILS the build on ANY advisory affecting a production dependency —
+# nothing is suppressed.
+#
+# History: the original 2026-08-20 lock carried 27 advisories across 8 packages
+# (cryptography, pyjwt, starlette, urllib3, requests, idna, msgpack,
+# pymetasploit3). All 27 were RESOLVED, not baselined, by the dependency-security
+# remediation:
+#   cryptography 46.0.2 -> 50.0.0   (7 advisories, incl. PYSEC-2026-3552 fixed 50.0.0)
+#   pyjwt        2.10.1 -> 2.13.0   (7 advisories, incl. PYSEC-2025-183 no longer reported)
+#   starlette    1.0.0  -> 1.3.1    (5 advisories; fastapi 0.136.1 allows starlette>=0.46.0)
+#   urllib3      2.5.0  -> 2.7.0    (4 advisories)
+#   requests     2.32.5 -> 2.34.2   (1 advisory)
+#   idna         3.11   -> 3.19     (1 advisory)
+#   msgpack      1.1.2  -> 1.2.1    (1 advisory)
+#   pymetasploit3 1.0.6 -> MOVED OUT of the core lock into requirements-optional.txt
+#
+# RESIDUAL RISK (NOT a core-lock advisory, documented — not pretended-resolved):
+#   pymetasploit3==1.0.6 has PYSEC-2026-500 with NO upstream fix. It is optional
+#   (real-exploit path only, RECONX_REAL_EXPLOIT=true) and is confined to the
+#   opt-in requirements-optional.txt, which the default image and this CI gate do
+#   NOT install. Its residual risk is documented in requirements-optional.in.
+#   It is intentionally NOT listed below: adding it would suppress nothing (it is
+#   absent from the core lock) and would weaken the gate.
+#
+# Format: one advisory id per line (comments/blank lines ignored). Add an id here
+# ONLY for a genuinely-unresolvable advisory in the CORE lock, with a rationale.
+# There are currently none.

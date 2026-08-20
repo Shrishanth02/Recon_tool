@@ -1,0 +1,29 @@
+{% extends "base.html" %}
+{% block title %}My account{% endblock %}
+{% block body %}
+
+<section class="page">
+  <h1>Hi, {{ current_user }}</h1>
+  <div class="card-panel">
+    <h2>Your orders</h2>
+    {% if orders %}
+    <table class="data-table">
+      <thead><tr><th>#</th><th>Product</th><th>Qty</th><th>Total</th><th>Placed</th></tr></thead>
+      <tbody>
+        {% for o in orders %}
+        <tr>
+          <td><a href="{{ url_for('order_detail', oid=o['id']) }}">#{{ o['id'] }}</a></td>
+          <td>{{ o['product_name'] }}</td>
+          <td>{{ o['qty'] }}</td>
+          <td>${{ '%.2f'|format(o['total']) }}</td>
+          <td class="muted">{{ o['created_at'][:10] }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+    {% else %}
+    <p class="empty">No orders yet.</p>
+    {% endif %}
+  </div>
+</section>
+{% endblock %}

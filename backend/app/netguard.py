@@ -91,7 +91,9 @@ def validate_target(target: str) -> tuple[bool, str]:
         return False, "empty target"
 
     if host == "localhost" or host.endswith(".localhost"):
-        return False, "localhost is not an allowed target"
+        if settings.BLOCK_PRIVATE_TARGETS:
+            return False, "localhost is not an allowed target"
+        # BLOCK_PRIVATE_TARGETS=false → operator opted into internal scanning
 
     # Literal IP: check directly, skip DNS.
     try:

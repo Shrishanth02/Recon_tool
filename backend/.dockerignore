@@ -11,9 +11,20 @@ __pycache__/
 venv/
 env/
 
-# Local SQLite database (Postgres is used in the container)
+# Local databases, backups & dumps (Postgres is used in the container) — never
+# bake any local data into the image.
 *.db
+*.sqlite
+*.sqlite3
+*.bak
+*.bak-*
+*.backup
+*.sql
 reconx.db
+
+# Generated reports (regenerated at runtime; may contain findings / client PII)
+*.html
+_purple_report.html
 
 # Local env / secrets — never bake into the image
 .env

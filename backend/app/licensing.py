@@ -45,15 +45,10 @@ from typing import Any
 # Embedded development vendor keypair.
 #
 # DEFAULT_PUBLIC_PEM is a genuine Ed25519 public key generated for local testing.
-# The matching private key is recorded below ONLY so the local test/verify step
-# can sign tokens. It is a throwaway dev key — a production build MUST override
-# the public key via settings.LICENSE_PUBLIC_KEY and keep its own private key
-# secret.
-#
-# DEV ISSUER KEY (for local testing only — do not ship):
-# -----BEGIN PRIVATE KEY-----
-# MC4CAQAwBQYDK2VwBCIEIHUUGM2m4asGcyfem8zlMlSCrjYoiulD3KjroSyFmmLD
-# -----END PRIVATE KEY-----
+# The embedded public key below is a throwaway DEV key. A production build MUST
+# override it via settings.LICENSE_PUBLIC_KEY and keep the matching private key
+# secret with the vendor/issuer. The dev private key is intentionally NOT stored
+# in this repo (tests that need to sign generate an ephemeral keypair).
 # --------------------------------------------------------------------------- #
 DEFAULT_PUBLIC_PEM = (
     "-----BEGIN PUBLIC KEY-----\n"

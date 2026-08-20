@@ -19,7 +19,8 @@ import asyncio
 import jwt
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
-from .. import billing, crud, execution, models, scope, security
+from .. import billing, crud, execution, models, ratelimit, scope, security
+from ..config import settings
 from ..database import SessionLocal
 from ..scanners import get_scanner
 
@@ -83,6 +84,22 @@ def _resolve_workspace(db, user, api_key, ws_id: int) -> models.Workspace | None
 async def ws_scan(websocket: WebSocket):
     """Authenticate, run one scan, stream its events, and persist the result."""
     await websocket.accept()
+
+    # P1-H2: rate-limit WS scan connections by client IP (scan bucket) BEFORE auth
+    # so nobody can open unlimited scan sockets. Same Redis-backed limiter as the
+    # HTTP middleware (with a per-process fallback for the scan category).
+    if settings.RATE_LIMIT_ENABLED:
+        _ip = ratelimit.resolve_client_ip(
+            websocket.client.host if websocket.client else None,
+            websocket.headers.get("x-forwarded-for"),
+            settings.rate_limit_trusted_proxies,
+        )
+        if not ratelimit.limiter().check(ratelimit.SCAN, _ip)[0].allowed:
+            await websocket.send_json(
+                {"type": "error", "data": "Rate limit exceeded. Try again shortly."}
+            )
+            await websocket.close()
+            return
 
     db = SessionLocal()
     try:

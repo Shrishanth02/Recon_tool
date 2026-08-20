@@ -1,0 +1,29 @@
+{% extends "base.html" %}
+{% block title %}Your cart{% endblock %}
+{% block body %}
+
+<section class="page">
+  <h1>Your cart</h1>
+  {% if items %}
+  <div class="cart-table">
+    {% for it in items %}
+    <div class="cart-row">
+      <span class="cart-emoji">{{ it.p['emoji'] }}</span>
+      <div class="cart-main">
+        <a class="cart-name" href="{{ url_for('product', pid=it.p['id']) }}">{{ it.p['name'] }}</a>
+        <span class="muted">${{ '%.2f'|format(it.p['price']) }} × {{ it.qty }}</span>
+      </div>
+      <span class="cart-line">${{ '%.2f'|format(it.line) }}</span>
+      <a class="btn btn-ghost btn-sm" href="{{ url_for('cart_remove', pid=it.p['id']) }}">Remove</a>
+    </div>
+    {% endfor %}
+  </div>
+  <div class="cart-summary">
+    <div class="cart-total"><span>Total</span><strong>${{ '%.2f'|format(total) }}</strong></div>
+    <a class="btn btn-primary btn-lg" href="{{ url_for('checkout') }}">Checkout</a>
+  </div>
+  {% else %}
+  <p class="empty">Your cart is empty. <a href="{{ url_for('index') }}">Browse products →</a></p>
+  {% endif %}
+</section>
+{% endblock %}

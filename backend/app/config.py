@@ -44,6 +44,13 @@ class Settings(BaseSettings):
     # --- Persistence -------------------------------------------------------- #
     DATABASE_URL: str = Field(default=_DEFAULT_DB_URL)
     REDIS_URL: str = Field(default="redis://localhost:6379/0")
+    # Schema-bootstrap policy (P1-H4). "auto" (default) runs SQLAlchemy
+    # ``create_all`` ONLY for SQLite — the zero-config local/dev/test backend.
+    # For Postgres the schema is authoritative via Alembic migrations
+    # (``alembic upgrade head`` in entrypoint.sh / CI), so create_all is disabled
+    # to prevent a model added without a migration from being silently created
+    # (schema drift). "true"/"false" force the behavior regardless of backend.
+    DB_AUTO_CREATE: str = Field(default="auto", alias="RECONX_DB_AUTO_CREATE")
 
     # --- Auth / JWT --------------------------------------------------------- #
     JWT_SECRET: str = Field(default="dev-insecure-change-me")
@@ -57,7 +64,9 @@ class Settings(BaseSettings):
     BOOTSTRAP_ORG_NAME: str = Field(default="RECON-X")
 
     # --- General ------------------------------------------------------------ #
-    DEBUG: bool = Field(default=True)
+    # Secure by default: DEBUG must be explicitly turned on for local dev
+    # (the dev .env sets DEBUG=true). In production it stays False.
+    DEBUG: bool = Field(default=False)
 
     # --- Scanner engine (kept from the original config) --------------------- #
     # Aliased to the historical RECONX_* env vars so existing deployments keep
@@ -77,7 +86,16 @@ class Settings(BaseSettings):
     EXECUTION_BACKEND: str = Field(
         default="inline", alias="RECONX_EXECUTION_BACKEND"
     )  # "inline" | "queue"
-    SANDBOX_MODE: str = Field(default="none", alias="RECONX_SANDBOX")  # "none" | "docker"
+    # Scanner execution isolation level applied to every external-tool subprocess:
+    #   none    - NO ISOLATION (direct child; still gets baseline env sanitization)
+    #   process - PROCESS RESTRICTION (sanitized env + scratch cwd + process group
+    #             + timeout + POSIX CPU rlimit) — the default, works without Docker
+    #   docker  - CONTAINER ISOLATION (ephemeral hardened container; needs Docker)
+    SANDBOX_MODE: str = Field(default="process", alias="RECONX_SANDBOX")
+    # Policy when the requested isolation can't be provided (e.g. SANDBOX_MODE=docker
+    # with no Docker): True => refuse to run the scanner; False => degrade to
+    # process_restricted and report the degraded mode clearly (never silent).
+    SANDBOX_REQUIRED: bool = Field(default=False, alias="RECONX_SANDBOX_REQUIRED")
     SCANNER_IMAGE: str = Field(
         default="reconx-scanner:latest", alias="RECONX_SCANNER_IMAGE"
     )
@@ -90,6 +108,21 @@ class Settings(BaseSettings):
     STREAM_TTL_SECONDS: int = Field(
         default=900, alias="RECONX_STREAM_TTL_SECONDS"
     )
+
+    # --- Real exploitation (Metasploit) — OFF by default -------------------- #
+    # When REAL_EXPLOIT is enabled AND a Metasploit RPC daemon is reachable, an
+    # *approved* exploit proposal executes a real Metasploit module against the
+    # in-scope target instead of the safe reachability probe. It stays behind the
+    # same human-approval + scope + SSRF gates. Default OFF so the hosted/demo
+    # build is a safe, non-destructive tool; only self-hosted operators with an
+    # authorized engagement turn it on.
+    REAL_EXPLOIT: bool = Field(default=False, alias="RECONX_REAL_EXPLOIT")
+    MSF_HOST: str = Field(default="127.0.0.1", alias="RECONX_MSF_HOST")
+    MSF_PORT: int = Field(default=55553, alias="RECONX_MSF_PORT")
+    MSF_USER: str = Field(default="msf", alias="RECONX_MSF_USER")
+    MSF_PASSWORD: str = Field(default="", alias="RECONX_MSF_PASSWORD")
+    MSF_SSL: bool = Field(default=True, alias="RECONX_MSF_SSL")
+    MSF_EXPLOIT_TIMEOUT: int = Field(default=180, alias="RECONX_MSF_EXPLOIT_TIMEOUT")
 
     # --- Phase 4: intelligence core (AI triage, scheduling, alerting) ------- #
     # Everything here is additive and defaults to OFF/empty so the verified
@@ -155,11 +188,32 @@ class Settings(BaseSettings):
     SECURITY_HEADERS: bool = Field(
         default=True, alias="RECONX_SECURITY_HEADERS"
     )  # send CSP/HSTS/nosniff/frame-deny/referrer headers
+    # Distributed (Redis-backed) rate limiting. ON by default so production is
+    # protected out of the box; the test suite disables it (conftest) and local
+    # dev can set RECONX_RATE_LIMIT_ENABLED=false. Separate per-category buckets:
+    #   auth    - login/register/refresh/mfa/sso: strict (brute-force defence)
+    #   scan    - scan creation (GET /scan/*, /ws/pipeline, /ws/scan): moderate
+    #   general - everything else: lenient (normal API browsing)
     RATE_LIMIT_ENABLED: bool = Field(
-        default=False, alias="RECONX_RATE_LIMIT_ENABLED"
-    )  # in-memory per-client token bucket
+        default=True, alias="RECONX_RATE_LIMIT_ENABLED"
+    )
     RATE_LIMIT_PER_MINUTE: int = Field(
         default=120, alias="RECONX_RATE_LIMIT_PER_MINUTE"
+    )  # general bucket
+    RATE_LIMIT_AUTH_PER_MINUTE: int = Field(
+        default=10, alias="RECONX_RATE_LIMIT_AUTH_PER_MINUTE"
+    )
+    RATE_LIMIT_SCAN_PER_MINUTE: int = Field(
+        default=20, alias="RECONX_RATE_LIMIT_SCAN_PER_MINUTE"
+    )
+    RATE_LIMIT_WINDOW_SECONDS: int = Field(
+        default=60, alias="RECONX_RATE_LIMIT_WINDOW_SECONDS"
+    )
+    # Comma/space separated CIDRs of trusted reverse proxies. Only when the direct
+    # peer is one of these is X-Forwarded-For trusted for the client IP; empty
+    # (default) => never trust the header (spoof-proof).
+    RATE_LIMIT_TRUSTED_PROXIES: str = Field(
+        default="", alias="RECONX_RATE_LIMIT_TRUSTED_PROXIES"
     )
     METRICS_ENABLED: bool = Field(
         default=True, alias="RECONX_METRICS_ENABLED"
@@ -205,8 +259,19 @@ class Settings(BaseSettings):
 
     @property
     def rate_limit_enabled(self) -> bool:
-        """True when the in-memory request rate limiter is active."""
+        """True when the request rate limiter is active."""
         return bool(self.RATE_LIMIT_ENABLED)
+
+    @property
+    def rate_limit_trusted_proxies(self) -> list:
+        """Trusted-proxy CIDRs (ip_network objects) for X-Forwarded-For handling.
+
+        Empty by default, meaning the forwarded header is never trusted and the
+        direct connection peer is used for rate-limit bucketing.
+        """
+        from .ratelimit import parse_trusted_proxies
+
+        return parse_trusted_proxies(self.RATE_LIMIT_TRUSTED_PROXIES)
 
     @property
     def metrics_enabled(self) -> bool:
@@ -225,8 +290,30 @@ class Settings(BaseSettings):
 
     @property
     def use_docker_sandbox(self) -> bool:
-        """True when scanner tools should run inside the Docker sandbox."""
+        """True when scanner tools are configured to run inside the Docker sandbox.
+
+        This is only the operator's *intent*; whether container isolation is
+        actually applied is decided at run time by ``app.sandbox.effective_isolation``
+        (which checks Docker availability), so nothing claims container isolation
+        when Docker is absent.
+        """
         return self.SANDBOX_MODE.strip().lower() == "docker"
+
+    @property
+    def sandbox_required(self) -> bool:
+        """True when isolation is mandatory: refuse to run a scanner if the
+        requested isolation level cannot be provided."""
+        return bool(self.SANDBOX_REQUIRED)
+
+    @property
+    def real_exploit_enabled(self) -> bool:
+        """True when real Metasploit exploitation is turned on for this deployment.
+
+        This is only the operator's *intent* switch; the exploit engine still
+        checks that a Metasploit RPC daemon is actually reachable at run time and
+        falls back to the safe probe otherwise.
+        """
+        return bool(self.REAL_EXPLOIT)
 
     @property
     def PROJECT_ROOT(self) -> Path:
@@ -242,17 +329,86 @@ class Settings(BaseSettings):
     def is_sqlite(self) -> bool:
         return self.DATABASE_URL.startswith("sqlite")
 
+    @property
+    def db_auto_create(self) -> bool:
+        """Whether startup should bootstrap tables via ``create_all``.
+
+        "auto" (default): create_all runs ONLY for SQLite. Postgres is
+        migration-managed (Alembic is authoritative), so create_all is OFF to
+        prevent silent schema drift. "true"/"false" force it either way.
+        """
+        v = (self.DB_AUTO_CREATE or "auto").strip().lower()
+        if v in ("true", "1", "yes", "on"):
+            return True
+        if v in ("false", "0", "no", "off"):
+            return False
+        return self.is_sqlite
+
+
+# Known-insecure JWT signing secrets that must never sign tokens in a real
+# deployment: the repo's PUBLIC dev default, empty, common placeholders, the
+# test suite's fixed secret, and the .env.example placeholder. Length is enforced
+# separately (see :func:`validate_jwt_secret`) so weak custom values are caught
+# even when they are not on this list.
+_INSECURE_JWT_SECRETS = frozenset(
+    {
+        "",
+        "dev-insecure-change-me",
+        "change-me",
+        "changeme",
+        "changethis",
+        "secret",
+        "password",
+        "test-secret",
+        "your-secret-key",
+        "CHANGE_ME_openssl_rand_hex_32",
+    }
+)
+
+#: Minimum acceptable JWT secret length (characters) in a non-DEBUG deployment.
+MIN_JWT_SECRET_LEN = 32
+
+
+def validate_jwt_secret(*, debug: bool, secret: str) -> None:
+    """Fail closed unless a production deployment has a strong, explicit JWT secret.
+
+    In DEBUG (local dev) anything is allowed for convenience. Otherwise the secret
+    must not be a known-insecure value and must be at least
+    :data:`MIN_JWT_SECRET_LEN` characters long. Raises ``RuntimeError`` with
+    operator remediation guidance on failure.
+
+    Security note: the secret value is NEVER interpolated into the error message,
+    so a misconfiguration cannot leak the (attempted) secret into logs.
+    """
+    if debug:
+        return
+    candidate = (secret or "").strip()
+    remediation = (
+        " Set JWT_SECRET to a strong random value, e.g. "
+        "`export JWT_SECRET=$(openssl rand -hex 32)` (or set DEBUG=true for local "
+        "development)."
+    )
+    if candidate in _INSECURE_JWT_SECRETS:
+        raise RuntimeError(
+            "JWT_SECRET is unset or an insecure default in a non-DEBUG environment. "
+            "Refusing to start - booting with a known secret would let anyone forge "
+            "admin tokens." + remediation
+        )
+    if len(candidate) < MIN_JWT_SECRET_LEN:
+        raise RuntimeError(
+            f"JWT_SECRET is too short ({len(candidate)} chars) for a non-DEBUG "
+            f"environment; at least {MIN_JWT_SECRET_LEN} characters are required. "
+            "Refusing to start." + remediation
+        )
+
 
 settings = Settings()
 
-# Warn loudly if a real deployment forgot to change the signing secret.
-if settings.JWT_SECRET == "dev-insecure-change-me" and not settings.DEBUG:
-    warnings.warn(
-        "JWT_SECRET is still the insecure development default in a non-DEBUG "
-        "environment. Set JWT_SECRET to a strong random value.",
-        RuntimeWarning,
-        stacklevel=2,
-    )
+# Fail closed at import/startup: a real (non-DEBUG) deployment must have a strong,
+# explicitly-configured signing secret. The dev default is a PUBLIC constant in
+# this repo, so booting with it in production is a full auth bypass. Local dev
+# (DEBUG=true) is unaffected.
+validate_jwt_secret(debug=settings.DEBUG, secret=settings.JWT_SECRET)
 
 # --------------------------------------------------------------------------- #
 # Backward-compatibility module constants.

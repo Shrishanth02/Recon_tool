@@ -1,0 +1,48 @@
+{% extends "base.html" %}
+{% block title %}Admin{% endblock %}
+{% block body %}
+
+<section class="page">
+  <div class="admin-head">
+    <h1>🔧 Admin dashboard</h1>
+    <span class="badge badge-danger">restricted</span>
+  </div>
+
+  {% if not authed %}
+  <div class="card-panel auth-card">
+    <div class="notice notice-warn">Admin area. Please authenticate.</div>
+    <form class="form" method="post" action="{{ url_for('login', next='/admin') }}">
+      <label>Username<input name="username" required></label>
+      <label>Password<input name="password" type="password" required></label>
+      <button class="btn btn-primary btn-lg" type="submit">Sign in</button>
+    </form>
+  </div>
+  {% else %}
+  <div class="card-panel">
+    <h2>Users</h2>
+    <table class="data-table">
+      <thead><tr><th>ID</th><th>Username</th><th>Password</th><th>Email</th><th>Admin</th></tr></thead>
+      <tbody>
+        {% for u in users %}
+        <tr><td>{{ u['id'] }}</td><td>{{ u['username'] }}</td>
+          <td><code>{{ u['password'] }}</code></td><td>{{ u['email'] }}</td>
+          <td>{{ '✅' if u['is_admin'] else '—' }}</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  <div class="card-panel">
+    <h2>Orders</h2>
+    <table class="data-table">
+      <thead><tr><th>#</th><th>Product</th><th>Qty</th><th>Total</th><th>Customer</th></tr></thead>
+      <tbody>
+        {% for o in orders %}
+        <tr><td>#{{ o['id'] }}</td><td>{{ o['product_name'] }}</td><td>{{ o['qty'] }}</td>
+          <td>${{ '%.2f'|format(o['total']) }}</td><td>{{ o['customer_name'] }}</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% endif %}
+</section>
+{% endblock %}

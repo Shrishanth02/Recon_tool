@@ -1,0 +1,81 @@
+# SOURCE of production dependencies (direct deps + real constraints). This file
+# is human-edited; the fully-pinned, hashed lock is requirements.txt, GENERATED
+# from here by pip-compile. After editing this file, run `make lock` (see
+# backend/Makefile) and commit both files. Production/CI install the LOCK only.
+
+# --- Existing runtime dependencies (scanner engine + API) ---
+fastapi>=0.110
+uvicorn[standard]>=0.27
+# Production ASGI server: gunicorn manages N uvicorn workers (the Dockerfile
+# entrypoint runs `gunicorn -k uvicorn.workers.UvicornWorker`).
+gunicorn>=21.2
+websockets>=12
+python-whois>=0.9
+builtwith>=1.3
+requests>=2.33.0  # P1-H3 remediation: PYSEC-2026-2275
+
+# --- Persistence / migrations ---
+sqlalchemy>=2.0
+alembic>=1.13
+psycopg[binary]>=3.1
+
+# --- Config / validation ---
+pydantic>=2.6
+pydantic-settings>=2.2
+email-validator>=2.1
+
+# --- Auth (JWT / passwords / MFA) ---
+PyJWT>=2.13.0  # P1-H3 remediation: PYSEC-2026-120/175/176/177/178/179
+passlib[bcrypt]>=1.7
+# passlib 1.7.4's bcrypt backend is incompatible with bcrypt>=4.1 (its backend
+# probe raises on the removed __about__ / 72-byte guard). Pin to the last known
+# good release until passlib ships a fix.
+bcrypt<4.1
+pyotp>=2.9
+python-multipart>=0.0.9
+
+# --- Queue scaffold (Phase 2) ---
+redis>=5.0
+arq>=0.25
+
+# --- Asset ownership verification ---
+dnspython>=2.6
+
+# --- Phase 3: billing core ---
+# Both are optional at runtime: app.billing / app.licensing import them lazily
+# and degrade gracefully when absent, so the app still boots without them.
+stripe>=9
+cryptography>=50.0.0  # P1-H3 remediation: clears all 7 advisories (fixes span 46.0.5..50.0.0)
+
+# --- Phase 5: enterprise / compliance core ---
+# Optional at runtime: app.observability imports prometheus_client lazily and
+# falls back to no-op metrics + a plain-text /metrics stub when it is absent, so
+# the app still boots and every test passes without it installed.
+prometheus-client>=0.20
+
+# --- Phase 4: AI triage (headline feature) ---
+# Required for the AI-triage feature to work when ANTHROPIC_API_KEY is set.
+# app.ai imports it lazily and degrades to "disabled" when absent — but it must
+# ship in the image or a paying customer who sets the key still gets nothing.
+anthropic>=0.39
+
+# --- Security-pinned transitive floors (P1-H3 remediation) ---
+# These are pulled in transitively (starlette by fastapi; urllib3/idna by
+# requests; msgpack by arq), but their parents' constraints are wide enough to
+# resolve a KNOWN-VULNERABLE version. We pin a secure FLOOR here so the lock can
+# never regress below the fixed release. Each floor clears the advisories that
+# were baselined in .pip-audit-ignores for that package.
+starlette>=1.3.1,<1.4  # PYSEC-2026-161/248/249/2280/2281; capped to the minimal fix
+                       # line (fastapi 0.136.1 allows >=0.46.0 but was tested near 1.0)
+urllib3>=2.7.0    # PYSEC-2026-141/1994/1996/1998
+idna>=3.15        # PYSEC-2026-215
+msgpack>=1.2.1    # PYSEC-2026-3625
+
+# --- Optional: real Metasploit exploitation (self-hosted, opt-in) ---
+# MOVED OUT of the core production lock (P1-H3 remediation): pymetasploit3 has an
+# unresolved advisory (PYSEC-2026-500, no upstream fix) and is only needed when
+# RECONX_REAL_EXPLOIT=true with a reachable msfrpcd. app.metasploit imports it
+# lazily and degrades cleanly when absent, so the default safe-probe build does
+# NOT ship it. Operators who opt into real exploitation install the separately
+# pinned lock: `pip install --require-hashes -r requirements-optional.txt`.
+# See requirements-optional.in for the documented residual risk.

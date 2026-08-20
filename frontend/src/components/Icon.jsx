@@ -74,6 +74,7 @@ const PATHS = {
   ),
   check: <path d="M5 13l4 4L19 7" />,
   x: <path d="M6 6l12 12M18 6L6 18" />,
+  plus: <path d="M12 5v14M5 12h14" />,
   pulse: <path d="M2 12h4l3 8 4-16 3 8h6" />,
   bug: (
     <>

@@ -1,0 +1,18 @@
+{% extends "base.html" %}
+{% block title %}Sign in{% endblock %}
+{% block body %}
+
+<section class="page narrow">
+  <div class="card-panel auth-card">
+    <h1>Sign in</h1>
+    {% if error %}<div class="notice notice-error">{{ error }}</div>{% endif %}
+    <form class="form" method="post" action="{{ url_for('login') }}">
+      <input type="hidden" name="next" value="{{ next }}">
+      <label>Username<input name="username" autofocus required></label>
+      <label>Password<input name="password" type="password" required></label>
+      <button class="btn btn-primary btn-lg" type="submit">Sign in</button>
+    </form>
+    <p class="muted small">Demo: <code>alice / password1</code> · <code>admin / admin123</code></p>
+  </div>
+</section>
+{% endblock %}

@@ -272,6 +272,55 @@ class Finding(Base):
     cwe: Mapped[list] = mapped_column(JSON, nullable=False, default=list)
     cvss: Mapped[float | None] = mapped_column(Float, nullable=True)
     status: Mapped[str] = mapped_column(String(20), nullable=False, default="open")
+    # --- Purple-Team P1: MITRE ATT&CK mapping (both nullable) --------------- #
+    # ``technique_id`` is the ATT&CK technique (e.g. "T1046"); ``tactic`` is the
+    # tactic id (e.g. "discovery"). NULL means the finding's tool has no sensible
+    # ATT&CK mapping; pre-P1 rows are NULL and render as "unmapped".
+    technique_id: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    tactic: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    # --- P0: detection tier, classification, confidence & evidence ---------- #
+    # ``detection_tier`` encodes trust and is the SIGNAL / VALIDATED / EXPLOITED
+    # distinction the product cares about:
+    #   * "signal"    — a scanner reported a possible issue (no verification);
+    #   * "validated" — the platform performed a SAFE check and holds evidence;
+    #   * "exploited" — set ONLY by the human-approved P5 exploit path. The
+    #                   automated Auto-Pentest pipeline must never set this.
+    detection_tier: Mapped[str] = mapped_column(
+        String(12), nullable=False, default="signal", server_default="signal"
+    )
+    # ``kind`` separates genuine vulnerabilities from informational/recon/
+    # hardening signal so the latter never inflate the vulnerability risk score:
+    # "vuln" | "hardening" | "recon" | "info".
+    kind: Mapped[str] = mapped_column(
+        String(12), nullable=False, default="vuln", server_default="vuln"
+    )
+    # 0-100 confidence that the finding is real and correctly rated. Weighted
+    # into the risk score so low-confidence signals count for less than
+    # high-confidence validated findings.
+    confidence: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=50, server_default="50"
+    )
+    # Structured, source-specific supporting evidence (request/response, AXFR
+    # records, matched parameter, secret preview, …). Never invented — only what
+    # the scanner actually observed.
+    evidence: Mapped[dict] = mapped_column(
+        JSON, nullable=False, default=dict, server_default="{}"
+    )
+    # Stable identity used to deduplicate repeated scans; NULL on legacy rows.
+    dedupe_key: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    # How many times this finding has been re-observed (incremented on a dedup
+    # hit instead of inserting a duplicate row).
+    seen_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=1, server_default="1"
+    )
+    # --- P1: cross-scanner correlation ------------------------------------- #
+    # ``correlation_id`` groups findings that refer to the SAME underlying issue
+    # across different scanners (NULL when a finding stands alone). ``related``
+    # lists the other findings in that group as ``{id, source, name}`` so a
+    # finding can show exactly which other scanner results support it — without
+    # merging them (each keeps its own source + evidence).
+    correlation_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    related: Mapped[list] = mapped_column(JSON, nullable=False, default=list, server_default="[]")
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
@@ -298,6 +347,12 @@ class Schedule(Base):
     tool: Mapped[str] = mapped_column(String(50), nullable=False)
     target: Mapped[str] = mapped_column(String(500), nullable=False)
     options: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
+    # --- Purple-Team P4: continuous-purple config (nullable/defaulted) ------ #
+    # For a ``tool == "purple"`` schedule this carries the purple-loop settings
+    # the scanner ``options`` blob can't express — e.g. ``{"connector_id": 3,
+    # "techniques": ["E1", "E4"]}``. It is an empty dict for ordinary scanner
+    # schedules, so pre-P4 rows are unaffected.
+    config: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
     cron: Mapped[str] = mapped_column(String(120), nullable=False)
     enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     last_run_at: Mapped[datetime | None] = mapped_column(
@@ -453,6 +508,50 @@ class AuditLog(Base):
     )
 
 
+class PentestRun(Base):
+    """One execution of the automated end-to-end pentest pipeline (P0).
+
+    A ``PentestRun`` records a single ``run_pipeline`` invocation so that
+    auto-pentest results are first-class alongside the manual ``Scan`` history.
+    The individual per-stage tool outputs are still persisted as ordinary
+    ``Scan`` rows (feeding Findings/risk/diff/AI/report); this row is the
+    top-level envelope that ties them together and stores the aggregate risk.
+
+    ``summary`` holds the ``pipeline_done`` summary dict verbatim. ``status`` is
+    ``"running"`` while the pipeline streams and becomes ``"done"`` (or an error
+    state) once it finishes. ``created_by`` is nullable and set NULL if the user
+    is later deleted, mirroring :class:`Scan`.
+    """
+
+    __tablename__ = "pentest_runs"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    workspace_id: Mapped[int] = mapped_column(
+        ForeignKey("workspaces.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    created_by: Mapped[int | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+    target: Mapped[str] = mapped_column(String(500), nullable=False)
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="running")
+    risk_score: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    risk_label: Mapped[str] = mapped_column(String(20), nullable=False, default="")
+    summary: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
+    # Full stage-by-stage process (name, status, trimmed logs, result per stage)
+    # so a completed run can be replayed from the Purple Team history exactly as
+    # it streamed live. Empty {} for older runs captured before this existed.
+    process: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
+    started_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    finished_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+
 class SsoConfig(Base):
     """Per-organization single sign-on configuration (Phase 5).
 
@@ -486,4 +585,210 @@ class SsoConfig(Base):
     enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+
+class EmulationRun(Base):
+    """One execution of the SAFE ATT&CK emulation engine (Purple-Team P2).
+
+    An ``EmulationRun`` records a single :func:`app.emulation.run_emulation`
+    invocation against one authorized target. The individual per-technique
+    outcomes are stored as child :class:`TechniqueResult` rows; this envelope
+    carries the aggregate tallies (``executed``/``blocked``/``failed``) and the
+    verbatim engine summary.
+
+    Every emulation is scope + SSRF (netguard) + billing gated by its router
+    before this row is created, and every technique is non-destructive by design.
+    ``created_by`` is nullable and set NULL if the user is later deleted,
+    mirroring :class:`Scan` / :class:`PentestRun`.
+    """
+
+    __tablename__ = "emulation_runs"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    workspace_id: Mapped[int] = mapped_column(
+        ForeignKey("workspaces.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    created_by: Mapped[int | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+    target: Mapped[str] = mapped_column(String(500), nullable=False)
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="running")
+    executed: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    blocked: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    failed: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    summary: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
+    started_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    finished_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+    technique_results: Mapped[list["TechniqueResult"]] = relationship(
+        back_populates="emulation_run",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+        order_by="TechniqueResult.id",
+    )
+
+
+class TechniqueResult(Base):
+    """The outcome of one SAFE emulated ATT&CK technique (Purple-Team P2).
+
+    A child of :class:`EmulationRun`. ``status`` is one of ``executed`` (the
+    benign action reached the target and produced telemetry), ``blocked`` (the
+    target/WAF refused it — itself a useful detection signal), ``failed`` (the
+    probe errored), or ``skipped`` (not run, e.g. the run was canceled).
+    ``evidence`` is a short human string (``"HTTP 403"``); ``detail`` is longer
+    free-form context.
+    """
+
+    __tablename__ = "technique_results"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    emulation_run_id: Mapped[int] = mapped_column(
+        ForeignKey("emulation_runs.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    technique_id: Mapped[str] = mapped_column(String(20), nullable=False)
+    technique_name: Mapped[str] = mapped_column(String(200), nullable=False, default="")
+    tactic: Mapped[str] = mapped_column(String(40), nullable=False, default="")
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="failed")
+    evidence: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    detail: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+    emulation_run: Mapped["EmulationRun"] = relationship(
+        back_populates="technique_results"
+    )
+
+
+class DetectionConnector(Base):
+    """An org-scoped integration to a defender SIEM/EDR (Purple-Team P3).
+
+    A ``DetectionConnector`` is what the BLUE side of the platform queries to ask
+    "did you detect this technique?" (see :mod:`app.connectors` /
+    :mod:`app.detection`). ``ctype`` selects the implementation (``"mock"``,
+    ``"http"``, ``"splunk"``, ``"elastic"``); ``config`` carries the
+    type-specific settings.
+
+    WARNING: ``config`` may hold secrets (API tokens, Splunk bearer tokens,
+    Elastic API keys, HTTP auth). It is persisted as-is so the connector can run,
+    but the API schema (:class:`app.schemas.DetectionConnectorOut`) **masks** it —
+    the raw secret values are never echoed back over the API.
+    """
+
+    __tablename__ = "detection_connectors"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    org_id: Mapped[int] = mapped_column(
+        ForeignKey("organizations.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    name: Mapped[str] = mapped_column(String(200), nullable=False)
+    ctype: Mapped[str] = mapped_column(String(20), nullable=False, default="mock")
+    config: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
+    enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+
+class DetectionResult(Base):
+    """The verdict of one technique correlated against a connector (P3).
+
+    A child of an :class:`EmulationRun`: for each emulated technique that
+    produced telemetry, :func:`app.detection.validate_emulation` asks the
+    connector whether it was detected and persists the answer here. ``detected``
+    is the headline verdict; ``count`` is how many matching events the SIEM
+    returned; ``source`` is the connector type that answered; ``evidence`` is a
+    short human string explaining the verdict (or the error, when the SIEM query
+    failed — connectors degrade to ``detected=False`` rather than raising).
+
+    ``connector_id`` is nullable and set NULL if the connector is later deleted,
+    so historical detection results survive connector churn (mirroring the
+    ``created_by`` SET NULL pattern used elsewhere).
+    """
+
+    __tablename__ = "detection_results"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    emulation_run_id: Mapped[int] = mapped_column(
+        ForeignKey("emulation_runs.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    connector_id: Mapped[int | None] = mapped_column(
+        ForeignKey("detection_connectors.id", ondelete="SET NULL"), nullable=True
+    )
+    technique_id: Mapped[str] = mapped_column(String(20), nullable=False)
+    technique_name: Mapped[str] = mapped_column(String(200), nullable=False, default="")
+    tactic: Mapped[str] = mapped_column(String(40), nullable=False, default="")
+    detected: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    source: Mapped[str] = mapped_column(String(40), nullable=False, default="")
+    evidence: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Purple-Team P5: human-gated, non-destructive exploitation proposals
+# --------------------------------------------------------------------------- #
+class ExploitProposal(Base):
+    """A proposed, human-gated, NON-DESTRUCTIVE validation probe (Purple-Team P5).
+
+    An ``ExploitProposal`` is the platform's honest market boundary between
+    *automated reconnaissance/validation* and *actual exploitation*. The engine
+    (:mod:`app.exploit`) automatically **proposes** which findings warrant a SAFE
+    reachability/validation probe, but it will never execute one on its own: a
+    proposal must be moved to ``status == "approved"`` by a privileged human
+    (admin+) before :func:`app.exploit.execute` will act, and even then the probe
+    is a benign, read-only check (the same philosophy as :mod:`app.emulation` —
+    TCP connect / benign HTTP with an ``X-RECONX-EXPLOIT-CHECK`` marker), never a
+    destructive payload, shell, or data-exfiltration.
+
+    Lifecycle of ``status``::
+
+        proposed --approve--> approved --execute--> executed
+                \\--reject--> rejected            \\--> failed (guarded error)
+
+    ``result`` holds the recorded probe evidence (a ``{probe, evidence,
+    non_destructive, executed_at}`` dict) once executed. This is a NEW table and
+    is created at runtime by ``Base.metadata.create_all``; migration
+    ``0010_p5_exploit`` mirrors it for Alembic parity.
+    """
+
+    __tablename__ = "exploit_proposals"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    workspace_id: Mapped[int] = mapped_column(
+        ForeignKey("workspaces.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    finding_id: Mapped[int | None] = mapped_column(
+        ForeignKey("findings.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    technique_id: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    title: Mapped[str] = mapped_column(String(500), nullable=False, default="")
+    rationale: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    #: proposed | approved | rejected | executed | failed
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="proposed")
+    created_by: Mapped[int | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+    approved_by: Mapped[int | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+    result: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+        nullable=False,
     )

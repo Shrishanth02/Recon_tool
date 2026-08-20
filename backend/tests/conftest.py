@@ -15,13 +15,36 @@ import uuid
 # --------------------------------------------------------------------------- #
 # 1. Redirect the database to a temp SQLite file BEFORE importing the app.
 # --------------------------------------------------------------------------- #
-_TMP_DIR = tempfile.mkdtemp(prefix="reconx-tests-")
-_DB_PATH = os.path.join(_TMP_DIR, "test.db").replace("\\", "/")
-os.environ["DATABASE_URL"] = f"sqlite:///{_DB_PATH}"
-# Keep the JWT secret deterministic and MFA/bootstrap out of the way.
-os.environ.setdefault("JWT_SECRET", "test-secret")
+# Default: a throwaway SQLite file (fast, zero-config, local). The P1-H4 CI
+# Postgres job sets RECONX_TEST_DATABASE_URL to a Postgres URL so this SAME suite
+# also runs against the production engine — SQLite compatibility does not prove
+# Postgres compatibility. When it is set we honour it verbatim; otherwise we fall
+# back to the historical temp-SQLite behaviour.
+_PROVIDED_DB = os.environ.get("RECONX_TEST_DATABASE_URL", "").strip()
+if _PROVIDED_DB:
+    os.environ["DATABASE_URL"] = _PROVIDED_DB
+else:
+    _TMP_DIR = tempfile.mkdtemp(prefix="reconx-tests-")
+    _DB_PATH = os.path.join(_TMP_DIR, "test.db").replace("\\", "/")
+    os.environ["DATABASE_URL"] = f"sqlite:///{_DB_PATH}"
+# Keep the JWT secret deterministic and MFA/bootstrap out of the way. This value
+# is a strong, clearly-fake test secret (>= MIN_JWT_SECRET_LEN chars, not on the
+# known-insecure list) so the production fail-closed guard in app.config is
+# satisfied even when DEBUG is off (e.g. in CI) — tests never use a real secret.
+os.environ.setdefault(
+    "JWT_SECRET", "reconx-test-secret-not-for-production-0123456789"
+)
 os.environ.pop("BOOTSTRAP_ADMIN_EMAIL", None)
 os.environ.pop("BOOTSTRAP_ADMIN_PASSWORD", None)
+# Force the SSRF guard's secure default so the netguard/execution tests are
+# deterministic regardless of any local .env (a dev .env may set
+# RECONX_BLOCK_PRIVATE_TARGETS=false to allow scanning localhost/private ranges).
+# An env var overrides the .env in pydantic-settings.
+os.environ["RECONX_BLOCK_PRIVATE_TARGETS"] = "true"
+# Rate limiting defaults ON in production; the general suite makes many rapid
+# requests, so disable it here. The dedicated rate-limit tests enable it
+# explicitly and drive the limiter directly.
+os.environ.setdefault("RECONX_RATE_LIMIT_ENABLED", "false")
 
 import pytest  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402

@@ -9,8 +9,8 @@
 #   nuclei     - templated vulnerability scanning (ProjectDiscovery release binary)
 #   ffuf       - content/parameter fuzzing        (ffuf release binary)
 #
-# The release binaries are version-pinned below and a RUN check verifies each
-# one is present and executable before the image is considered good. The
+# The release binaries are version-pinned below, SHA-256 checksum-verified, and a
+# post-install check fails the build unless each is present and runnable. The
 # container's entrypoint is the arq worker (arq app.worker.WorkerSettings).
 
 FROM python:3.11-slim
@@ -31,49 +31,58 @@ ARG FFUF_VERSION=2.1.0
 ARG TARGETARCH=amd64
 
 # System dependencies:
-#   nmap             - port/service scanner
+#   nmap             - port/service scanner (REQUIRED, stage 4)
+#   whois            - WHOIS lookup used by python-whois (stage 1)
 #   ca-certificates  - TLS roots for outbound HTTPS (release downloads + scans)
 #   curl / unzip     - fetch and unpack the release archives (build-time only)
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         nmap \
+        whois \
         ca-certificates \
         curl \
         unzip \
-    && rm -rf /var/lib/apt/lists/*
+    && rm -rf /var/lib/apt/lists/* \
+    && nmap --version
 
-# Download the pinned scanner release binaries into /usr/local/bin. The three
-# ProjectDiscovery tools ship as .zip, ffuf ships as .tar.gz.
-RUN set -eux; \
-    cd /tmp; \
-    pd_base="https://github.com/projectdiscovery"; \
-    curl -fsSL -o subfinder.zip "${pd_base}/subfinder/releases/download/v${SUBFINDER_VERSION}/subfinder_${SUBFINDER_VERSION}_linux_${TARGETARCH}.zip"; \
-    curl -fsSL -o httpx.zip     "${pd_base}/httpx/releases/download/v${HTTPX_VERSION}/httpx_${HTTPX_VERSION}_linux_${TARGETARCH}.zip"; \
-    curl -fsSL -o nuclei.zip    "${pd_base}/nuclei/releases/download/v${NUCLEI_VERSION}/nuclei_${NUCLEI_VERSION}_linux_${TARGETARCH}.zip"; \
-    curl -fsSL -o ffuf.tar.gz   "https://github.com/ffuf/ffuf/releases/download/v${FFUF_VERSION}/ffuf_${FFUF_VERSION}_linux_${TARGETARCH}.tar.gz"; \
-    unzip -o subfinder.zip subfinder -d /usr/local/bin; \
-    unzip -o httpx.zip     httpx     -d /usr/local/bin; \
-    unzip -o nuclei.zip    nuclei    -d /usr/local/bin; \
-    tar -xzf ffuf.tar.gz -C /usr/local/bin ffuf; \
-    chmod +x /usr/local/bin/subfinder /usr/local/bin/httpx /usr/local/bin/nuclei /usr/local/bin/ffuf; \
-    rm -f /tmp/*.zip /tmp/*.tar.gz
-
-# Fail the build unless every scanner tool is present and executable.
-RUN set -eux; \
-    nmap --version; \
-    subfinder -version; \
-    httpx -version; \
-    nuclei -version; \
-    ffuf -V
+# Install the REQUIRED release-binary scanners with pinned versions + SHA-256
+# checksum verification (the SAME script the API image uses, so the two images
+# never drift). The build FAILS if any required tool cannot be installed/verified.
+COPY install-scanners.sh /usr/local/bin/install-scanners.sh
+RUN SUBFINDER_VERSION="${SUBFINDER_VERSION}" HTTPX_VERSION="${HTTPX_VERSION}" \
+    NUCLEI_VERSION="${NUCLEI_VERSION}" FFUF_VERSION="${FFUF_VERSION}" \
+    TARGETARCH="${TARGETARCH}" sh /usr/local/bin/install-scanners.sh
 
 WORKDIR /app
 
 # Install Python dependencies first so this layer is cached across code changes.
 COPY requirements.txt ./
-RUN pip install --no-cache-dir -r requirements.txt
+# Reproducible, hash-verified install from the pinned lock (see backend/Dockerfile).
+RUN pip install --no-cache-dir --require-hashes -r requirements.txt
+# OPT-IN real-exploit path only (RECONX_REAL_EXPLOIT=true): pymetasploit3 lives in
+# requirements-optional.txt, kept OUT of the core lock because its sole advisory
+# (PYSEC-2026-500) has no upstream fix. app.metasploit imports it lazily, so the
+# default worker runs without it. To enable, build with the optional deps:
+#   COPY requirements-optional.txt ./
+#   RUN pip install --no-cache-dir --require-hashes -r requirements-optional.txt
 
-# Copy the application source.
-COPY . .
+# Copy ONLY the application runtime as an explicit allow-list — never `COPY . .`.
+# The worker only needs the app package; database migrations are applied by the
+# API image's entrypoint, not here.
+COPY app ./app
+
+# --- Least privilege: run as a dedicated non-root user --------------------- #
+# Same model as the API image. The worker shells out to the full scanner
+# toolchain, which writes config/cache under $HOME and scratch under /tmp; no
+# Linux capability is required (unprivileged nmap connect-scans; the PD tools /
+# ffuf are TCP/DNS clients). The arq worker needs no privileged port.
+RUN groupadd -r reconx \
+    && useradd -r -g reconx -u 10001 -m -d /home/reconx reconx \
+    && chown -R reconx:reconx /app /home/reconx
+ENV HOME=/home/reconx \
+    XDG_CONFIG_HOME=/home/reconx/.config \
+    XDG_CACHE_HOME=/home/reconx/.cache
+USER reconx
 
 # Run the arq worker. It pulls scan jobs off Redis and executes them out of
 # process (settings.EXECUTION_BACKEND == "queue").

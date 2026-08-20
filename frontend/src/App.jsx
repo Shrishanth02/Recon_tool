@@ -5,6 +5,8 @@ import {
   fetchWorkspaceScans,
   fetchWorkspaceFindings,
   fetchScan,
+  deleteScan,
+  clearWorkspaceScans,
 } from "./api/client";
 import { AuthProvider, useAuth } from "./auth/AuthContext";
 import { useScan } from "./hooks/useScan";
@@ -13,15 +15,34 @@ import ScanForm from "./components/ScanForm";
 import LiveTerminal from "./components/LiveTerminal";
 import ResultsPanel from "./components/ResultsPanel";
 import FindingsPanel from "./components/FindingsPanel";
+import AttackMatrix from "./components/AttackMatrix";
+import EmulationPanel from "./components/EmulationPanel";
+import CoveragePanel from "./components/CoveragePanel";
+import ExploitPanel from "./components/ExploitPanel";
 import SchedulesPanel from "./components/SchedulesPanel";
 import ScanHistory from "./components/ScanHistory";
 import StatusBar from "./components/StatusBar";
 import Login from "./components/Login";
-import OrgSwitcher from "./components/OrgSwitcher";
+import EngagementMenu from "./components/EngagementMenu";
 import BillingPanel from "./components/BillingPanel";
 import SettingsPanel from "./components/SettingsPanel";
 import ThemeToggle from "./components/ThemeToggle";
 import Icon from "./components/Icon";
+import AutoPentestPanel from "./components/AutoPentestPanel";
+import PurpleHistory from "./components/PurpleHistory";
+
+// The automated purple-team suite — its own navigation, separate from the
+// manual recon scanners. Order follows the pentest lifecycle:
+// run → map → emulate → validate → exploit → schedule.
+const PURPLE_ITEMS = [
+  { id: "autopent", name: "Auto-Pentest", desc: "End-to-end automation", icon: "play" },
+  { id: "phistory", name: "Run History", desc: "Past auto-pentest runs", icon: "history" },
+  { id: "attack", name: "ATT&CK Coverage", desc: "Technique mapping", icon: "cpu" },
+  { id: "emulate", name: "Emulate", desc: "Safe adversary emulation", icon: "pulse" },
+  { id: "coverage", name: "Coverage", desc: "Detection posture", icon: "shield" },
+  { id: "exploit", name: "Exploit", desc: "Human-gated validation", icon: "bug" },
+  { id: "schedules", name: "Schedules", desc: "Recurring automation", icon: "history" },
+];
 
 // Top-level shell: provide auth/tenancy context, then gate on it.
 export default function App() {
@@ -57,12 +78,16 @@ function Dashboard() {
   const [showBilling, setShowBilling] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
 
+  // Two top-level areas: manual recon vs the automated purple-team suite.
+  const [section, setSection] = useState("recon"); // recon | purple
+  const [purpleTab, setPurpleTab] = useState("autopent"); // autopent | attack | emulate | coverage | exploit | schedules
+
   const [tools, setTools] = useState([]);
   const [connected, setConnected] = useState(false);
   const [selected, setSelected] = useState(null);
   const [target, setTarget] = useState("");
   const [optionsByTool, setOptionsByTool] = useState({});
-  const [rightTab, setRightTab] = useState("results"); // results | findings | history | schedules
+  const [rightTab, setRightTab] = useState("results"); // results | findings | history
 
   const [findings, setFindings] = useState([]);
   const [scans, setScans] = useState([]);
@@ -173,6 +198,35 @@ function Dashboard() {
     }
   };
 
+  const deleteHistoryScan = async (scanId) => {
+    try {
+      await deleteScan(scanId);
+      if (historyView) setHistoryView(null);
+      refreshWorkspace(workspaceId);
+      refreshWorkspaces();
+    } catch {
+      /* ignore — a failed delete just leaves the row */
+    }
+  };
+
+  const clearAllHistory = async () => {
+    if (!workspaceId) return;
+    if (
+      !window.confirm(
+        "Delete ALL scan history and findings for this engagement? This cannot be undone."
+      )
+    )
+      return;
+    try {
+      await clearWorkspaceScans(workspaceId);
+      setHistoryView(null);
+      refreshWorkspace(workspaceId);
+      refreshWorkspaces();
+    } catch {
+      /* ignore */
+    }
+  };
+
   const exportJson = () => {
     const data = historyView ? historyView.result : result;
     const t = historyView ? historyView.tool : tool?.id;
@@ -195,16 +249,21 @@ function Dashboard() {
   return (
     <div className="layout">
       <Sidebar
+        section={section}
+        onSection={setSection}
         tools={tools}
         selected={selected}
         onSelect={handleSelect}
+        purpleItems={PURPLE_ITEMS}
+        purpleSelected={purpleTab}
+        onPurpleSelect={setPurpleTab}
         connected={connected}
         disabled={isRunning}
       />
 
       <main className="main">
         <header className="topbar">
-          <OrgSwitcher disabled={isRunning} />
+          <EngagementMenu disabled={isRunning} />
           <div className="topbar-spacer" />
           <ThemeToggle />
           <button
@@ -231,64 +290,96 @@ function Dashboard() {
           </div>
         </header>
 
-        <ScanForm
-          tool={tool}
-          target={target}
-          onTargetChange={setTarget}
-          options={optionsByTool[selected] || {}}
-          onOptionChange={handleOptionChange}
-          onRun={run}
-          onStop={stopScan}
-          isRunning={isRunning}
-        />
+        {section === "recon" ? (
+          <>
+            <ScanForm
+              tool={tool}
+              target={target}
+              onTargetChange={setTarget}
+              options={optionsByTool[selected] || {}}
+              onOptionChange={handleOptionChange}
+              onRun={run}
+              onStop={stopScan}
+              isRunning={isRunning}
+            />
 
-        <div className="workspace">
-          <LiveTerminal logs={viewLogs} isRunning={isRunning && !historyView} status={status} />
+            <div className="workspace">
+              <LiveTerminal logs={viewLogs} isRunning={isRunning && !historyView} status={status} />
 
-          <div className="right-col">
-            <div className="tabbar">
-              <button className={rightTab === "results" ? "tab active" : "tab"} onClick={() => setRightTab("results")}>
-                Results
-              </button>
-              <button className={rightTab === "findings" ? "tab active" : "tab"} onClick={() => setRightTab("findings")}>
-                Findings{findings.length ? ` · ${findings.length}` : ""}
-              </button>
-              <button className={rightTab === "history" ? "tab active" : "tab"} onClick={() => setRightTab("history")}>
-                History{scans.length ? ` · ${scans.length}` : ""}
-              </button>
-              <button className={rightTab === "schedules" ? "tab active" : "tab"} onClick={() => setRightTab("schedules")}>
-                Schedules
-              </button>
+              <div className="right-col">
+                <div className="tabbar">
+                  <button className={rightTab === "results" ? "tab active" : "tab"} onClick={() => setRightTab("results")}>
+                    Results
+                  </button>
+                  <button className={rightTab === "findings" ? "tab active" : "tab"} onClick={() => setRightTab("findings")}>
+                    Findings{findings.length ? ` · ${findings.length}` : ""}
+                  </button>
+                  <button className={rightTab === "history" ? "tab active" : "tab"} onClick={() => setRightTab("history")}>
+                    History{scans.length ? ` · ${scans.length}` : ""}
+                  </button>
+                </div>
+
+                {rightTab === "results" && (
+                  <ResultsPanel
+                    tool={viewToolId}
+                    result={viewResult}
+                    error={viewError}
+                    status={status}
+                    onExport={exportJson}
+                  />
+                )}
+                {rightTab === "findings" && (
+                  <FindingsPanel projectId={workspaceId} findings={findings} />
+                )}
+                {rightTab === "history" && (
+                  <ScanHistory
+                    scans={scans}
+                    toolNames={toolNames}
+                    onReplay={replay}
+                    onDelete={deleteHistoryScan}
+                    onClearAll={clearAllHistory}
+                  />
+                )}
+              </div>
             </div>
 
-            {rightTab === "results" && (
-              <ResultsPanel
-                tool={viewToolId}
-                result={viewResult}
-                error={viewError}
-                status={status}
-                onExport={exportJson}
-              />
-            )}
-            {rightTab === "findings" && (
-              <FindingsPanel projectId={workspaceId} findings={findings} />
-            )}
-            {rightTab === "history" && (
-              <ScanHistory scans={scans} toolNames={toolNames} onReplay={replay} />
-            )}
-            {rightTab === "schedules" && (
-              <SchedulesPanel workspaceId={workspaceId} tools={tools} />
-            )}
-          </div>
-        </div>
+            <StatusBar
+              status={status}
+              elapsed={elapsed}
+              logCount={logs.length}
+              target={historyView ? historyView.target : target}
+              tool={tool?.name}
+            />
+          </>
+        ) : (
+          <div className="purple-area">
+            <div className="purple-head">
+              <div className="purple-head-main">
+                <Icon name="bolt" size={16} />
+                <span>Purple Team</span>
+                <span className="purple-head-sep">/</span>
+                <span className="purple-head-sub">
+                  {(PURPLE_ITEMS.find((p) => p.id === purpleTab) || PURPLE_ITEMS[0]).name}
+                </span>
+              </div>
+              <p className="purple-head-desc">
+                Automated adversary emulation → detection validation → coverage → human-gated exploitation, run end-to-end against your authorized scope.
+              </p>
+            </div>
 
-        <StatusBar
-          status={status}
-          elapsed={elapsed}
-          logCount={logs.length}
-          target={historyView ? historyView.target : target}
-          tool={tool?.name}
-        />
+            <div className="right-col">
+              {purpleTab === "autopent" && <AutoPentestPanel workspaceId={workspaceId} />}
+              {purpleTab === "phistory" && <PurpleHistory workspaceId={workspaceId} />}
+              {purpleTab === "attack" && <AttackMatrix workspaceId={workspaceId} />}
+              {purpleTab === "emulate" && <EmulationPanel workspaceId={workspaceId} />}
+              {purpleTab === "coverage" && <CoveragePanel workspaceId={workspaceId} />}
+              {purpleTab === "exploit" && <ExploitPanel workspaceId={workspaceId} />}
+              {purpleTab === "schedules" && (
+                <SchedulesPanel workspaceId={workspaceId} tools={tools} />
+              )}
+            </div>
+          </div>
+        )}
       </main>
 
       {showBilling && (

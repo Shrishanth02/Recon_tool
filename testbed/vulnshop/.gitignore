@@ -1,0 +1,4 @@
+# The seeded database is generated at runtime — never commit it.
+vulnshop.db
+__pycache__/
+*.pyc

@@ -67,13 +67,11 @@ export default function Login() {
     <div className="auth-screen">
       <div className="auth-card">
         <div className="auth-brand">
-          <div className="brand-mark">
-            <Icon name="shield" size={22} />
-          </div>
-          <div className="brand-text">
-            <span className="brand-name">RECON-X</span>
-            <span className="brand-sub">security console</span>
-          </div>
+          <img
+            src="/logo-lockup.png"
+            alt="RedOpsX — Offensive Security Platform"
+            className="auth-logo"
+          />
         </div>
 
         <h2 className="auth-title">

@@ -105,6 +105,50 @@ def _notify_new_findings(db: Any, scan: Any) -> None:
         return
 
 
+def _authorize_scan_target(db: Any, workspace_id: Any, target: str):
+    """Shared scan security gate: workspace authorization + engagement scope +
+    verified-asset + netguard.
+
+    Mirrors the manual-scan gate in :func:`app.routers.scans.run_scan` so a
+    scheduled or queued scan gets the SAME guarantees. Returns
+    ``(allowed, reason, workspace)``. Reuses the existing ``scope.check`` /
+    ``crud.is_target_authorized`` / ``netguard.validate_target`` — there is no
+    second SSRF or authorization system.
+    """
+    from . import crud, netguard, scope  # deferred: keep app.worker import-safe
+
+    ws = crud.get_workspace(db, workspace_id) if workspace_id else None
+    if ws is None:
+        return False, "workspace not found or unauthorized", None
+    tgt = target or ""
+    allowed, reason = scope.check(tgt, ws.scope)
+    if not allowed:
+        return False, f"out of engagement scope ({reason})", ws
+    if not crud.is_target_authorized(db, ws.id, tgt):
+        return False, "target is not a verified asset for this workspace", ws
+    safe, nreason = netguard.validate_target(tgt)
+    if not safe:
+        return False, f"blocked by netguard ({nreason})", ws
+    return True, "ok", ws
+
+
+def _blocked_reason(workspace_id: Any, target: str) -> "str | None":
+    """Re-run the scan security gate in a fresh session at the worker execution
+    boundary. Returns ``None`` if the scan may proceed, else a clear reason.
+
+    This is the TOCTOU-safe check: a target's DNS, the workspace scope, the
+    verified-asset set, or the workspace itself may have changed between enqueue
+    and execution, so the boundary is re-established here — as close as possible
+    to the network operation — before any scanner runs.
+    """
+    db = SessionLocal()
+    try:
+        allowed, reason, _ws = _authorize_scan_target(db, workspace_id, target)
+        return None if allowed else reason
+    finally:
+        db.close()
+
+
 def _execute_and_persist(job: dict[str, Any]) -> dict[str, Any]:
     """Run one scan synchronously, streaming + persisting its result.
 
@@ -126,31 +170,45 @@ def _execute_and_persist(job: dict[str, Any]) -> dict[str, Any]:
     logs: list = []
     result_data: Any = None
     error_data: Any = None
+    blocked_reason: "str | None" = None
     try:
-        scanner = get_scanner(tool)
-        if scanner is None:
-            error_data = f"Unknown tool: {tool}"
+        # --- P1-B4: execution-boundary security gate (TOCTOU-safe) ---------- #
+        # Revalidate IMMEDIATELY before any scanner runs. A queued/scheduled job
+        # may have been created when the target was safe, but its DNS, the
+        # workspace scope, the verified-asset set, or the workspace itself may
+        # have changed since. If the target no longer passes workspace
+        # authorization + engagement scope + verified-asset + netguard, the
+        # scanner is NOT run: a 'blocked' scan (no findings) is persisted and the
+        # rejection is audited. Same gate as the manual /scans path.
+        blocked_reason = _blocked_reason(job.get("workspace_id"), target)
+        if blocked_reason is not None:
+            error_data = f"scan blocked: {blocked_reason}"
             publisher.publish({"type": "error", "data": error_data})
         else:
-            # A cancel handle exists for parity with the scanner signature; the
-            # queue transport has no cross-process stop channel, so it is simply
-            # never set here.
-            cancel = threading.Event()
-            try:
-                for event in scanner(target, cancel=cancel, **options):
-                    kind = event.get("type")
-                    if kind == "log":
-                        logs.append(event.get("data"))
-                    elif kind == "result":
-                        result_data = event.get("data")
-                    elif kind == "error":
-                        error_data = event.get("data")
-                    publisher.publish(event)
-            except Exception as exc:  # noqa: BLE001 - surface any scanner crash
-                error_data = str(exc)
+            scanner = get_scanner(tool)
+            if scanner is None:
+                error_data = f"Unknown tool: {tool}"
                 publisher.publish({"type": "error", "data": error_data})
+            else:
+                # A cancel handle exists for parity with the scanner signature;
+                # the queue transport has no cross-process stop channel, so it is
+                # simply never set here.
+                cancel = threading.Event()
+                try:
+                    for event in scanner(target, cancel=cancel, **options):
+                        kind = event.get("type")
+                        if kind == "log":
+                            logs.append(event.get("data"))
+                        elif kind == "result":
+                            result_data = event.get("data")
+                        elif kind == "error":
+                            error_data = event.get("data")
+                        publisher.publish(event)
+                except Exception as exc:  # noqa: BLE001 - surface any scanner crash
+                    error_data = str(exc)
+                    publisher.publish({"type": "error", "data": error_data})
 
-        status = "error" if error_data else "done"
+        status = "blocked" if blocked_reason is not None else ("error" if error_data else "done")
         record = {
             "workspace_id": job.get("workspace_id"),
             "created_by": job.get("created_by"),
@@ -173,16 +231,22 @@ def _execute_and_persist(job: dict[str, Any]) -> dict[str, Any]:
             scan_id = scan.id
             ws = crud.get_workspace(db, job["workspace_id"]) if job.get("workspace_id") else None
             if ws is not None:
-                crud.audit(
-                    db,
-                    ws.org_id,
-                    job.get("created_by"),
-                    "scan",
-                    f"{tool} {target} ({status})",
-                )
+                if blocked_reason is not None:
+                    # Do not silently ignore a rejected scan — audit it clearly.
+                    crud.audit(
+                        db, ws.org_id, job.get("created_by"),
+                        "scan-blocked", f"{tool} {target}: {blocked_reason}",
+                    )
+                else:
+                    crud.audit(
+                        db, ws.org_id, job.get("created_by"),
+                        "scan", f"{tool} {target} ({status})",
+                    )
             db.commit()
-            # Phase 4: best-effort new-finding alerts (never crashes the task).
-            _notify_new_findings(db, scan)
+            # Phase 4: best-effort new-finding alerts — only a real (non-blocked)
+            # scan can produce findings to alert on.
+            if blocked_reason is None:
+                _notify_new_findings(db, scan)
         finally:
             db.close()
 
@@ -212,50 +276,135 @@ async def run_scan_task(ctx: dict, job: dict[str, Any]) -> dict[str, Any]:
     return await loop.run_in_executor(None, _execute_and_persist, job)
 
 
+def _run_purple_schedule(db: Any, sched: Any) -> bool:
+    """Run a due ``tool == "purple"`` schedule inline (emulate + validate).
+
+    Resolves the schedule's workspace and the connector it should validate
+    against (its ``config["connector_id"]`` if set and same-org, else the org's
+    default connector), re-checks scope + SSRF/netguard defensively, then runs
+    :func:`app.purple.run_purple`. Returns ``True`` when a purple run actually
+    executed. Never raises — any failure is swallowed so one bad schedule can't
+    wedge the poller (the caller still advances ``next_run_at``).
+
+    Unlike a scanner schedule, this does the work *inline* in the worker rather
+    than enqueuing a job: a purple run is a self-contained emulate+validate unit
+    with no separate scanner backend to dispatch to.
+    """
+    try:
+        from . import crud, netguard, purple, scope  # deferred: keep import-safe
+
+        ws = crud.get_workspace(db, sched.workspace_id)
+        if ws is None:
+            return False
+
+        # Defensive scope + egress re-check (schedule creation isn't target-gated).
+        allowed, _ = scope.check(sched.target, ws.scope)
+        if not allowed:
+            return False
+        safe, _ = netguard.validate_target(sched.target)
+        if not safe:
+            return False
+
+        cfg = getattr(sched, "config", None) or {}
+        connector = None
+        connector_id = cfg.get("connector_id")
+        if connector_id:
+            connector = crud.get_detection_connector(db, connector_id)
+            if connector and connector.org_id != ws.org_id:
+                connector = None
+        if connector is None:
+            connector = crud.default_detection_connector(db, ws.org_id)
+
+        purple.run_purple(
+            db,
+            workspace=ws,
+            target=sched.target,
+            connector=connector,
+            created_by=sched.created_by,
+            technique_ids=cfg.get("techniques"),
+        )
+        return True
+    except Exception:  # noqa: BLE001 - a purple schedule must never wedge the poller
+        return False
+
+
 async def check_schedules(ctx: dict) -> dict[str, Any]:
-    """arq cron poller: enqueue scans for every due :class:`~app.models.Schedule`.
+    """arq cron poller: fire every due :class:`~app.models.Schedule`.
 
     Runs inside the arq worker (so Redis/arq are present at call time). For each
-    schedule returned by :func:`crud.due_schedules` it builds an
-    :class:`app.execution.Job`, enqueues it through the same
-    :func:`app.queue.enqueue_scan` path the API uses, then advances the
-    schedule's ``last_run_at``/``next_run_at`` (recomputed from its cron) so it is
-    not re-fired until due again.
+    schedule returned by :func:`crud.due_schedules`:
+
+    * a ``tool == "purple"`` schedule runs a full purple loop **inline** via
+      :func:`_run_purple_schedule` (emulate + validate; no scanner job), and
+    * every other schedule is enqueued as a scan job through the same
+      :func:`app.queue.enqueue_scan` path the API uses.
+
+    Either way the schedule's ``last_run_at``/``next_run_at`` are advanced
+    (``next_run_at`` recomputed from its cron) so it is not re-fired until due
+    again — even on failure, so a persistently unreachable broker or a broken
+    purple run can't wedge the poller on the same rows.
 
     A no-op when ``settings.SCHEDULER_ENABLED`` is off. Redis/arq/execution
     imports are deferred so ``import app.worker`` stays safe without them.
     """
     if not settings.SCHEDULER_ENABLED:
-        return {"enqueued": 0, "due": 0, "reason": "scheduler disabled"}
+        return {"enqueued": 0, "due": 0, "purple": 0, "reason": "scheduler disabled"}
 
     from . import crud, execution  # local imports keep module import-safe
     from . import queue as queue_mod
 
     db = SessionLocal()
     enqueued = 0
+    purple_runs = 0
+    rejected = 0
     due: list = []
     try:
         due = crud.due_schedules(db)
         for sched in due:
-            job = execution.Job(
-                tool=sched.tool,
-                target=sched.target,
-                options=sched.options or {},
-                workspace_id=sched.workspace_id,
-                created_by=sched.created_by,
-            )
-            job_id = await queue_mod.enqueue_scan(execution._job_to_dict(job))
-            if job_id:
-                enqueued += 1
-            # Advance the schedule even if enqueue failed, so a persistently
-            # unreachable broker can't wedge the poller on the same rows.
+            if (sched.tool or "").strip().lower() == "purple":
+                if _run_purple_schedule(db, sched):
+                    purple_runs += 1
+            else:
+                # P1-B4: refuse to enqueue a scheduled scan whose target no longer
+                # passes workspace authorization + engagement scope + verified-
+                # asset + netguard. Fail-fast layer (the worker re-checks again at
+                # execution time); a rejection is audited, never silently dropped.
+                allowed, reason, ws = _authorize_scan_target(
+                    db, sched.workspace_id, sched.target
+                )
+                if not allowed:
+                    if ws is not None:
+                        crud.audit(
+                            db, ws.org_id, sched.created_by,
+                            "schedule-rejected",
+                            f"{sched.tool} {sched.target}: {reason}",
+                        )
+                    rejected += 1
+                else:
+                    job = execution.Job(
+                        tool=sched.tool,
+                        target=sched.target,
+                        options=sched.options or {},
+                        workspace_id=sched.workspace_id,
+                        created_by=sched.created_by,
+                    )
+                    job_id = await queue_mod.enqueue_scan(execution._job_to_dict(job))
+                    if job_id:
+                        enqueued += 1
+            # Advance the schedule even if the leg failed, so a persistently
+            # unreachable broker (or a bad purple run) can't wedge the poller.
             sched.last_run_at = datetime.now(timezone.utc)
             sched.next_run_at = crud.cron_next(sched.cron)
             db.add(sched)
         db.commit()
     finally:
         db.close()
-    return {"enqueued": enqueued, "due": len(due)}
+    return {
+        "enqueued": enqueued,
+        "due": len(due),
+        "purple": purple_runs,
+        "rejected": rejected,
+    }
 
 
 # arq's ``cron`` helper builds a CronJob; guard the import so this module stays

@@ -58,12 +58,13 @@ def test_report_html_contains_custom_branding(client, auth, fake_scanner):
     assert "Prepared exclusively for the client" in html
 
 
-def test_report_default_still_reconx_when_unbranded():
+def test_report_default_brand_when_unbranded():
     html = report.generate(
         {"name": "Demo Engagement", "description": "", "scope": []},
         findings=[],
         scans=[],
         branding=None,
     )
-    # The unbranded report keeps the RECON-X identity.
-    assert "RECON-X" in html
+    # The unbranded report carries the product's default brand (RedOpsX).
+    assert "RedOpsX" in html
+    assert "RECON-X" not in html

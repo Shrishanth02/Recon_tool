@@ -1,0 +1,18 @@
+{% extends "base.html" %}
+{% block title %}Order #{{ o['id'] }}{% endblock %}
+{% block body %}
+
+<section class="page narrow">
+  <div class="order-ok">✅ Order placed</div>
+  <div class="card-panel">
+    <h1>Order #{{ o['id'] }}</h1>
+    <div class="order-line"><span>{{ o['emoji'] }} {{ o['product_name'] }}</span><span>× {{ o['qty'] }}</span></div>
+    <div class="order-line"><span>Total</span><strong>${{ '%.2f'|format(o['total']) }}</strong></div>
+    <hr>
+    <p><strong>Ship to:</strong> {{ o['customer_name'] }}<br>{{ o['address'] }}</p>
+    <p class="muted">Placed {{ o['created_at'] }}</p>
+  </div>
+  <p class="muted small">Tip: order URLs look like <code>/order/{{ o['id'] }}</code> — try changing the number.</p>
+  <a class="btn btn-primary" href="{{ url_for('index') }}">Continue shopping</a>
+</section>
+{% endblock %}

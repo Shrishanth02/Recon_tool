@@ -113,6 +113,13 @@ def add_member(
     if crud.get_membership(db, target.id, org_id):
         raise HTTPException(status.HTTP_409_CONFLICT, "Already a member")
 
+    # Only an owner may mint another owner — an admin must not be able to
+    # escalate a member (or a second account they control) to owner.
+    if payload.role == "owner" and membership.role != "owner":
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN, "Only an owner can grant the 'owner' role"
+        )
+
     # --- Billing quota gate (Phase 3) --------------------------------------- #
     # No-op unless settings.billing_enabled; over the plan's seat limit -> 402.
     org = crud.get_org(db, org_id)
@@ -145,6 +152,11 @@ def update_member_role(
     target = crud.get_membership(db, user_id, org_id)
     if not target:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Membership not found")
+    # Only an owner may promote anyone to owner (prevents admin self/peer escalation).
+    if payload.role == "owner" and membership.role != "owner":
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN, "Only an owner can grant the 'owner' role"
+        )
     if target.role == "owner" and payload.role != "owner" and _count_owners(db, org_id) <= 1:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "Cannot demote the last owner")
 

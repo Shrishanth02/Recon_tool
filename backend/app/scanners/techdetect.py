@@ -6,6 +6,7 @@ from typing import Iterator, Optional
 import requests
 from builtwith import builtwith
 
+from .. import safe_http
 from .base import ensure_url, error, log, result
 
 
@@ -17,7 +18,8 @@ def stream(target: str, cancel: Optional[threading.Event] = None, **_) -> Iterat
 
     yield log(f"Requesting {url} ...")
     try:
-        response = requests.head(
+        response = safe_http.safe_request(
+            "HEAD",
             url,
             headers={"User-Agent": "Mozilla/5.0 (RECON-X)"},
             timeout=15,

@@ -18,7 +18,17 @@ _SPLIT = re.compile(r"[\s,]+")
 
 
 def _targets(raw: str):
-    return [t.strip() for t in _SPLIT.split(raw or "") if t.strip()]
+    from .base import reject_optionlike
+
+    out = []
+    for t in _SPLIT.split(raw or ""):
+        t = t.strip()
+        if not t:
+            continue
+        host = t.split("://", 1)[-1].split("/")[0]
+        reject_optionlike(host)  # refuse option-like targets (arg-injection guard)
+        out.append(t)
+    return out
 
 
 def stream(
@@ -123,6 +133,11 @@ def stream(
             "cwe": (classification.get("cwe-id") or []),
             "cvss": classification.get("cvss-score"),
             "extracted": obj.get("extracted-results", []),
+            # nuclei includes the raw request/response by default; keep a bounded
+            # copy as real evidence for the matched detection (truncated so a
+            # single large finding can't bloat the scan blob / DB).
+            "request": (obj.get("request") or "")[:4000] or None,
+            "response": (obj.get("response") or "")[:4000] or None,
         }
         findings.append(finding)
         yield log(

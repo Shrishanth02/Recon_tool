@@ -1,0 +1,46 @@
+{% extends "base.html" %}
+{% block title %}{{ store.name }} — {{ store.tagline }}{% endblock %}
+{% block body %}
+
+{% if not active_cat %}
+<section class="hero">
+  <div class="hero-text">
+    <h1>Big tech, small prices.</h1>
+    <p>Fresh gadgets every week. Free shipping over $99.</p>
+    <a class="btn btn-primary" href="#catalog">Shop now</a>
+  </div>
+  <div class="hero-art" aria-hidden="true">
+    <span>🎧</span><span>💻</span><span>⌚</span><span>📷</span>
+  </div>
+</section>
+{% endif %}
+
+<section id="catalog" class="catalog">
+  <div class="catalog-head">
+    <h2>{{ active_cat or "All products" }}</h2>
+    <span class="muted">{{ products|length }} item{{ 's' if products|length != 1 }}</span>
+  </div>
+
+  <div class="grid">
+    {% for p in products %}
+    <article class="card">
+      <a class="card-media" href="{{ url_for('product', pid=p['id']) }}" data-cat="{{ p['category'] }}">
+        <img class="card-img" src="{{ url_for('static', filename='img/' ~ (p['image'] or 'box') ~ '.svg') }}"
+             alt="{{ p['name'] }}" loading="lazy">
+        {% if p['badge'] %}<span class="badge">{{ p['badge'] }}</span>{% endif %}
+      </a>
+      <div class="card-body">
+        <span class="card-cat">{{ p['category'] }}</span>
+        <h3 class="card-title"><a href="{{ url_for('product', pid=p['id']) }}">{{ p['name'] }}</a></h3>
+        <div class="card-foot">
+          <span class="price">${{ '%.2f'|format(p['price']) }}</span>
+          <button class="btn btn-add" data-add="{{ p['id'] }}">Add</button>
+        </div>
+      </div>
+    </article>
+    {% else %}
+    <p class="empty">No products found.</p>
+    {% endfor %}
+  </div>
+</section>
+{% endblock %}

@@ -1,0 +1,5 @@
+VoltMart Invoice #1042
+Customer: Alice Nguyen
+Item: Aurora Wireless Earbuds x1
+Total: $79.99
+(sample file behind the intentional directory-listing vuln)

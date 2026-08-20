@@ -38,7 +38,7 @@ from datetime import datetime, timezone
 from typing import Any, AsyncIterator, Callable
 from uuid import uuid4
 
-from . import netguard, sandbox
+from . import netguard
 from .config import settings
 from .scanners import get_scanner
 
@@ -188,15 +188,10 @@ async def _stream_inline(
     sentinel = object()
     started = _now()
 
-    # Sandbox seam: with SANDBOX_MODE="docker" the scanner tools are intended to
-    # run in ephemeral hardened containers (see app.sandbox). Full wrapping is a
-    # scanners-level concern (out of scope for Phase 2's no-Docker environment);
-    # surface the intent so operators can see it took effect.
-    if settings.use_docker_sandbox:
-        yield {
-            "type": "log",
-            "data": "[sandbox] docker isolation enabled; tools run in ephemeral containers",
-        }
+    # Scanner isolation (environment sanitization, process restriction, or a
+    # container) is applied per-subprocess in app.scanners.base.stream_command,
+    # which also logs the ACTUAL isolation_mode. Nothing is asserted about
+    # isolation here — that avoids ever claiming a level that wasn't applied.
 
     def worker() -> None:
         try:
@@ -380,9 +375,3 @@ def _run_queue_to_completion(job: Job) -> dict[str, Any]:
         return record
 
     return asyncio.run(_consume())
-
-
-# Reference the sandbox seam so the dependency is explicit and importable; the
-# actual per-command wrapping lives in app.sandbox.maybe_wrap for scanners to
-# adopt in a later phase.
-_SANDBOX_SEAM = sandbox.maybe_wrap

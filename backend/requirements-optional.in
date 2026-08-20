@@ -1,0 +1,22 @@
+# OPTIONAL production dependencies — real Metasploit exploitation (opt-in).
+#
+# This lock is NOT installed by the default image or CI. It is only needed when
+# an operator deliberately enables the human-gated real-exploit path
+# (RECONX_REAL_EXPLOIT=true) against their own authorized msfrpcd. app.metasploit
+# imports pymetasploit3 lazily and degrades to "unavailable" when it is absent,
+# so the core safe-probe product runs without this file.
+#
+# Regenerate with:
+#   pip-compile --generate-hashes --allow-unsafe \
+#       --output-file=requirements-optional.txt requirements-optional.in
+# Install (opt-in only):
+#   pip install --require-hashes -r requirements-optional.txt
+#
+# RESIDUAL RISK (accepted, documented — NOT silently suppressed):
+#   pymetasploit3==1.0.6 carries PYSEC-2026-500 with NO upstream fix available.
+#   Because the package is confined to this opt-in file, the advisory does NOT
+#   apply to the default deployment. Operators who install this file accept the
+#   residual risk; it is mitigated by the fact that the exploit path is
+#   human-gated, scope-checked, and only runs against operator-authorized hosts.
+#   Re-evaluate when pymetasploit3 ships a fixed release.
+pymetasploit3>=1.0.6

@@ -7,6 +7,7 @@ and ``save_scan`` logic is a faithful port of the original single-user
 ``Finding`` model with a ``workspace_id`` and ``status="open"``.
 """
 
+import hashlib
 import re
 import secrets
 from datetime import datetime, timezone
@@ -15,10 +16,14 @@ from typing import Any
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from . import models, security
+from . import attack, models, security, vulndb
+from .severity import is_known_severity, normalize_severity
 
 # Severity ordering used when listing findings (critical first).
 _SEV_RANK = {"critical": 0, "high": 1, "medium": 2, "low": 3, "info": 4}
+# Trust ordering for detection tiers (higher = stronger evidence). Used when a
+# re-observed finding is merged: the stronger tier wins.
+_TIER_RANK = {"signal": 0, "validated": 1, "exploited": 2}
 
 
 def _now() -> datetime:
@@ -358,22 +363,82 @@ def save_scan(db: Session, record: dict) -> models.Scan:
     db.add(scan)
     db.flush()  # assign scan.id
 
-    for f in derive_findings(record.get("tool"), record.get("result")):
-        db.add(
-            models.Finding(
-                scan_id=scan.id,
-                workspace_id=record["workspace_id"],
-                source=record.get("tool") or "",
-                severity=f["severity"],
-                name=f["name"],
-                location=f["location"],
-                description=f.get("description", ""),
-                cve=f.get("cve") or [],
-                cwe=f.get("cwe") or [],
-                cvss=f.get("cvss"),
-                status="open",
+    tool = record.get("tool")
+    ws_id = record["workspace_id"]
+    # Track keys created in THIS call so two identical findings in one scan also
+    # dedup against each other (not just against previously-persisted rows).
+    local: dict[str, models.Finding] = {}
+    for f in derive_findings(tool, record.get("result")):
+        # P0-7: normalize severity at the single write boundary so the DB only
+        # ever stores a canonical value (critical|high|medium|low|info). When the
+        # scanner's value was NOT already a known severity, preserve the ORIGINAL
+        # in evidence.raw_severity — never silently discard a scanner's own label.
+        _raw_sev = f.get("severity")
+        if not is_known_severity(_raw_sev):
+            _ev = dict(f.get("evidence") or {})
+            _ev.setdefault("raw_severity", _raw_sev)
+            f["evidence"] = _ev
+        f["severity"] = normalize_severity(_raw_sev)
+
+        # Purple-Team P1: tag the finding with its MITRE ATT&CK technique/tactic.
+        # ``map_finding`` returns None when the tool has no sensible mapping, in
+        # which case both columns stay NULL (the finding renders as "unmapped").
+        mapping = attack.map_finding(tool or "", f) or {}
+        key = _dedupe_key(tool or "", f["name"], f["location"], f.get("cwe"))
+        existing = local.get(key) or db.scalar(
+            select(models.Finding).where(
+                models.Finding.workspace_id == ws_id,
+                models.Finding.dedupe_key == key,
             )
         )
+        if existing is not None:
+            # Re-observed the same issue: merge rather than duplicate. Keep the
+            # strongest severity/tier/confidence, refresh evidence + scan link,
+            # and PRESERVE any analyst triage decision (never reopen a finding a
+            # human marked false_positive/resolved).
+            existing.seen_count = (existing.seen_count or 1) + 1
+            existing.scan_id = scan.id
+            if _SEV_RANK.get(f["severity"], 5) < _SEV_RANK.get(existing.severity, 5):
+                existing.severity = f["severity"]
+            if _TIER_RANK.get(f.get("detection_tier"), 0) > _TIER_RANK.get(
+                existing.detection_tier, 0
+            ):
+                existing.detection_tier = f.get("detection_tier")
+            existing.confidence = max(
+                int(existing.confidence or 0), int(f.get("confidence", 50))
+            )
+            if f.get("evidence"):
+                existing.evidence = f["evidence"]
+            if f.get("cvss") is not None:
+                existing.cvss = (
+                    f["cvss"] if existing.cvss is None
+                    else max(existing.cvss, f["cvss"])
+                )
+            db.add(existing)
+            continue
+        finding = models.Finding(
+            scan_id=scan.id,
+            workspace_id=ws_id,
+            source=tool or "",
+            severity=f["severity"],
+            name=f["name"],
+            location=f["location"],
+            description=f.get("description", ""),
+            cve=f.get("cve") or [],
+            cwe=f.get("cwe") or [],
+            cvss=f.get("cvss"),
+            status="open",
+            technique_id=mapping.get("technique_id"),
+            tactic=mapping.get("tactic"),
+            detection_tier=f.get("detection_tier", "signal"),
+            kind=f.get("kind", "vuln"),
+            confidence=int(f.get("confidence", 50)),
+            evidence=f.get("evidence") or {},
+            dedupe_key=key,
+            seen_count=1,
+        )
+        db.add(finding)
+        local[key] = finding
     db.flush()
     return scan
 
@@ -402,6 +467,30 @@ def get_scan(db: Session, scan_id: int) -> models.Scan | None:
     return db.get(models.Scan, scan_id)
 
 
+def delete_scan(db: Session, scan: models.Scan) -> None:
+    """Delete a stored scan and any findings it produced. Caller commits."""
+    db.query(models.Finding).filter(models.Finding.scan_id == scan.id).delete(
+        synchronize_session=False
+    )
+    db.delete(scan)
+
+
+def clear_workspace_scans(db: Session, workspace_id: int) -> int:
+    """Delete ALL scans + findings for a workspace. Returns #scans removed. Caller commits."""
+    n = (
+        db.query(models.Scan)
+        .filter(models.Scan.workspace_id == workspace_id)
+        .count()
+    )
+    db.query(models.Finding).filter(
+        models.Finding.workspace_id == workspace_id
+    ).delete(synchronize_session=False)
+    db.query(models.Scan).filter(
+        models.Scan.workspace_id == workspace_id
+    ).delete(synchronize_session=False)
+    return n
+
+
 def list_findings(db: Session, workspace_id: int) -> list[models.Finding]:
     """Return findings for a workspace, critical-first then newest-first."""
     rows = db.scalars(
@@ -412,6 +501,97 @@ def list_findings(db: Session, workspace_id: int) -> list[models.Finding]:
 
 def get_finding(db: Session, finding_id: int) -> models.Finding | None:
     return db.get(models.Finding, finding_id)
+
+
+def attack_coverage(db: Session, workspace_id: int) -> dict[str, Any]:
+    """Build a MITRE ATT&CK coverage matrix over a workspace's findings (P1).
+
+    Groups every mapped finding in ``workspace_id`` by ATT&CK tactic, then by
+    technique, counting findings and tallying their severities. Only tactics and
+    techniques with at least one finding are included; findings with no ATT&CK
+    mapping (NULL ``technique_id``) are skipped. Tactics are returned in the
+    canonical ATT&CK kill-chain order (see :data:`app.attack.TACTICS`), and
+    techniques within a tactic are ordered by descending finding count.
+
+    Returns a dict shaped as::
+
+        {
+          "tactics": [
+            {"tactic": <id>, "name": <display>, "techniques": [
+              {"technique_id": <id>, "name": <display>, "count": <int>,
+               "severities": {<severity>: <int>, ...}},
+              ...
+            ]},
+            ...
+          ],
+          "total_techniques": <int>,   # distinct techniques with >=1 finding
+          "total_findings": <int>,     # mapped findings counted
+        }
+    """
+    rows = db.execute(
+        select(
+            models.Finding.tactic,
+            models.Finding.technique_id,
+            models.Finding.severity,
+            func.count(models.Finding.id),
+        )
+        .where(
+            models.Finding.workspace_id == workspace_id,
+            models.Finding.technique_id.is_not(None),
+        )
+        .group_by(
+            models.Finding.tactic,
+            models.Finding.technique_id,
+            models.Finding.severity,
+        )
+    ).all()
+
+    # tactic id -> {technique_id -> {"count": int, "severities": {sev: n}}}
+    tactics: dict[str, dict[str, dict[str, Any]]] = {}
+    total_findings = 0
+    for tactic, technique_id, severity, count in rows:
+        # Resolve the tactic from the technique metadata when the stored value is
+        # missing (defensive; both are written together in save_scan).
+        tactic_id = tactic or attack.TECHNIQUES.get(technique_id, {}).get("tactic")
+        if not technique_id or not tactic_id:
+            continue
+        techniques = tactics.setdefault(tactic_id, {})
+        entry = techniques.setdefault(
+            technique_id, {"count": 0, "severities": {}}
+        )
+        entry["count"] += count
+        entry["severities"][severity] = entry["severities"].get(severity, 0) + count
+        total_findings += count
+
+    tactics_out: list[dict[str, Any]] = []
+    total_techniques = 0
+    for tactic_id in sorted(tactics, key=lambda t: attack.TACTIC_ORDER.get(t, 999)):
+        techniques = tactics[tactic_id]
+        total_techniques += len(techniques)
+        techniques_out = [
+            {
+                "technique_id": tid,
+                "name": attack.TECHNIQUES.get(tid, {}).get("name", tid),
+                "count": data["count"],
+                "severities": data["severities"],
+            }
+            for tid, data in techniques.items()
+        ]
+        # Most-evidenced techniques first, then by id for stable ordering.
+        techniques_out.sort(key=lambda x: (-x["count"], x["technique_id"]))
+        tactics_out.append(
+            {
+                "tactic": tactic_id,
+                "name": attack.TACTIC_NAMES.get(tactic_id, tactic_id),
+                "techniques": techniques_out,
+            }
+        )
+
+    return {
+        "tactics": tactics_out,
+        "total_techniques": total_techniques,
+        "total_findings": total_findings,
+    }
 
 
 def update_finding_status(
@@ -567,14 +747,24 @@ def create_schedule(
     options: dict | None = None,
     enabled: bool = True,
     created_by: int | None = None,
+    config: dict | None = None,
 ) -> models.Schedule:
-    """Create a recurring scan schedule; ``next_run_at`` is derived from ``cron``."""
+    """Create a recurring schedule; ``next_run_at`` is derived from ``cron``.
+
+    ``tool`` is either a scanner id (the worker enqueues a scan job) or the
+    special value ``"purple"`` (the worker runs a full purple loop inline —
+    emulate + validate — via :func:`app.purple.run_purple`). ``config`` carries
+    purple-specific settings that don't belong in the scanner ``options`` blob,
+    e.g. ``{"connector_id": <int>, "techniques": ["E1", ...]}``; it defaults to
+    an empty object for ordinary scanner schedules.
+    """
     sched = models.Schedule(
         workspace_id=workspace_id,
         tool=tool,
         target=target,
         cron=cron,
         options=options or {},
+        config=config or {},
         enabled=enabled,
         created_by=created_by,
         next_run_at=cron_next(cron),
@@ -1131,45 +1321,909 @@ def purge_old_scans(db: Session, org_id: int, older_than_days: int) -> int:
 
 
 # --------------------------------------------------------------------------- #
+# P0: automated pentest runs
+# --------------------------------------------------------------------------- #
+def create_pentest_run(
+    db: Session,
+    workspace_id: int,
+    created_by: int | None,
+    target: str,
+) -> models.PentestRun:
+    """Create a ``PentestRun`` envelope in the ``running`` state.
+
+    Called at the start of an auto-pentest pipeline. ``started_at`` is stamped
+    now; the aggregate risk/summary are filled in later by
+    :func:`finish_pentest_run`. The caller commits.
+    """
+    run = models.PentestRun(
+        workspace_id=workspace_id,
+        created_by=created_by,
+        target=target,
+        status="running",
+        risk_score=0,
+        risk_label="",
+        summary={},
+        started_at=_now(),
+    )
+    db.add(run)
+    db.flush()  # assign run.id
+    return run
+
+
+def finish_pentest_run(
+    db: Session,
+    run: models.PentestRun,
+    status: str,
+    risk_score: int,
+    risk_label: str,
+    summary: dict,
+) -> models.PentestRun:
+    """Finalize a ``PentestRun`` with its terminal status and aggregate risk.
+
+    Sets ``finished_at`` to now and records the final ``risk_score`` /
+    ``risk_label`` / ``summary`` produced by the pipeline's ``pipeline_done``
+    event. The caller commits.
+    """
+    run.status = status or "done"
+    run.risk_score = int(risk_score or 0)
+    run.risk_label = risk_label or ""
+    run.summary = summary or {}
+    run.finished_at = _now()
+    db.add(run)
+    db.flush()
+    return run
+
+
+def list_pentest_runs(
+    db: Session, workspace_id: int, limit: int = 50
+) -> list[models.PentestRun]:
+    """Return a workspace's most recent pentest runs (newest first)."""
+    rows = db.scalars(
+        select(models.PentestRun)
+        .where(models.PentestRun.workspace_id == workspace_id)
+        .order_by(models.PentestRun.id.desc())
+        .limit(limit)
+    ).all()
+    return list(rows)
+
+
+def get_pentest_run(db: Session, run_id: int) -> models.PentestRun | None:
+    """Return a single pentest run by id, or ``None``."""
+    return db.get(models.PentestRun, run_id)
+
+
+def delete_pentest_run(db: Session, run: models.PentestRun) -> None:
+    """Delete an auto-pentest run summary envelope. Caller commits.
+
+    Only removes the run's summary record; the per-stage scans it produced live
+    in the ``scans`` table and are managed from the recon scan history.
+    """
+    db.delete(run)
+
+
+# --------------------------------------------------------------------------- #
+# Purple-Team P2: SAFE ATT&CK emulation runs + per-technique results.
+# --------------------------------------------------------------------------- #
+def create_emulation_run(
+    db: Session,
+    workspace_id: int,
+    created_by: int | None,
+    target: str,
+) -> models.EmulationRun:
+    """Create an :class:`~app.models.EmulationRun` in the ``running`` state.
+
+    Called after the router has enforced scope + netguard + billing, at the start
+    of a SAFE emulation. ``started_at`` is stamped now; the aggregate tallies and
+    ``summary`` are filled in later by :func:`finish_emulation_run`. The caller
+    commits.
+    """
+    run = models.EmulationRun(
+        workspace_id=workspace_id,
+        created_by=created_by,
+        target=target,
+        status="running",
+        executed=0,
+        blocked=0,
+        failed=0,
+        summary={},
+        started_at=_now(),
+    )
+    db.add(run)
+    db.flush()  # assign run.id
+    return run
+
+
+def save_technique_result(
+    db: Session, run_id: int, result: dict
+) -> models.TechniqueResult:
+    """Persist one emulated-technique outcome as a child of an emulation run.
+
+    ``result`` is a single entry from :func:`app.emulation.run_emulation`'s
+    ``results`` list (``{"technique_id","name","tactic","status","evidence",
+    "detail", ...}``). The caller commits.
+    """
+    row = models.TechniqueResult(
+        emulation_run_id=run_id,
+        technique_id=result.get("technique_id", ""),
+        technique_name=result.get("name", ""),
+        tactic=result.get("tactic", ""),
+        status=result.get("status", "failed"),
+        evidence=result.get("evidence", "") or "",
+        detail=result.get("detail", "") or "",
+    )
+    db.add(row)
+    db.flush()
+    return row
+
+
+def finish_emulation_run(
+    db: Session,
+    run: models.EmulationRun,
+    executed: int,
+    blocked: int,
+    failed: int,
+    summary: dict,
+) -> models.EmulationRun:
+    """Finalize an :class:`~app.models.EmulationRun` with its tallies + summary.
+
+    Sets ``status="done"`` and ``finished_at`` to now, and records the aggregate
+    ``executed``/``blocked``/``failed`` counts plus the verbatim engine
+    ``summary``. The caller commits.
+    """
+    run.executed = int(executed or 0)
+    run.blocked = int(blocked or 0)
+    run.failed = int(failed or 0)
+    run.summary = summary or {}
+    run.status = "done"
+    run.finished_at = _now()
+    db.add(run)
+    db.flush()
+    return run
+
+
+def list_emulation_runs(
+    db: Session, workspace_id: int, limit: int = 50
+) -> list[models.EmulationRun]:
+    """Return a workspace's most recent emulation runs (newest first)."""
+    rows = db.scalars(
+        select(models.EmulationRun)
+        .where(models.EmulationRun.workspace_id == workspace_id)
+        .order_by(models.EmulationRun.id.desc())
+        .limit(limit)
+    ).all()
+    return list(rows)
+
+
+def get_emulation_run(db: Session, run_id: int) -> models.EmulationRun | None:
+    """Return a single emulation run by id (with its ordered technique results).
+
+    The ``technique_results`` relationship is ordered by id at the ORM level, so
+    accessing ``run.technique_results`` yields them in execution order.
+    """
+    return db.get(models.EmulationRun, run_id)
+
+
+# --------------------------------------------------------------------------- #
+# Purple-Team P3: detection connectors + correlated detection results.
+# --------------------------------------------------------------------------- #
+def create_detection_connector(
+    db: Session,
+    org_id: int,
+    name: str,
+    ctype: str,
+    config: dict | None = None,
+    enabled: bool = True,
+) -> models.DetectionConnector:
+    """Create an org-scoped :class:`~app.models.DetectionConnector`.
+
+    ``ctype`` selects the connector implementation (validated by the router
+    against :data:`app.connectors.CONNECTOR_TYPES`); ``config`` carries the
+    type-specific settings and may contain secrets. The caller commits.
+    """
+    connector = models.DetectionConnector(
+        org_id=org_id,
+        name=name,
+        ctype=ctype,
+        config=config or {},
+        enabled=enabled,
+    )
+    db.add(connector)
+    db.flush()
+    return connector
+
+
+def list_detection_connectors(
+    db: Session, org_id: int
+) -> list[models.DetectionConnector]:
+    """Return an org's detection connectors (newest first)."""
+    rows = db.scalars(
+        select(models.DetectionConnector)
+        .where(models.DetectionConnector.org_id == org_id)
+        .order_by(models.DetectionConnector.id.desc())
+    ).all()
+    return list(rows)
+
+
+def get_detection_connector(
+    db: Session, connector_id: int
+) -> models.DetectionConnector | None:
+    """Return a single detection connector by id, or ``None``."""
+    return db.get(models.DetectionConnector, connector_id)
+
+
+def default_detection_connector(
+    db: Session, org_id: int
+) -> models.DetectionConnector | None:
+    """Return the org's *default* detection connector, or ``None``.
+
+    The default is simply the oldest **enabled** connector (lowest id). Used by
+    the scheduler (:func:`app.worker.check_schedules`) to resolve which connector
+    a ``tool == "purple"`` schedule validates against when it doesn't name one
+    explicitly in its ``config``.
+    """
+    return db.scalars(
+        select(models.DetectionConnector)
+        .where(
+            models.DetectionConnector.org_id == org_id,
+            models.DetectionConnector.enabled.is_(True),
+        )
+        .order_by(models.DetectionConnector.id)
+        .limit(1)
+    ).first()
+
+
+def delete_detection_connector(
+    db: Session, connector: models.DetectionConnector
+) -> None:
+    """Delete a detection connector.
+
+    Historical :class:`~app.models.DetectionResult` rows survive: their
+    ``connector_id`` FK is ``ON DELETE SET NULL``. The caller commits.
+    """
+    db.delete(connector)
+    db.flush()
+
+
+def save_detection_results(
+    db: Session,
+    run_id: int,
+    connector_id: int | None,
+    results: list[dict],
+) -> list[models.DetectionResult]:
+    """Persist correlated detection results for an emulation run.
+
+    ``results`` is the per-technique list produced by
+    :func:`app.detection.validate_emulation`. One
+    :class:`~app.models.DetectionResult` row is written per entry. The caller
+    commits.
+    """
+    rows: list[models.DetectionResult] = []
+    for r in results or []:
+        row = models.DetectionResult(
+            emulation_run_id=run_id,
+            connector_id=connector_id,
+            technique_id=r.get("technique_id", "") or "",
+            technique_name=r.get("technique_name", "") or "",
+            tactic=r.get("tactic", "") or "",
+            detected=bool(r.get("detected", False)),
+            count=int(r.get("count", 0) or 0),
+            source=r.get("source", "") or "",
+            evidence=r.get("evidence", "") or "",
+        )
+        db.add(row)
+        rows.append(row)
+    db.flush()
+    return rows
+
+
+def list_detection_results(
+    db: Session, run_id: int
+) -> list[models.DetectionResult]:
+    """Return the detection results recorded for an emulation run (in order)."""
+    rows = db.scalars(
+        select(models.DetectionResult)
+        .where(models.DetectionResult.emulation_run_id == run_id)
+        .order_by(models.DetectionResult.id)
+    ).all()
+    return list(rows)
+
+
+# --------------------------------------------------------------------------- #
+# Purple-Team P4: continuous-purple coverage dashboard.
+# --------------------------------------------------------------------------- #
+#: Emulated statuses that produced attributable telemetry (mirrors
+#: :data:`app.detection._COUNTED_STATUSES`). Only these techniques are considered
+#: "emulated" for coverage, so the dashboard's coverage math lines up with what
+#: the detection engine actually scores.
+_COVERAGE_COUNTED_STATUSES: frozenset[str] = frozenset({"executed", "blocked"})
+
+
+def _iso_or_none(value: Any) -> str | None:
+    """Render a datetime as an ISO-8601 string (pass through / None otherwise)."""
+    if isinstance(value, datetime):
+        return value.isoformat()
+    if isinstance(value, str):
+        return value or None
+    return None
+
+
+def coverage_dashboard(db: Session, workspace_id: int) -> dict[str, Any]:
+    """Build the continuous-purple detection-coverage dashboard for a workspace.
+
+    Rolls every emulation run in ``workspace_id`` and its correlated detection
+    results into the *current* posture — for each technique the latest run that
+    emulated it and whether the SIEM/EDR has ever detected it — plus per-tactic
+    rollups, a coverage trend, and the outstanding detection gaps.
+
+    A technique counts as **emulated** only when it produced attributable
+    telemetry (an ``executed``/``blocked`` :class:`~app.models.TechniqueResult`),
+    matching the detection engine's scoring domain. Its ``detected`` verdict is
+    the most recent :class:`~app.models.DetectionResult` for that technique, or
+    ``None`` when it has never been validated.
+
+    Returns a dict shaped as::
+
+        {
+          "summary": {"techniques_emulated", "detected", "missed",
+                      "not_validated", "coverage_pct": int|None},
+          "techniques": [{"technique_id","name","tactic","emulated","detected",
+                          "last_run_id","last_at"}],   # latest per technique
+          "tactics": [{"tactic","name","total","detected","missed"}],  # ATT&CK order
+          "trend": [{"run_id","at","coverage_pct"}],   # runs with detections, last ~20
+          "gaps": [{"technique_id","name","tactic"}],   # emulated but missed
+        }
+
+    ``coverage_pct`` (summary and trend) is a whole-percent integer over the
+    *validated* techniques (detected + missed); the summary value is ``None`` when
+    nothing has been validated yet.
+    """
+    # --- Emulated techniques (counted statuses only), joined to their runs. --- #
+    tr_rows = db.execute(
+        select(
+            models.EmulationRun.id,
+            models.EmulationRun.started_at,
+            models.EmulationRun.finished_at,
+            models.TechniqueResult.technique_id,
+            models.TechniqueResult.technique_name,
+            models.TechniqueResult.tactic,
+            models.TechniqueResult.status,
+        )
+        .join(
+            models.TechniqueResult,
+            models.TechniqueResult.emulation_run_id == models.EmulationRun.id,
+        )
+        .where(models.EmulationRun.workspace_id == workspace_id)
+        .order_by(models.EmulationRun.id)
+    ).all()
+
+    # --- Detection verdicts, joined to their runs (ordered so latest wins). --- #
+    dr_rows = db.execute(
+        select(
+            models.EmulationRun.id,
+            models.DetectionResult.technique_id,
+            models.DetectionResult.detected,
+        )
+        .join(
+            models.DetectionResult,
+            models.DetectionResult.emulation_run_id == models.EmulationRun.id,
+        )
+        .where(models.EmulationRun.workspace_id == workspace_id)
+        .order_by(models.EmulationRun.id, models.DetectionResult.id)
+    ).all()
+
+    # Latest emulating run per technique (rows are ascending by run id, so the
+    # last assignment for a technique is its most recent run).
+    tech_latest: dict[str, dict[str, Any]] = {}
+    run_at: dict[int, Any] = {}
+    for run_id, started, finished, tid, tname, tactic, status in tr_rows:
+        at = finished or started
+        run_at[run_id] = at
+        if status not in _COVERAGE_COUNTED_STATUSES or not tid:
+            continue
+        meta = attack.TECHNIQUES.get(tid, {})
+        tech_latest[tid] = {
+            "technique_id": tid,
+            "name": meta.get("name") or tname or tid,
+            "tactic": tactic or meta.get("tactic", ""),
+            "last_run_id": run_id,
+            "last_at": _iso_or_none(at),
+        }
+
+    # Latest detection verdict per technique + per-run detection tallies (trend).
+    det_latest: dict[str, bool] = {}
+    run_det: dict[int, dict[str, int]] = {}
+    for run_id, tid, detected in dr_rows:
+        det_latest[tid] = bool(detected)
+        tally = run_det.setdefault(run_id, {"total": 0, "detected": 0})
+        tally["total"] += 1
+        if detected:
+            tally["detected"] += 1
+
+    # --- Per-technique current status. ------------------------------------- #
+    techniques: list[dict[str, Any]] = []
+    for tid, info in tech_latest.items():
+        techniques.append({**info, "emulated": True, "detected": det_latest.get(tid)})
+    techniques.sort(
+        key=lambda t: (attack.TACTIC_ORDER.get(t["tactic"], 999), t["technique_id"])
+    )
+
+    detected = sum(1 for t in techniques if t["detected"] is True)
+    missed = sum(1 for t in techniques if t["detected"] is False)
+    not_validated = sum(1 for t in techniques if t["detected"] is None)
+    validated = detected + missed
+    coverage_pct = round(100 * detected / validated) if validated else None
+    summary = {
+        "techniques_emulated": len(techniques),
+        "detected": detected,
+        "missed": missed,
+        "not_validated": not_validated,
+        "coverage_pct": coverage_pct,
+    }
+
+    # --- Per-tactic rollup (ATT&CK kill-chain order). ---------------------- #
+    tactics_map: dict[str, dict[str, int]] = {}
+    for t in techniques:
+        entry = tactics_map.setdefault(
+            t["tactic"] or "", {"total": 0, "detected": 0, "missed": 0}
+        )
+        entry["total"] += 1
+        if t["detected"] is True:
+            entry["detected"] += 1
+        elif t["detected"] is False:
+            entry["missed"] += 1
+    tactics = [
+        {
+            "tactic": tac,
+            "name": attack.TACTIC_NAMES.get(tac, tac or "unmapped"),
+            "total": v["total"],
+            "detected": v["detected"],
+            "missed": v["missed"],
+        }
+        for tac, v in tactics_map.items()
+    ]
+    tactics.sort(key=lambda x: attack.TACTIC_ORDER.get(x["tactic"], 999))
+
+    # --- Coverage trend over runs that were validated (chronological). ----- #
+    trend: list[dict[str, Any]] = []
+    for run_id in sorted(run_det):
+        tally = run_det[run_id]
+        cov = round(100 * tally["detected"] / tally["total"]) if tally["total"] else 0
+        trend.append(
+            {
+                "run_id": run_id,
+                "at": _iso_or_none(run_at.get(run_id)),
+                "coverage_pct": cov,
+            }
+        )
+    trend = trend[-20:]
+
+    # --- Detection gaps: emulated but definitively missed. ----------------- #
+    gaps = [
+        {"technique_id": t["technique_id"], "name": t["name"], "tactic": t["tactic"]}
+        for t in techniques
+        if t["detected"] is False
+    ]
+
+    return {
+        "summary": summary,
+        "techniques": techniques,
+        "tactics": tactics,
+        "trend": trend,
+        "gaps": gaps,
+    }
+
+
+# --------------------------------------------------------------------------- #
 # Finding derivation — turn raw scan results into normalized findings.
 # Ported verbatim from the original backend/app/db.py.
 # --------------------------------------------------------------------------- #
+# --------------------------------------------------------------------------- #
+# Finding derivation — SIGNAL vs VALIDATED classification + evidence & dedup.
+#
+# Every derived finding now carries four extra fields that the persistence layer
+# stores on the Finding row:
+#   * ``detection_tier`` — "signal" (a scanner reported a possible issue),
+#     "validated" (the platform safely verified it and holds evidence), or
+#     "exploited" (reserved for the human-approved P5 path; never set here);
+#   * ``kind``          — "vuln" | "hardening" | "recon" | "info" so that
+#     informational/recon/hardening signal never inflates the vuln risk score;
+#   * ``confidence``    — 0-100, weighted into the risk score;
+#   * ``evidence``      — source-specific supporting data, NEVER invented.
+# --------------------------------------------------------------------------- #
+
+# (detection_tier, kind, confidence) for tools whose scanner emits a normalized
+# ``findings`` list (injection/webaudit/waf). Injection tool-confirms its vulns
+# and webaudit confirms a misconfiguration on a real response, so both are
+# "validated"; a WAF-effectiveness result is a hardening signal, not a vuln.
+_GENERIC_META = {
+    "injection": ("validated", "vuln", 90),
+    "webaudit": ("validated", "vuln", 80),
+    "waf": ("signal", "hardening", 60),
+    "waf_test": ("signal", "hardening", 60),
+}
+
+# Keys a scanner's finding dict may carry that are worth keeping as evidence.
+_EVIDENCE_KEYS = (
+    "evidence", "poc", "payload", "parameter", "param", "place", "technique",
+    "types", "dbms", "matched", "observed", "status", "category",
+    "baseline_status", "url", "header", "cookie",
+)
+
+
+def _aslist(v) -> list:
+    """Coerce a bare cve/cwe scalar to a list so it can never 500 serializers."""
+    if not v:
+        return []
+    return list(v) if isinstance(v, (list, tuple)) else [str(v)]
+
+
+def _norm_location(loc: str) -> str:
+    """Normalize a finding location for stable dedup (lowercase, strip trailing /)."""
+    s = (loc or "").strip().lower()
+    if len(s) > 1 and s.endswith("/"):
+        s = s.rstrip("/")
+    return s
+
+
+def _dedupe_key(source: str, name: str, location: str, cwe) -> str:
+    """Stable identity for a finding, used to deduplicate repeated scans.
+
+    Deliberately specific — includes the tool, the finding name (vuln type), the
+    normalized location and the sorted CWE set — so genuinely *different*
+    findings never collapse together. Two scans that re-observe the SAME issue at
+    the SAME place produce the same key and are merged rather than duplicated.
+    """
+    cwe_part = ",".join(sorted(str(c) for c in (cwe or [])))
+    raw = "|".join(
+        [
+            (source or "").strip().lower(),
+            (name or "").strip().lower(),
+            _norm_location(location),
+            cwe_part,
+        ]
+    )
+    return hashlib.sha256(raw.encode("utf-8", "replace")).hexdigest()[:32]
+
+
+def _extract_evidence(f: dict) -> dict:
+    """Pull the evidence-bearing keys a scanner already emits (never invents)."""
+    ev: dict[str, Any] = {}
+    for k in _EVIDENCE_KEYS:
+        v = f.get(k)
+        if v not in (None, "", [], {}):
+            ev[k] = v
+    nested = f.get("evidence")
+    if isinstance(nested, dict):
+        ev.update(nested)
+    return ev
+
+
+def _secret_severity(stype: str) -> str:
+    """Rate an exposed-secret signal by its type (conservative: high only for
+    clearly high-impact credential families)."""
+    t = (stype or "").lower()
+    if any(
+        k in t
+        for k in ("aws", "private_key", "private-key", "stripe", "gcp", "google",
+                  "slack", "azure", "rsa")
+    ):
+        return "high"
+    return "medium"
+
+
+def _mk(
+    severity, name, location, description, *, cve=None, cwe=None, cvss=None,
+    tier="signal", kind="vuln", confidence=50, evidence=None, tags=None,
+) -> dict:
+    """Build a normalized finding dict carrying the new classification fields."""
+    d = {
+        "severity": severity or "info",
+        "name": name or "finding",
+        "location": location or "",
+        "description": description or "",
+        "cve": _aslist(cve),
+        "cwe": _aslist(cwe),
+        "cvss": cvss,
+        "detection_tier": tier,
+        "kind": kind,
+        "confidence": int(confidence),
+        "evidence": evidence or {},
+    }
+    if tags is not None:
+        # Transient: consumed by attack.map_finding for ATT&CK mapping, not
+        # persisted as a column.
+        d["tags"] = tags
+    return d
+
+
 def derive_findings(tool: str, result) -> list[dict]:
     if not result:
         return []
     if tool == "nuclei":
         out = []
         for f in result.get("findings", []):
-            out.append({
-                "severity": f.get("severity", "info"),
-                "name": f.get("name", f.get("template_id", "finding")),
-                "location": f.get("matched_at", ""),
-                "description": f.get("description", ""),
-                "cve": f.get("cve") or [],
-                "cwe": f.get("cwe") or [],
-                "cvss": f.get("cvss"),
-            })
+            # Preserve template metadata + request/response (when nuclei was run
+            # with -irr) as evidence. Never invent — only keep what is present.
+            ev = {
+                "template_id": f.get("template_id"),
+                "matched_at": f.get("matched_at"),
+                "tags": f.get("tags"),
+                "type": f.get("type"),
+                "reference": f.get("reference"),
+                "extracted": f.get("extracted"),
+                "request": f.get("request"),
+                "response": f.get("response"),
+            }
+            ev = {k: v for k, v in ev.items() if v}
+            out.append(_mk(
+                f.get("severity", "info"),
+                f.get("name", f.get("template_id", "finding")),
+                f.get("matched_at", ""),
+                f.get("description", ""),
+                cve=f.get("cve"), cwe=f.get("cwe"), cvss=f.get("cvss"),
+                # A raw nuclei template match is a SIGNAL — unverified until the
+                # (P1) safe-validation layer re-checks it.
+                tier="signal", kind="vuln", confidence=50,
+                evidence=ev, tags=f.get("tags"),
+            ))
         return out
     if tool == "nmap":
         out = []
+        host = result.get("host", "")
         for p in result.get("ports", []):
             if p.get("state") == "open":
                 svc = p.get("service", "")
-                ver = " ".join(x for x in [p.get("product", ""), p.get("version", "")] if x)
-                out.append({
-                    "severity": "info",
-                    "name": f"Open port {p.get('port')}/{p.get('protocol')} ({svc or 'unknown'})",
-                    "location": f"{result.get('host', '')}:{p.get('port')}",
-                    "description": ver,
-                    "cve": [], "cwe": [], "cvss": None,
-                })
+                product = p.get("product", "")
+                version = p.get("version", "")
+                ver = " ".join(x for x in [product, version] if x)
+                port_ev = {
+                    k: v for k, v in {
+                        "host": host, "port": p.get("port"),
+                        "protocol": p.get("protocol"), "service": svc,
+                        "product": product, "version": version,
+                        "cpe": p.get("cpe"), "state": p.get("state"),
+                    }.items() if v not in (None, "")
+                }
+                out.append(_mk(
+                    "info",
+                    f"Open port {p.get('port')}/{p.get('protocol')} ({svc or 'unknown'})",
+                    f"{host}:{p.get('port')}",
+                    ver,
+                    # An open port is a real observation but NOT a vulnerability —
+                    # recon, so it does not inflate the vuln risk score.
+                    tier="signal", kind="recon", confidence=100, evidence=port_ev,
+                ))
+                # Version -> known-CVE enrichment. Emits a vuln finding ONLY when
+                # the detected version falls inside a known-affected range (a
+                # strong SIGNAL, not a validated exploit). The nmap observation is
+                # preserved as evidence.
+                for hit in vulndb.match(product, version, p.get("cpe")):
+                    out.append(_mk(
+                        hit["severity"],
+                        f"Potentially vulnerable {product} {version}: {hit['cve']}",
+                        f"{host}:{p.get('port')}",
+                        (f"nmap fingerprinted {product} {version} on "
+                         f"{host}:{p.get('port')}. This version matches the affected "
+                         f"range ({hit['affected_range']}) for {hit['cve']} — "
+                         f"{hit['title']}. Version-based inference; confirm the exact "
+                         "build before treating as exploitable."),
+                        cve=[hit["cve"]], cwe=hit.get("cwe"), cvss=hit.get("cvss"),
+                        tier="signal", kind="vuln", confidence=60,
+                        evidence={
+                            "component": product, "version": version,
+                            "cpe": p.get("cpe"), "affected_range": hit["affected_range"],
+                            "matched_product": hit["matched_product"],
+                            "matched_via": "nmap-version",
+                            "nmap_service": svc, "location": f"{host}:{p.get('port')}",
+                        },
+                    ))
         return out
     if tool == "dirbuster":
-        return [{
-            "severity": "info",
-            "name": f"Discovered path /{r.get('path')}",
-            "location": r.get("url", ""),
-            "description": f"HTTP {r.get('status')}",
-            "cve": [], "cwe": [], "cvss": None,
-        } for r in result.get("rows", [])]
+        out = []
+        for r in result.get("rows", []):
+            ev = {
+                k: v for k, v in {
+                    "status": r.get("status"), "size": r.get("size"),
+                    "words": r.get("words"), "lines": r.get("lines"),
+                    "url": r.get("url"),
+                }.items() if v is not None
+            }
+            out.append(_mk(
+                "info",
+                f"Discovered path /{r.get('path')}",
+                r.get("url", ""),
+                f"HTTP {r.get('status')}",
+                # A discovered path is informational, not a vulnerability.
+                tier="signal", kind="info", confidence=80, evidence=ev,
+            ))
+        return out
+    if tool in ("dns_zt", "dns_zone_transfer"):
+        # A SUCCESSFUL AXFR is a genuinely VALIDATED finding: the transfer really
+        # happened and the returned records are hard evidence. (Previously this
+        # confirmed critical was silently dropped.)
+        if not (isinstance(result, dict) and result.get("vulnerable")):
+            return []
+        domain = result.get("domain", "")
+        nss = result.get("vulnerable_nameservers") or []
+        records = result.get("records") or []
+        rec_count = result.get("record_count", len(records))
+        return [_mk(
+            "high",
+            "DNS zone transfer (AXFR) permitted",
+            domain,
+            (f"A full DNS zone transfer succeeded from "
+             f"{', '.join(nss) or 'a nameserver'}, exposing {rec_count} record(s). "
+             "This leaks internal hostnames and infrastructure layout."),
+            cwe=["CWE-200"], tier="validated", kind="vuln", confidence=95,
+            evidence={
+                k: v for k, v in {
+                    "vulnerable_nameservers": nss,
+                    "record_count": rec_count,
+                    "records": records[:50],  # cap embedded evidence
+                }.items() if v
+            },
+        )]
+    if tool == "takeover":
+        # The scanner already classifies each finding's tier/confidence (validated
+        # when a provider fingerprint matched, signal for a dangling CNAME), so
+        # carry those per-finding values through rather than a fixed default.
+        out = []
+        for f in (result.get("findings") or []):
+            if not isinstance(f, dict):
+                continue
+            out.append(_mk(
+                f.get("severity", "info"),
+                f.get("name", "Subdomain takeover"),
+                f.get("location", ""),
+                f.get("description", ""),
+                cwe=f.get("cwe"),
+                tier=f.get("detection_tier", "signal"),
+                kind="vuln",
+                confidence=int(f.get("confidence", 50)),
+                evidence=_extract_evidence(f),
+            ))
+        return out
+    if tool in ("crawl", "auth_crawl"):
+        # Secrets regexed out of client-side JS/HTML are a real detection but an
+        # UNVERIFIED signal — surface them (previously dropped) without claiming
+        # validation.
+        out = []
+        for s in (result.get("js_secrets") or []):
+            stype = str(s.get("type", "secret"))
+            out.append(_mk(
+                _secret_severity(stype),
+                f"Exposed secret in client-side code ({stype})",
+                s.get("source", ""),
+                (f"A string matching a {stype} pattern was found in the site's "
+                 "JavaScript/HTML. This is an unverified signal — confirm whether "
+                 "it is a live credential before treating it as exploitable."),
+                cwe=["CWE-200"], tier="signal", kind="vuln", confidence=40,
+                evidence={
+                    k: v for k, v in {
+                        "type": stype, "preview": s.get("preview"),
+                        "source": s.get("source"),
+                    }.items() if v
+                },
+            ))
+        return out
+    # Deep-scan modules (injection, webaudit, waf_test, …) return a pre-normalized
+    # "findings" list. Classify by tool and preserve whatever evidence the scanner
+    # already emitted.
+    if isinstance(result, dict) and isinstance(result.get("findings"), list):
+        meta_tier, meta_kind, meta_conf = _GENERIC_META.get(tool, ("signal", "vuln", 50))
+        out = []
+        for f in result["findings"]:
+            if not isinstance(f, dict):
+                continue
+            # Honour a finding's OWN classification when the scanner set it (e.g.
+            # ssrf/idor/jwt emit per-finding possible-vs-validated tiers); fall
+            # back to the per-tool default otherwise. Existing scanners
+            # (injection/webaudit/waf) don't set these, so their behaviour is
+            # unchanged.
+            out.append(_mk(
+                f.get("severity") or "info",
+                f.get("name", "finding"),
+                f.get("location", ""),
+                f.get("description", ""),
+                cve=f.get("cve"), cwe=f.get("cwe"), cvss=f.get("cvss"),
+                tier=f.get("detection_tier") or meta_tier,
+                kind=f.get("kind") or meta_kind,
+                confidence=int(f["confidence"]) if f.get("confidence") is not None else meta_conf,
+                evidence=_extract_evidence(f),
+            ))
+        return out
     return []
+
+
+# --------------------------------------------------------------------------- #
+# Purple-Team P5: human-gated, non-destructive exploitation proposals.
+# All helpers flush but do not commit — the caller (router) owns the txn.
+# --------------------------------------------------------------------------- #
+def create_exploit_proposal(
+    db: Session,
+    workspace_id: int,
+    finding_id: int | None,
+    technique_id: str | None,
+    title: str,
+    rationale: str,
+    created_by: int | None,
+) -> models.ExploitProposal:
+    """Create (or return an existing) exploitation proposal — idempotent.
+
+    If a proposal for the same ``(workspace_id, finding_id, technique_id)`` with a
+    still-actionable status (``proposed`` or ``approved``) already exists it is
+    returned unchanged rather than duplicated, so re-running
+    :func:`app.exploit.propose` never fans out duplicate rows for the same finding.
+    """
+    existing = db.scalar(
+        select(models.ExploitProposal)
+        .where(
+            models.ExploitProposal.workspace_id == workspace_id,
+            models.ExploitProposal.finding_id.is_(finding_id)
+            if finding_id is None
+            else models.ExploitProposal.finding_id == finding_id,
+            models.ExploitProposal.technique_id.is_(technique_id)
+            if technique_id is None
+            else models.ExploitProposal.technique_id == technique_id,
+            models.ExploitProposal.status.in_(("proposed", "approved")),
+        )
+        .order_by(models.ExploitProposal.id.desc())
+        .limit(1)
+    )
+    if existing is not None:
+        return existing
+
+    proposal = models.ExploitProposal(
+        workspace_id=workspace_id,
+        finding_id=finding_id,
+        technique_id=technique_id,
+        title=title or "",
+        rationale=rationale or "",
+        status="proposed",
+        created_by=created_by,
+    )
+    db.add(proposal)
+    db.flush()
+    return proposal
+
+
+def list_exploit_proposals(
+    db: Session, workspace_id: int
+) -> list[models.ExploitProposal]:
+    """Return a workspace's exploitation proposals, newest-first."""
+    rows = db.scalars(
+        select(models.ExploitProposal)
+        .where(models.ExploitProposal.workspace_id == workspace_id)
+        .order_by(models.ExploitProposal.id.desc())
+    ).all()
+    return list(rows)
+
+
+def get_exploit_proposal(
+    db: Session, pid: int
+) -> models.ExploitProposal | None:
+    """Return one exploitation proposal by id, or ``None``."""
+    return db.get(models.ExploitProposal, pid)
+
+
+def set_exploit_status(
+    db: Session,
+    proposal: models.ExploitProposal,
+    status: str,
+    *,
+    approved_by: int | None = None,
+    result: dict | None = None,
+) -> models.ExploitProposal:
+    """Transition a proposal's ``status`` (and optionally record approver/result).
+
+    ``approved_by`` is stamped when supplied (on the approve transition); ``result``
+    is stored when supplied (on execute). Flushes but does not commit.
+    """
+    proposal.status = status
+    if approved_by is not None:
+        proposal.approved_by = approved_by
+    if result is not None:
+        proposal.result = result
+    db.add(proposal)
+    db.flush()
+    return proposal

@@ -9,12 +9,17 @@ import {
   fetchAudit,
   exportOrg,
   logoutAll,
+  fetchConnectors,
+  createConnector,
+  deleteConnector,
 } from "../api/client";
 
-// Phase 5 / Settings — the org-admin enterprise console. Four sections:
-//   Branding — white-label name/color/logo/footer with a live preview swatch.
+// Phase 5 / Settings — the org-admin enterprise console. Five sections:
+//   Branding  — white-label name/color/logo/footer with a live preview swatch.
 //   SSO       — OIDC provider/issuer/client id + enable toggle (secret is
 //               write-only: never returned, only sent when re-entered).
+//   Detection — Purple-Team P3 SIEM/EDR connectors (mock/http/splunk/elastic):
+//               list + add (secret config fields are write-only) + delete.
 //   Security  — "Sign out everywhere" (revoke all sessions) then re-login.
 //   Audit     — scrollable audit table + a one-click org JSON export.
 // Every remote call is admin-gated on the backend; a 403 (or any failure) is
@@ -24,11 +29,68 @@ import {
 const TABS = [
   { key: "branding", label: "Branding", icon: "shield" },
   { key: "sso", label: "SSO", icon: "id" },
+  { key: "detection", label: "Detection", icon: "radar" },
   { key: "security", label: "Security", icon: "bolt" },
   { key: "audit", label: "Audit", icon: "history" },
 ];
 
 const SSO_PROVIDERS = ["oidc", "saml", "google", "okta", "azuread"];
+
+// --------------------------------------------------------------------------- //
+// Detection connector type catalog (Purple-Team P3)
+// --------------------------------------------------------------------------- //
+// Each connector type declares its config fields. `secret: true` fields are
+// write-only — rendered as password inputs and only ever sent to the backend,
+// never displayed (the OUT schema masks them to "***"). `kind` drives light
+// parsing so numbers / lists reach the backend in the right shape.
+const CONNECTOR_TYPES = [
+  {
+    ctype: "mock",
+    label: "Mock (demo / testing)",
+    blurb: "Deterministic connector for demos + tests. Detects a technique when it is listed, or by coverage probability.",
+    fields: [
+      { key: "coverage", label: "Coverage", kind: "number", placeholder: "0.0 – 1.0", hint: "Fraction of techniques detected (0–1)." },
+      { key: "detect_technique_ids", label: "Always-detect technique IDs", kind: "list", placeholder: "T1071, T1595", hint: "Comma-separated ATT&CK IDs." },
+    ],
+  },
+  {
+    ctype: "http",
+    label: "Generic HTTP / webhook",
+    blurb: "POST/GET a search query to any HTTP SIEM API. Detected when the hit count at count_path is > 0.",
+    fields: [
+      { key: "search_url", label: "Search URL", kind: "text", placeholder: "https://siem.example.com/api/search" },
+      { key: "method", label: "HTTP method", kind: "text", placeholder: "POST" },
+      { key: "count_path", label: "Count path", kind: "text", placeholder: "total", hint: "Dot-path to the hit count in the JSON response." },
+      { key: "body_template", label: "Body template", kind: "text", placeholder: '{"q":"{marker} {technique_id} since {since}"}', hint: "Supports {technique_id} / {marker} / {since}." },
+      { key: "headers", label: "Headers (JSON)", kind: "json", secret: true, placeholder: '{"Authorization":"Bearer …"}' },
+      { key: "auth", label: "Auth", kind: "text", secret: true, placeholder: "user:pass or token" },
+    ],
+  },
+  {
+    ctype: "splunk",
+    label: "Splunk",
+    blurb: "Runs a oneshot search via the Splunk REST API, filtered by marker + time. Needs live credentials to return hits.",
+    fields: [
+      { key: "base_url", label: "Base URL", kind: "text", placeholder: "https://splunk.example.com:8089" },
+      { key: "index", label: "Index", kind: "text", placeholder: "main" },
+      { key: "token", label: "Token", kind: "text", secret: true, placeholder: "Splunk auth token" },
+    ],
+  },
+  {
+    ctype: "elastic",
+    label: "Elastic",
+    blurb: "Queries {index}/_search on the marker + @timestamp. Needs live credentials to return hits.",
+    fields: [
+      { key: "base_url", label: "Base URL", kind: "text", placeholder: "https://es.example.com:9200" },
+      { key: "index", label: "Index", kind: "text", placeholder: "logs-*" },
+      { key: "api_key", label: "API key", kind: "text", secret: true, placeholder: "base64 API key" },
+    ],
+  },
+];
+
+function connectorMeta(ctype) {
+  return CONNECTOR_TYPES.find((c) => c.ctype === ctype) || null;
+}
 
 function fmtWhen(iso) {
   if (!iso) return "";
@@ -76,6 +138,7 @@ export default function SettingsPanel({ orgId }) {
           <>
             {tab === "branding" && <BrandingSection orgId={orgId} />}
             {tab === "sso" && <SsoSection orgId={orgId} />}
+            {tab === "detection" && <DetectionSection orgId={orgId} />}
             {tab === "security" && <SecuritySection logout={logout} />}
             {tab === "audit" && <AuditSection orgId={orgId} />}
           </>
@@ -460,6 +523,345 @@ function SsoSection({ orgId }) {
     </div>
   );
 }
+
+// --------------------------------------------------------------------------- //
+// Detection connectors (Purple-Team P3)
+// --------------------------------------------------------------------------- //
+// List the org's SIEM/EDR connectors, add a new one (type-specific config with
+// write-only secret fields), and delete. Secrets are never returned by the
+// backend — the OUT schema masks them to "***" and reports only `config_keys`,
+// so this panel never re-displays a stored secret.
+function DetectionSection({ orgId }) {
+  const [rows, setRows] = useState([]);
+  const [loading, setLoading] = useState(false);
+  const [loadErr, setLoadErr] = useState(null);
+
+  // Add-connector form state.
+  const [ctype, setCtype] = useState(CONNECTOR_TYPES[0].ctype);
+  const [name, setName] = useState("");
+  const [config, setConfig] = useState({}); // { fieldKey: rawString }
+  const [enabled, setEnabled] = useState(true);
+  const [saving, setSaving] = useState(false);
+  const [saveNote, setSaveNote] = useState(null); // { kind, text }
+  const [deletingId, setDeletingId] = useState(null);
+
+  const meta = connectorMeta(ctype);
+
+  const load = useCallback(async () => {
+    setLoading(true);
+    setLoadErr(null);
+    try {
+      const data = await fetchConnectors(orgId);
+      setRows(Array.isArray(data) ? data : []);
+    } catch (e) {
+      setLoadErr(e?.message || "Failed to load detection connectors");
+    } finally {
+      setLoading(false);
+    }
+  }, [orgId]);
+
+  useEffect(() => {
+    load();
+  }, [load]);
+
+  // Switching type resets the type-specific config so stale fields don't leak.
+  const onTypeChange = (e) => {
+    setCtype(e.target.value);
+    setConfig({});
+    setSaveNote(null);
+  };
+
+  const setField = (key) => (e) =>
+    setConfig((c) => ({ ...c, [key]: e.target.value }));
+
+  // Turn the raw string form into the typed config the backend expects.
+  const buildConfig = () => {
+    const out = {};
+    for (const f of meta.fields) {
+      const raw = (config[f.key] ?? "").trim();
+      if (!raw) continue; // omit empties — keeps secrets write-only + config clean
+      if (f.kind === "number") {
+        const n = Number(raw);
+        if (!Number.isNaN(n)) out[f.key] = n;
+      } else if (f.kind === "list") {
+        const items = raw.split(",").map((s) => s.trim()).filter(Boolean);
+        if (items.length) out[f.key] = items;
+      } else if (f.kind === "json") {
+        try {
+          out[f.key] = JSON.parse(raw);
+        } catch {
+          throw new Error(`"${f.label}" must be valid JSON.`);
+        }
+      } else {
+        out[f.key] = raw;
+      }
+    }
+    return out;
+  };
+
+  const onAdd = useCallback(async () => {
+    if (saving) return;
+    const nm = name.trim();
+    if (!nm) {
+      setSaveNote({ kind: "err", text: "Give the connector a name." });
+      return;
+    }
+    let cfg;
+    try {
+      cfg = buildConfig();
+    } catch (e) {
+      setSaveNote({ kind: "err", text: e.message });
+      return;
+    }
+    setSaving(true);
+    setSaveNote(null);
+    try {
+      await createConnector(orgId, { name: nm, ctype, config: cfg, enabled });
+      setName("");
+      setConfig({});
+      setEnabled(true);
+      setSaveNote({ kind: "ok", text: "Connector added." });
+      load();
+    } catch (e) {
+      setSaveNote({ kind: "err", text: e?.message || "Failed to add connector" });
+    } finally {
+      setSaving(false);
+    }
+  }, [orgId, name, ctype, config, enabled, saving, meta, load]);
+
+  const onDelete = useCallback(
+    async (id) => {
+      if (deletingId) return;
+      setDeletingId(id);
+      try {
+        await deleteConnector(id);
+        setRows((rs) => rs.filter((r) => r.id !== id));
+      } catch (e) {
+        setSaveNote({ kind: "err", text: e?.message || "Failed to delete connector" });
+      } finally {
+        setDeletingId(null);
+      }
+    },
+    [deletingId]
+  );
+
+  return (
+    <div className="settings-section">
+      {/* Existing connectors */}
+      <div className="settings-audit-bar">
+        <span className="bill-section-label" style={{ margin: 0 }}>
+          Connectors{rows.length ? ` · ${rows.length}` : ""}
+        </span>
+        <div className="panel-actions">
+          <button className="btn-ghost" onClick={load} disabled={loading} title="Reload">
+            <Icon name="history" size={14} /> Refresh
+          </button>
+        </div>
+      </div>
+
+      {loading ? (
+        <div className="muted sched-empty">Loading connectors…</div>
+      ) : loadErr ? (
+        <div className="result-error">
+          <Icon name="x" size={16} /> {loadErr}
+        </div>
+      ) : rows.length === 0 ? (
+        <div className="results-empty">
+          <Icon name="radar" size={28} />
+          <p>No detection connectors yet. Add one below to validate emulations.</p>
+        </div>
+      ) : (
+        <div className="conn-list">
+          {rows.map((r) => (
+            <div className="conn-item" key={r.id}>
+              <div className="conn-item-main">
+                <span className="conn-name">{r.name}</span>
+                <span className="pill pill-info conn-ctype">{r.ctype}</span>
+                {!r.enabled && <span className="pill pill-dim">disabled</span>}
+              </div>
+              {Array.isArray(r.config_keys) && r.config_keys.length > 0 && (
+                <div className="conn-keys">
+                  {r.config_keys.map((k) => (
+                    <span className="conn-key mono" key={k}>
+                      {k}
+                    </span>
+                  ))}
+                </div>
+              )}
+              <button
+                className="btn-ghost conn-del"
+                onClick={() => onDelete(r.id)}
+                disabled={deletingId === r.id}
+                title="Delete connector"
+              >
+                {deletingId === r.id ? (
+                  <span className="rec-dot" />
+                ) : (
+                  <Icon name="trash" size={14} />
+                )}
+              </button>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {/* Add connector */}
+      <div className="conn-add">
+        <div className="conn-add-head">Add connector</div>
+
+        <div className="settings-grid">
+          <label className="settings-field">
+            <span>Name</span>
+            <input
+              type="text"
+              value={name}
+              onChange={(e) => setName(e.target.value)}
+              placeholder="Prod Splunk"
+            />
+          </label>
+
+          <label className="settings-field">
+            <span>Type</span>
+            <select value={ctype} onChange={onTypeChange}>
+              {CONNECTOR_TYPES.map((c) => (
+                <option key={c.ctype} value={c.ctype}>
+                  {c.label}
+                </option>
+              ))}
+            </select>
+          </label>
+        </div>
+
+        {meta?.blurb && (
+          <p className="settings-hint">
+            <Icon name="shield" size={13} /> {meta.blurb}
+          </p>
+        )}
+
+        <div className="settings-grid">
+          {meta.fields.map((f) => (
+            <label
+              key={f.key}
+              className={
+                f.kind === "json" || f.kind === "list" || f.key === "body_template"
+                  ? "settings-field settings-field-wide"
+                  : "settings-field"
+              }
+            >
+              <span>
+                {f.label}{" "}
+                {f.secret && <em className="auth-optional">write-only</em>}
+              </span>
+              <input
+                type={f.secret ? "password" : "text"}
+                className={f.kind === "text" && !f.secret ? undefined : "mono"}
+                autoComplete={f.secret ? "new-password" : "off"}
+                value={config[f.key] ?? ""}
+                onChange={setField(f.key)}
+                placeholder={f.placeholder || ""}
+              />
+              {f.hint && <span className="conn-field-hint">{f.hint}</span>}
+            </label>
+          ))}
+        </div>
+
+        <label className="settings-toggle">
+          <input
+            type="checkbox"
+            checked={enabled}
+            onChange={(e) => setEnabled(e.target.checked)}
+          />
+          <span className="settings-toggle-track" aria-hidden="true">
+            <span className="settings-toggle-knob" />
+          </span>
+          <span className="settings-toggle-label">
+            Connector {enabled ? "enabled" : "disabled"}
+          </span>
+        </label>
+
+        <p className="settings-hint">
+          <Icon name="shield" size={13} /> Secret fields are write-only — they are
+          sent once and never returned to the browser.
+        </p>
+
+        {saveNote && (
+          <div
+            className={
+              saveNote.kind === "ok"
+                ? "settings-ok triage-note"
+                : "result-error triage-note"
+            }
+          >
+            <Icon name={saveNote.kind === "ok" ? "check" : "x"} size={16} />{" "}
+            {saveNote.text}
+          </div>
+        )}
+
+        <div className="settings-actions">
+          <button className="btn btn-run settings-save" onClick={onAdd} disabled={saving}>
+            {saving ? (
+              <>
+                <span className="rec-dot" /> Adding…
+              </>
+            ) : (
+              <>
+                <Icon name="check" size={13} /> Add connector
+              </>
+            )}
+          </button>
+        </div>
+      </div>
+
+      <style>{DETECTION_CSS}</style>
+    </div>
+  );
+}
+
+// Component-scoped styles for the Detection section — token-driven, no hardcoded
+// greys, so it tracks the app's light/dark themes.
+const DETECTION_CSS = `
+.conn-list { display: flex; flex-direction: column; gap: 8px; }
+.conn-item {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 12px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border);
+  background: var(--bg-elev);
+}
+.conn-item-main { display: inline-flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.conn-name { font-weight: 600; font-size: 13.5px; color: var(--text); }
+.conn-ctype { text-transform: uppercase; letter-spacing: 0.04em; }
+.conn-keys { display: inline-flex; gap: 5px; flex-wrap: wrap; flex: 1; }
+.conn-key {
+  font-size: 11px;
+  color: var(--text-faint);
+  background: var(--panel-2);
+  border: 1px solid var(--border-soft);
+  border-radius: 6px;
+  padding: 1px 7px;
+}
+.conn-del { margin-left: auto; color: var(--danger); flex: 0 0 auto; }
+.conn-del:hover:not(:disabled) { color: var(--danger); opacity: 0.8; }
+
+.conn-add {
+  margin-top: 6px;
+  padding-top: 14px;
+  border-top: 1px solid var(--border-soft);
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+.conn-add-head {
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--text-faint);
+}
+.conn-field-hint { font-size: 11px; color: var(--text-faint); line-height: 1.4; }
+`;
 
 // --------------------------------------------------------------------------- //
 // Security

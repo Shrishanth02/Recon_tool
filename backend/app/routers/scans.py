@@ -202,6 +202,52 @@ def get_scan(
     return schemas.ScanOut.model_validate(scan)
 
 
+def _authorize_workspace_write(
+    db: Session, user: models.User, ws_id: int, role: str = "analyst"
+) -> tuple[models.Workspace, models.Membership]:
+    """Load a workspace the ``user`` may modify at ``role``+, or 404/403."""
+    ws = crud.get_workspace(db, ws_id)
+    membership = crud.get_membership(db, user.id, ws.org_id) if ws else None
+    if not ws or not membership:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Workspace not found")
+    if security.ROLE_RANK.get(membership.role, -1) < security.ROLE_RANK[role]:
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN, f"Requires role '{role}' or higher"
+        )
+    return ws, membership
+
+
+@router.delete("/scans/{scan_id}", status_code=204)
+def delete_scan(
+    scan_id: int = Path(...),
+    user: models.User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Delete a single stored scan (and its findings). Analyst+ within its workspace."""
+    scan = crud.get_scan(db, scan_id)
+    if not scan:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Scan not found")
+    ws, membership = _authorize_workspace_write(db, user, scan.workspace_id, "analyst")
+    crud.delete_scan(db, scan)
+    crud.audit(db, ws.org_id, user.id, "scan-delete", f"scan #{scan_id} ({scan.tool} {scan.target})")
+    db.commit()
+    return None
+
+
+@router.delete("/workspaces/{ws_id}/scans")
+def clear_scans(
+    ws_id: int = Path(...),
+    user: models.User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Clear ALL scan history + findings for a workspace. Admin+ (destructive)."""
+    ws, membership = _authorize_workspace_write(db, user, ws_id, "admin")
+    removed = crud.clear_workspace_scans(db, ws.id)
+    crud.audit(db, ws.org_id, user.id, "scans-clear", f"cleared {removed} scan(s) from ws {ws.id}")
+    db.commit()
+    return {"deleted": removed}
+
+
 @router.get("/workspaces/{ws_id}/findings", response_model=list[schemas.FindingOut])
 def list_findings(
     ctx: tuple[models.Workspace, models.Membership] = Depends(get_workspace_for_user),

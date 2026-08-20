@@ -10,12 +10,21 @@ export const HTTP_BASE =
   import.meta.env.VITE_API_BASE || "http://127.0.0.1:8002";
 
 const WS_BASE = HTTP_BASE.replace(/^http/, "ws") + "/ws/scan";
+const PIPELINE_WS_BASE = HTTP_BASE.replace(/^http/, "ws") + "/ws/pipeline";
 
 // `WS_URL` is an ESM live binding: `useScan` imports it and reads it at
 // connect-time, so reassigning it here (via setAuthToken) transparently makes
 // every subsequent WebSocket carry the freshest access token — no change to the
 // scan hook required.
 export let WS_URL = WS_BASE;
+
+// Pipeline WS URL — updated in sync with the auth token.
+export let PIPELINE_WS_URL = PIPELINE_WS_BASE;
+
+/** Returns the pipeline WebSocket URL with the current auth token baked in. */
+export function getPipelineWsUrl() {
+  return PIPELINE_WS_URL;
+}
 
 // --------------------------------------------------------------------------- //
 // Auth token wiring
@@ -30,6 +39,9 @@ export function setAuthToken(token) {
   WS_URL = accessToken
     ? `${WS_BASE}?token=${encodeURIComponent(accessToken)}`
     : WS_BASE;
+  PIPELINE_WS_URL = accessToken
+    ? `${PIPELINE_WS_BASE}?token=${encodeURIComponent(accessToken)}`
+    : PIPELINE_WS_BASE;
 }
 
 export function getAuthToken() {
@@ -190,8 +202,145 @@ export function fetchScan(scanId) {
   return request(`/scans/${scanId}`);
 }
 
+// Delete a single stored scan (+ its findings). Analyst+.
+export function deleteScan(scanId) {
+  return request(`/scans/${scanId}`, { method: "DELETE" });
+}
+
+// Clear ALL scan history + findings for a workspace. Admin+.
+export function clearWorkspaceScans(wsId) {
+  return request(`/workspaces/${wsId}/scans`, { method: "DELETE" });
+}
+
 export function patchFinding(findingId, status) {
   return request(`/findings/${findingId}`, { method: "PATCH", body: { status } });
+}
+
+// MITRE ATT&CK coverage matrix for a workspace (P1). Returns
+// { tactics:[{ tactic, name, techniques:[{ technique_id, name, count, severities }] }],
+//   total_techniques, total_findings }. Only tactics/techniques with >=1 mapped
+// finding are present; an empty coverage yields empty `tactics` + zero totals.
+export function fetchAttackCoverage(wsId) {
+  return request(`/workspaces/${wsId}/attack-coverage`);
+}
+
+// --------------------------------------------------------------------------- //
+// Purple-Team P2: SAFE ATT&CK emulation (workspace-scoped)
+// --------------------------------------------------------------------------- //
+
+// Run a set of SAFE, non-destructive ATT&CK technique emulations against an
+// authorized target (analyst+). Body: { target, techniques? } where `techniques`
+// is an optional list of emu ids (E1..E5); omit/undefined runs all. The backend
+// scope-checks + netguard-checks + quota-checks first, then returns the completed
+// run: EmulationRunOut { id, target, status, executed, blocked, failed, summary,
+// started_at, finished_at, technique_results:[{ technique_id, technique_name,
+// tactic, status, evidence, detail }] }.
+export function runEmulation(wsId, { target, techniques } = {}) {
+  return request(`/workspaces/${wsId}/emulate`, {
+    method: "POST",
+    body: { target, ...(techniques ? { techniques } : {}) },
+  });
+}
+
+// List the workspace's past emulation runs, newest-first (member+).
+export function fetchEmulations(wsId) {
+  return request(`/workspaces/${wsId}/emulations`); // -> EmulationRunOut[]
+}
+
+// One emulation run with its ordered technique results (member via the run's ws).
+export function fetchEmulation(runId) {
+  return request(`/emulations/${runId}`);
+}
+
+// --------------------------------------------------------------------------- //
+// Purple-Team P3: detection validation / SIEM connectors
+// --------------------------------------------------------------------------- //
+
+// List an org's detection connectors (member/viewer+). Secrets are masked by the
+// backend: each DetectionConnectorOut exposes { id, org_id, name, ctype, enabled,
+// created_at, config_keys:[...], config:{...redacted...} } — secret-bearing keys
+// (token/api_key/auth/password/secret/headers) come back as "***", never the value.
+export function fetchConnectors(orgId) {
+  return request(`/orgs/${orgId}/detection-connectors`);
+}
+
+// Create a detection connector (admin+). `body` is DetectionConnectorIn:
+// { name, ctype: "mock"|"http"|"splunk"|"elastic", config:{...}, enabled }. The
+// config may carry secrets on the way in; they are never echoed back out.
+export function createConnector(orgId, body) {
+  return request(`/orgs/${orgId}/detection-connectors`, { method: "POST", body });
+}
+
+// Delete a detection connector by id (admin+). Historical detection results are
+// preserved (their FK is SET NULL on the backend).
+export function deleteConnector(connectorId) {
+  return request(`/detection-connectors/${connectorId}`, { method: "DELETE" });
+}
+
+// Validate an emulation run against a connector (analyst+). Asks the defender
+// SIEM/EDR "did you detect each emulated technique?", persists the verdicts, and
+// returns the envelope { results: DetectionResultOut[], summary: DetectionSummaryOut }
+// where summary = { total, detected, missed, coverage_pct, window_seconds, source }.
+export function validateEmulation(runId, connectorId) {
+  const qs = new URLSearchParams({ connector_id: connectorId }).toString();
+  return request(`/emulations/${runId}/validate?${qs}`, { method: "POST" });
+}
+
+// The persisted detection results for an emulation run (member read) ->
+// DetectionResultOut[] { technique_id, technique_name, tactic, detected, count,
+// source, evidence, ... }.
+export function fetchDetections(runId) {
+  return request(`/emulations/${runId}/detections`);
+}
+
+// --------------------------------------------------------------------------- //
+// Purple-Team P4: continuous purple loop + coverage dashboard (workspace-scoped)
+// --------------------------------------------------------------------------- //
+
+// Run ONE continuous purple loop against an authorized target (analyst+):
+// emulate SAFE ATT&CK techniques, then — when `connector_id` is given — validate
+// each against that org SIEM/EDR connector in a single request. The backend
+// scope-checks + netguard-checks + quota-checks first, persists the emulation run
+// (+ detection results), evaluates coverage drift vs. the previous purple run, and
+// returns the envelope { emulation_run: EmulationRunOut, detections:
+// DetectionResultOut[], summary: { emulation_run_id, target, executed, blocked,
+// failed, validated, detected|null, missed|null, coverage_pct|null, total, source,
+// window_seconds, drift }, drift? } — `detected`/`coverage_pct` are null when no
+// connector was supplied (emulate-only). `techniques` optionally limits the emu
+// ids (E1..E5); omit to run all.
+export function runPurple(wsId, { target, connector_id, techniques } = {}) {
+  return request(`/workspaces/${wsId}/purple-run`, {
+    method: "POST",
+    body: {
+      target,
+      ...(connector_id ? { connector_id: Number(connector_id) } : {}),
+      ...(techniques ? { techniques } : {}),
+    },
+  });
+}
+
+// The workspace's rolled-up detection-coverage dashboard (member+). Returns
+// { summary: { techniques_emulated, detected, missed, not_validated,
+//   coverage_pct: int|null },
+//   techniques: [{ technique_id, name, tactic, emulated, detected: bool|null,
+//     last_run_id, last_at }],           // latest status per technique
+//   tactics: [{ tactic, name, total, detected, missed }],  // ATT&CK order
+//   trend: [{ run_id, at, coverage_pct }],                 // validated runs, last ~20
+//   gaps: [{ technique_id, name, tactic }] }.              // emulated but missed
+// An empty workspace yields zeroed summary + empty arrays (a clean empty state).
+export function fetchCoverage(wsId) {
+  return request(`/workspaces/${wsId}/coverage`);
+}
+
+// Auto-pentest run history (newest first) + full run detail + delete.
+export function fetchPentestRuns(wsId) {
+  return request(`/workspaces/${wsId}/pentest-runs`); // -> PentestRunOut[]
+}
+export function fetchPentestRun(wsId, runId) {
+  return request(`/workspaces/${wsId}/pentest-runs/${runId}`); // -> PentestRunDetailOut (with process)
+}
+export function deletePentestRun(wsId, runId) {
+  return request(`/workspaces/${wsId}/pentest-runs/${runId}`, { method: "DELETE" });
 }
 
 // --------------------------------------------------------------------------- //
@@ -360,5 +509,85 @@ export function reportUrl(wsId) {
 export async function fetchReportHtml(wsId) {
   const res = await fetch(reportUrl(wsId), { headers: { ...authHeader() } });
   if (!res.ok) throw new Error(`Report failed (${res.status})`);
+  return res.text();
+}
+
+// --------------------------------------------------------------------------- //
+// Purple-Team P5: human-gated, non-destructive exploit validation
+// --------------------------------------------------------------------------- //
+//
+// The honest market boundary of RECON-X: the platform *proposes* exploit
+// candidates from a workspace's findings and *validates reachability* with SAFE,
+// non-destructive probes (benign TCP connect / HTTP GET / X-RECONX marker — the
+// same philosophy as app/emulation). It NEVER auto-exploits: every proposal is
+// human-gated (must be explicitly `approved` before `execute` is allowed), each
+// execution passes scope + SSRF checks and runs sandboxed, and no destructive
+// payload, shell, or data-exfil is ever sent.
+
+// Ask the backend to propose exploit candidates from the workspace's findings
+// (analyst+). Returns { proposals:[...] } OR a bare list — callers handle both.
+// Each proposal: { id, finding_id, technique_id, title, rationale, status,
+// approved_by, result, created_at }; fresh proposals come back as status
+// "proposed" (awaiting human approval).
+export function proposeExploits(wsId) {
+  return request(`/workspaces/${wsId}/exploit/propose`, { method: "POST" });
+}
+
+// List the workspace's exploit proposals, newest-first (member+) ->
+// ExploitProposalOut[] (see shape above).
+export function fetchExploitProposals(wsId) {
+  return request(`/workspaces/${wsId}/exploit/proposals`);
+}
+
+// Approve a proposal for execution (admin+ — the human gate). May respond 403
+// for non-admins; request() throws with the backend `detail`, which the panel
+// surfaces cleanly. Returns the updated proposal (status -> "approved").
+export function approveExploit(wsId, pid) {
+  return request(`/workspaces/${wsId}/exploit/${pid}/approve`, { method: "POST" });
+}
+
+// Reject a proposal (admin+). Returns the updated proposal (status -> "rejected").
+export function rejectExploit(wsId, pid) {
+  return request(`/workspaces/${wsId}/exploit/${pid}/reject`, { method: "POST" });
+}
+
+// Execute an APPROVED proposal's SAFE validation probe against `target`
+// (analyst+). The backend refuses unless the proposal is already `approved`,
+// then scope- + SSRF-checks and sandboxes the probe. Returns the updated proposal
+// with `result` (the evidence JSON) and status "executed"/"failed".
+export function executeExploit(wsId, pid, target) {
+  return request(`/workspaces/${wsId}/exploit/${pid}/execute`, {
+    method: "POST",
+    body: { target },
+  });
+}
+
+// Fetch the workspace's purple-team HTML report WITH the auth header, turn it
+// into a blob URL and open it in a new tab (a plain <a>/new-tab nav can't carry
+// the JWT). Mirrors fetchReportHtml's blob+auth pattern.
+export async function fetchPurpleReport(wsId) {
+  const res = await fetch(`${HTTP_BASE}/workspaces/${wsId}/purple-report`, {
+    headers: { ...authHeader() },
+  });
+  if (!res.ok) throw new Error(`Purple-team report failed (${res.status})`);
+  const html = await res.text();
+  const blob = new Blob([html], { type: "text/html" });
+  const url = URL.createObjectURL(blob);
+  const win = window.open(url, "_blank", "noopener,noreferrer");
+  // Revoke a little later so the new tab has time to load the document.
+  setTimeout(() => URL.revokeObjectURL(url), 60000);
+  return win;
+}
+
+// Return the purple-team report HTML (auth-carried) so the caller can render it
+// in-app (iframe/modal) — reliable regardless of popup blockers.
+export async function fetchPurpleReportHtml(wsId) {
+  // The report reflects live findings — never serve a cached copy. A unique
+  // query param busts any HTTP/browser cache (the backend ignores it).
+  const res = await fetch(
+    `${HTTP_BASE}/workspaces/${wsId}/purple-report?_=${Date.now()}`,
+    { headers: { ...authHeader() }, cache: "no-store" }
+  );
+  if (!res.ok) throw new Error(`Purple-team report failed (${res.status})`);
   return res.text();
 }
