@@ -7,26 +7,37 @@
 #                                              locks capturing every transitive.
 # Commit all four. Production and CI install ONLY the locks, with --require-hashes.
 #
-# Prerequisites:  pip install pip-tools pip-audit
+# Prerequisites:  pip install uv pip-audit
 #
-# Reproducibility: `make lock` regenerates the locks from the .in files WITHOUT
-# upgrading (pip-tools preserves the versions already pinned in the .txt), so it
-# reproduces the committed locks. `make lock-upgrade` is the deliberate,
-# reviewed way to move versions forward.
+# Locks are UNIVERSAL (`uv pip compile --universal`): resolved for EVERY OS and
+# Python version the project targets, with PEP 508 markers on the conditional
+# distributions. This matters because the runtime (Docker + CI) is Linux/Python
+# 3.11 while dev machines may be Windows/3.13: a platform-scoped lock generated
+# on Windows/3.13 OMITS Linux-only deps (e.g. `uvloop`, pulled by
+# uvicorn[standard]) and version-gated deps (e.g. `async-timeout`), which then
+# makes `pip install --require-hashes` FAIL on the Linux/3.11 target. A universal
+# lock includes them (behind markers), so `--require-hashes` resolves correctly
+# on every target. Regenerate from any dev machine; commit all locks.
+#
+# Reproducibility: `make lock` re-pins from the .in files, preferring the
+# versions already in the .txt (uv reads the output file as preferences), so it
+# reproduces the committed locks. `make lock-upgrade` moves versions forward.
 
-PIP_COMPILE = pip-compile --generate-hashes --allow-unsafe
+UV_COMPILE = uv pip compile --universal --generate-hashes
 
-.PHONY: lock lock-upgrade audit
+.PHONY: lock lock-upgrade audit audit-all
 
 ## Re-pin the locks from the .in files, keeping the current versions.
 lock:
-	$(PIP_COMPILE) --output-file=requirements.txt requirements.in
-	$(PIP_COMPILE) --constraint=requirements.txt --output-file=requirements-dev.txt requirements-dev.in
+	$(UV_COMPILE) requirements.in --output-file=requirements.txt
+	$(UV_COMPILE) requirements-dev.in --constraint=requirements.txt --output-file=requirements-dev.txt
+	$(UV_COMPILE) requirements-optional.in --constraint=requirements.txt --output-file=requirements-optional.txt
 
 ## Upgrade every dependency to the latest compatible version, then re-lock.
 lock-upgrade:
-	$(PIP_COMPILE) --upgrade --output-file=requirements.txt requirements.in
-	$(PIP_COMPILE) --upgrade --constraint=requirements.txt --output-file=requirements-dev.txt requirements-dev.in
+	$(UV_COMPILE) --upgrade requirements.in --output-file=requirements.txt
+	$(UV_COMPILE) --upgrade requirements-dev.in --constraint=requirements.txt --output-file=requirements-dev.txt
+	$(UV_COMPILE) --upgrade requirements-optional.in --constraint=requirements.txt --output-file=requirements-optional.txt
 
 ## Scan the PRODUCTION lock for known vulnerabilities (matches the CI gate).
 ## Fails on any advisory NOT in the reviewed baseline (.pip-audit-ignores).
