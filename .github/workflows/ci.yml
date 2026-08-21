@@ -181,28 +181,3 @@ jobs:
           REDIS_PASSWORD: ci-validate
           JWT_SECRET: ci-validate-secret-0123456789abcdef
         run: docker compose config -q
-
-  # ------------------------------------------------------------------------- #
-  # TEMPORARY OOM diagnostic (removed once the backend pytest OOM is fixed).
-  # The backend `pytest` step is SIGKILL/137'd on the 7 GB runner but the suite
-  # peaks at ~217 MB locally on Windows with no leak, so the cause is
-  # Linux-runner-specific and invisible locally. This job profiles peak RSS on
-  # the real Linux runner and reports the test running at the kill via
-  # `::warning::` annotations (readable without downloading logs).
-  backend-oom-diag:
-    runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: backend
-    env:
-      DATABASE_URL: sqlite:///./test.db
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-      - name: Install dependencies (locked + hash-verified)
-        run: pip install --require-hashes -r requirements.txt -r requirements-dev.txt
-      - name: pytest 3x (validate RLIMIT_CPU fix; fails if ANY run fails)
-        run: |
-          for i in 1 2 3; do echo "=== pytest run $i ==="; python -m pytest -q || exit 1; done

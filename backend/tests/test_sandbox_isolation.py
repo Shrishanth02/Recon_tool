@@ -133,6 +133,33 @@ def test_terminate_process_tree_on_finished_proc_is_noop():
     sandbox.terminate_process_tree(Done())  # must not raise
 
 
+@pytest.mark.skipif(os.name != "posix", reason="POSIX process groups only")
+def test_terminate_never_signals_our_own_process_group(monkeypatch):
+    """Defensive: the scanner tree-kill must NEVER signal our own process group.
+
+    A reaped scanner pid can be REUSED, and ``os.getpgid(reused_pid)`` may resolve
+    to this process's own group — so ``os.killpg(os.getpgid(pid), SIGKILL)`` could
+    SIGKILL the worker. The kill signals ``proc.pid`` directly (the scanner leads
+    its own group) and refuses to signal ``os.getpgrp()``.
+    """
+    own = os.getpgrp()
+    signalled = []
+    monkeypatch.setattr(os, "killpg", lambda pgid, sig: signalled.append(pgid))
+    # Simulate the pid-reuse hazard: make getpgid resolve to OUR OWN group.
+    monkeypatch.setattr(os, "getpgid", lambda pid: own)
+    proc = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(30)"], start_new_session=True
+    )
+    try:
+        sandbox.terminate_process_tree(proc)
+        assert own not in signalled, (
+            f"terminate_process_tree signalled our OWN process group {own}: {signalled}"
+        )
+    finally:
+        proc.kill()
+        proc.wait()
+
+
 @pytest.mark.skipif(os.name != "posix", reason="POSIX rlimits only")
 def test_cpu_rlimit_preexec_sets_child_limit_without_touching_parent():
     """``_apply`` is a preexec_fn for a forked CHILD: it must cap the CHILD's

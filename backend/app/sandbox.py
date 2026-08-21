@@ -155,7 +155,15 @@ def terminate_process_tree(proc) -> None:
         return
     try:
         if _IS_POSIX:
-            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            # Defensive: signal proc.pid directly (the scanner leads its own group
+            # via start_new_session=True, so pgid == pid) instead of
+            # os.getpgid(proc.pid). getpgid is TOCTOU-prone — once the child is
+            # reaped its pid can be reused and getpgid would resolve to an
+            # unrelated group; killpg(proc.pid) is reuse-safe (a stale group is
+            # just ESRCH). And never signal our own group.
+            pgid = proc.pid
+            if pgid > 0 and pgid != os.getpgrp():
+                os.killpg(pgid, signal.SIGKILL)
         else:
             subprocess.run(
                 ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
