@@ -14,6 +14,7 @@ is PENDING DOCKER.
 """
 
 import os
+import subprocess
 import sys
 import threading
 import time
@@ -130,6 +131,34 @@ def test_terminate_process_tree_on_finished_proc_is_noop():
         def poll(self):
             return 0
     sandbox.terminate_process_tree(Done())  # must not raise
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX process groups only")
+def test_terminate_never_signals_our_own_process_group(monkeypatch):
+    """The scanner tree-kill must NEVER signal our own process group.
+
+    Regression for the CI pytest self-kill: a scanner pid that has been reaped can
+    be REUSED, and ``os.getpgid(reused_pid)`` may then resolve to this process's
+    own group — so ``os.killpg(os.getpgid(pid), SIGKILL)`` would SIGKILL the worker
+    (and, in CI, the whole pytest run). The fix signals ``proc.pid`` directly (the
+    scanner leads its own group) and never signals ``os.getpgrp()``.
+    """
+    own = os.getpgrp()
+    signalled = []
+    monkeypatch.setattr(os, "killpg", lambda pgid, sig: signalled.append(pgid))
+    # Simulate the pid-reuse hazard: make getpgid resolve to OUR OWN group.
+    monkeypatch.setattr(os, "getpgid", lambda pid: own)
+    proc = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(30)"], start_new_session=True
+    )
+    try:
+        sandbox.terminate_process_tree(proc)
+        assert own not in signalled, (
+            f"terminate_process_tree signalled our OWN process group {own}: {signalled}"
+        )
+    finally:
+        proc.kill()
+        proc.wait()
 
 
 @pytest.mark.skipif(os.name != "posix", reason="POSIX rlimits only")

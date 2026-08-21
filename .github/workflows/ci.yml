@@ -203,7 +203,12 @@ jobs:
           python-version: "3.11"
       - name: Install dependencies (locked + hash-verified)
         run: pip install --require-hashes -r requirements.txt -r requirements-dev.txt
-      - name: Install psutil (diagnostic-only)
-        run: pip install psutil
-      - name: Profile pytest peak RSS + test-at-kill on the Linux runner
-        run: python ci_oom_diag.py
+      - name: pytest run 1 (validate sandbox fix, real topology)
+        continue-on-error: true
+        run: python -m pytest -q
+      - name: pytest run 2 (validate sandbox fix, real topology)
+        continue-on-error: true
+        run: python -m pytest -q
+      - name: pytest run 3 (validate sandbox fix, real topology)
+        continue-on-error: true
+        run: python -m pytest -q
