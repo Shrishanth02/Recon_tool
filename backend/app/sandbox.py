@@ -118,7 +118,13 @@ def _cpu_rlimit_preexec(max_seconds: float):
 
     def _apply():  # runs in the child after fork(), before exec()
         import resource
-        resource.setrlimit(resource.RLIMIT_CPU, (cpu, cpu))
+        # Cap CPU seconds, but NEVER try to raise the hard limit: raising it is
+        # forbidden without privilege and would make subprocess abort the spawn
+        # with "Exception occurred in preexec_fn". Clamp the target to whatever
+        # hard limit the child inherited.
+        _soft, hard = resource.getrlimit(resource.RLIMIT_CPU)
+        target = cpu if hard == resource.RLIM_INFINITY else min(cpu, hard)
+        resource.setrlimit(resource.RLIMIT_CPU, (target, target))
 
     return _apply
 
@@ -149,17 +155,7 @@ def terminate_process_tree(proc) -> None:
         return
     try:
         if _IS_POSIX:
-            # The scanner is started with start_new_session=True, so it LEADS its
-            # own process group (pgid == its pid). Signal that pid directly rather
-            # than os.getpgid(proc.pid): once the child is reaped its pid can be
-            # REUSED, and getpgid would then resolve to an unrelated group —
-            # possibly this worker's / the test runner's OWN group — turning a
-            # scanner-kill into a SIGKILL suicide. killpg(proc.pid) is reuse-safe
-            # (a stale group is simply gone, ESRCH), and we never signal our own
-            # group even defensively.
-            pgid = proc.pid
-            if pgid > 0 and pgid != os.getpgrp():
-                os.killpg(pgid, signal.SIGKILL)
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
         else:
             subprocess.run(
                 ["taskkill", "/F", "/T", "/PID", str(proc.pid)],

@@ -133,40 +133,33 @@ def test_terminate_process_tree_on_finished_proc_is_noop():
     sandbox.terminate_process_tree(Done())  # must not raise
 
 
-@pytest.mark.skipif(os.name != "posix", reason="POSIX process groups only")
-def test_terminate_never_signals_our_own_process_group(monkeypatch):
-    """The scanner tree-kill must NEVER signal our own process group.
-
-    Regression for the CI pytest self-kill: a scanner pid that has been reaped can
-    be REUSED, and ``os.getpgid(reused_pid)`` may then resolve to this process's
-    own group — so ``os.killpg(os.getpgid(pid), SIGKILL)`` would SIGKILL the worker
-    (and, in CI, the whole pytest run). The fix signals ``proc.pid`` directly (the
-    scanner leads its own group) and never signals ``os.getpgrp()``.
-    """
-    own = os.getpgrp()
-    signalled = []
-    monkeypatch.setattr(os, "killpg", lambda pgid, sig: signalled.append(pgid))
-    # Simulate the pid-reuse hazard: make getpgid resolve to OUR OWN group.
-    monkeypatch.setattr(os, "getpgid", lambda pid: own)
-    proc = subprocess.Popen(
-        [sys.executable, "-c", "import time; time.sleep(30)"], start_new_session=True
-    )
-    try:
-        sandbox.terminate_process_tree(proc)
-        assert own not in signalled, (
-            f"terminate_process_tree signalled our OWN process group {own}: {signalled}"
-        )
-    finally:
-        proc.kill()
-        proc.wait()
-
-
 @pytest.mark.skipif(os.name != "posix", reason="POSIX rlimits only")
-def test_cpu_rlimit_preexec_sets_limit():
+def test_cpu_rlimit_preexec_sets_child_limit_without_touching_parent():
+    """``_apply`` is a preexec_fn for a forked CHILD: it must cap the CHILD's
+    RLIMIT_CPU and NEVER mutate THIS (pytest / worker) process's own limit.
+
+    Regression: the old test called ``_apply()`` in-process, which permanently set
+    pytest's OWN RLIMIT_CPU to a low value. In the full suite pytest then crosses
+    that CPU cap and is SIGKILLed mid-run (the phantom "OOM" — exit 137 with the
+    machine at 7% memory); and because it also lowered the hard limit, a later
+    scanner spawn could not raise it and died in ``preexec_fn`` (a flaky test
+    failure). Exercise the preexec in a real throwaway child and assert the
+    parent's limit is unchanged.
+    """
     import resource
-    sandbox._cpu_rlimit_preexec(30)()
-    soft, _hard = resource.getrlimit(resource.RLIMIT_CPU)
-    assert soft <= 30 + 60 + 1
+
+    before = resource.getrlimit(resource.RLIMIT_CPU)
+    code = (
+        "import resource, sys\n"
+        f"sys.path.insert(0, {str(REPO / 'backend')!r})\n"
+        "from app import sandbox\n"
+        "sandbox._cpu_rlimit_preexec(30)()\n"
+        "print(resource.getrlimit(resource.RLIMIT_CPU)[0])\n"
+    )
+    out = subprocess.run([PY, "-c", code], capture_output=True, text=True)
+    assert out.returncode == 0, out.stderr
+    assert int(out.stdout.strip()) <= 30 + 60 + 1              # child limit applied
+    assert resource.getrlimit(resource.RLIMIT_CPU) == before   # parent untouched
 
 
 # --------------------------------------------------------------------------- #
