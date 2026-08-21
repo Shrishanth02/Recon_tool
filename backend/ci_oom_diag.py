@@ -1,16 +1,15 @@
-"""TEMPORARY CI-only OOM diagnostic (v4) — REMOVE once the pytest OOM is fixed.
+"""TEMPORARY CI-only OOM diagnostic (v5) — REMOVE once the pytest OOM is fixed.
 
-The OOM is a sudden ~16 GB single allocation at a NON-deterministic test (varies
-run to run), single-threaded, flat baseline. To pin the exact allocation line we
-cap the pytest child's address space (RLIMIT_AS) so the giant allocation raises
-MemoryError WITH A TRACEBACK instead of being OOM-killed; a plugin captures the
-failing test's longrepr and we surface it via ::warning:: annotations. Also
-prints RLIMIT_NOFILE (a huge value is a classic source of fd-sized allocations
-on Linux containers).
+The OOM triggers inside subprocess.Popen(close_fds=True, preexec_fn=...) in
+stream_command (fork path). This run records, per test, the pytest process's
+RSS *and* virtual size (VmSize) *and* live child-process count, to tell apart:
+  * VmSize ballooning (glibc arenas / mmap) -> fork COW explosion, vs
+  * child-process accumulation (subprocesses not reaped) -> process leak.
+No address-space cap this time, so the natural OOM curve is captured up to the
+kill. The monitor also samples the whole-tree peak RSS.
 """
 
 import os
-import resource
 import subprocess
 import sys
 import tempfile
@@ -22,28 +21,21 @@ TMP = tempfile.gettempdir()
 PLUGIN = os.path.join(TMP, "oomdiag_plugin.py")
 with open(PLUGIN, "w", encoding="utf-8") as fh:
     fh.write(
-        "import os\n"
+        "import os, threading, psutil\n"
+        "_p = psutil.Process(os.getpid())\n"
         "_f = open(os.environ['OOMDIAG_LOG'], 'w', buffering=1, encoding='utf-8')\n"
+        "def _row(tag, nodeid):\n"
+        "    mi = _p.memory_info()\n"
+        "    try: nch = len(_p.children(recursive=True))\n"
+        "    except Exception: nch = -1\n"
+        "    _f.write('%s rss=%.0f vms=%.0f nch=%d nthr=%d %s\\n'\n"
+        "             % (tag, mi.rss/1e6, mi.vms/1e6, nch, threading.active_count(), nodeid))\n"
+        "def pytest_runtest_logstart(nodeid, location):\n"
+        "    _row('START', nodeid)\n"
         "def pytest_runtest_logreport(report):\n"
-        "    if report.failed:\n"
-        "        _f.write('FAILED[%s] %s\\n' % (report.when, report.nodeid))\n"
-        "        _f.write(str(report.longrepr)[:6000] + '\\n---ENDFAIL---\\n')\n"
+        "    if report.when == 'teardown':\n"
+        "        _row('END', report.nodeid)\n"
     )
-
-soft_nofile, hard_nofile = resource.getrlimit(resource.RLIMIT_NOFILE)
-soft_as, hard_as = resource.getrlimit(resource.RLIMIT_AS)
-print("::warning title=OOMDIAG-LIMITS::RLIMIT_NOFILE soft=%s hard=%s | RLIMIT_AS soft=%s hard=%s"
-      % (soft_nofile, hard_nofile, soft_as, hard_as))
-
-CAP = 6 * 1024 * 1024 * 1024  # 6 GiB address-space cap for the pytest child
-
-
-def _cap():
-    try:
-        resource.setrlimit(resource.RLIMIT_AS, (CAP, CAP))
-    except Exception:
-        pass
-
 
 log = os.path.join(TMP, "oomdiag_full.log")
 open(log, "w", encoding="utf-8").close()
@@ -55,7 +47,7 @@ cmd = [
     sys.executable, "-u", "-m", "pytest", "-q",
     "-p", "oomdiag_plugin", "-p", "no:cacheprovider",
 ]
-p = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env, preexec_fn=_cap)
+p = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env)
 peak = 0.0
 stop = threading.Event()
 parent = psutil.Process(p.pid)
@@ -85,17 +77,20 @@ stop.set()
 th.join(timeout=2)
 
 with open(log, encoding="utf-8") as fh:
-    content = fh.read()
+    lines = fh.read().splitlines()
 
-print("::warning title=OOMDIAG-RESULT::exit=%d peak_sampled=%.0fMB cap=6GiB failures_captured=%d"
-      % (rc, peak / 1e6, content.count("FAILED[")))
+# emit the last ~18 rows (the VmSize / child-count trajectory into the OOM)
+tail = " || ".join(lines[-18:])
+print("::warning title=OOMDIAG-VMS::exit=%d tree_peak_rss=%.0fMB rows=%d  TAIL: %s"
+      % (rc, peak / 1e6, len(lines), tail[:1500]))
+# also emit a coarse VmSize progression (every ~80th row) to see the climb
+prog = []
+for i in range(0, len(lines), 80):
+    ln = lines[i]
+    if "vms=" in ln:
+        prog.append(ln.split("vms=")[1].split(" ")[0])
+print("::warning title=OOMDIAG-VMSCURVE::vms_MB every~80 tests: %s" % (" ".join(prog))[:1400])
 
-blocks = [b for b in content.split("---ENDFAIL---") if "FAILED[" in b]
-for i, b in enumerate(blocks[:4]):
-    # emphasise the MemoryError / allocation frames
-    msg = b.strip().replace("\n", " || ")
-    print("::warning title=OOMDIAG-FAIL-%d::%s" % (i, msg[:1600]))
-
-print("\n=== OOMDIAG v4 ===")
-print("exit", rc, "peak_MB", peak / 1e6)
-print(content[-6000:])
+print("\n=== OOMDIAG v5 ===  exit", rc, "tree_peak_MB", peak / 1e6)
+for ln in lines[-40:]:
+    print("  " + ln)
