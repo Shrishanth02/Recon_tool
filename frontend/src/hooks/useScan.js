@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { WS_URL } from "../api/client";
+import { WS_URL, wsAuthProtocols } from "../api/client";
 
 // Drives a single live scan over a WebSocket. Exposes streaming logs, the
 // final structured result, status, and an elapsed-time counter. Calls
@@ -61,7 +61,7 @@ export function useScan(onComplete) {
       setActive({ tool, target });
       setStatus("connecting");
 
-      const ws = new WebSocket(WS_URL);
+      const ws = new WebSocket(WS_URL, wsAuthProtocols());
       wsRef.current = ws;
 
       ws.onopen = () => {

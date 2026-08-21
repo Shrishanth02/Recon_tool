@@ -9,7 +9,6 @@ For backward compatibility with the existing scanner engine (which imports
 module-level constants are kept as thin aliases over ``settings``.
 """
 
-import warnings
 from pathlib import Path
 
 from pydantic import Field
@@ -216,8 +215,11 @@ class Settings(BaseSettings):
         default="", alias="RECONX_RATE_LIMIT_TRUSTED_PROXIES"
     )
     METRICS_ENABLED: bool = Field(
-        default=True, alias="RECONX_METRICS_ENABLED"
-    )  # expose Prometheus /metrics endpoint
+        default=False, alias="RECONX_METRICS_ENABLED"
+    )  # expose Prometheus /metrics endpoint (opt-in; secure-by-default OFF)
+    METRICS_TOKEN: str = Field(
+        default="", alias="RECONX_METRICS_TOKEN"
+    )  # when set, /metrics requires `Authorization: Bearer <token>` (scrape auth)
     JSON_LOGS: bool = Field(
         default=False, alias="RECONX_JSON_LOGS"
     )  # structured (JSON) access logs
@@ -227,6 +229,9 @@ class Settings(BaseSettings):
     OIDC_REDIRECT_BASE: str = Field(
         default="http://localhost:8002", alias="RECONX_OIDC_REDIRECT_BASE"
     )
+    SSO_STATE_TTL_SECONDS: int = Field(
+        default=600, alias="RECONX_SSO_STATE_TTL_SECONDS"
+    )  # OIDC login-transaction (state/nonce) lifetime; single-use within this window
     DATA_RETENTION_DAYS: int = Field(
         default=0, alias="RECONX_DATA_RETENTION_DAYS"
     )  # 0 = keep forever

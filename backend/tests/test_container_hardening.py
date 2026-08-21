@@ -172,3 +172,50 @@ def test_worker_startup_is_the_arq_queue_backend():
     # Worker image runs the arq worker; compose forces the queue backend.
     assert 'CMD ["arq", "app.worker.WorkerSettings"]' in _read(BACKEND / "Dockerfile.worker")
     assert _compose()["services"]["worker"]["environment"]["RECONX_EXECUTION_BACKEND"] == "queue"
+
+
+# --------------------------------------------------------------------------- #
+# Frontend hardening (Docker pass) — non-root nginx, dropped caps, limits, HC
+# --------------------------------------------------------------------------- #
+FRONTEND = REPO / "frontend"
+
+
+def test_frontend_runs_non_root_nginx():
+    df = _read(FRONTEND / "Dockerfile")
+    assert df, "frontend/Dockerfile missing"
+    # Purpose-built non-root nginx base (runs as uid 101; no root master process).
+    assert "nginx-unprivileged" in df, "frontend must use a non-root nginx image"
+    # ...and must never re-escalate to root for the runtime.
+    users = [ln.split(maxsplit=1)[1].strip() for ln in df.splitlines()
+             if ln.strip().startswith("USER ")]
+    assert users[-1:] not in (["root"], ["0"]), "frontend image must not end as root"
+
+
+def test_frontend_listens_on_unprivileged_port():
+    conf = _read(FRONTEND / "nginx.conf")
+    assert "listen" in conf and "8080" in conf, \
+        "nginx must listen on 8080 (unprivileged) to match the non-root image"
+    assert "listen       80;" not in conf and "listen 80;" not in conf
+
+
+def test_frontend_service_is_hardened():
+    fe = _compose()["services"]["frontend"]
+    assert fe.get("cap_drop") == ["ALL"], "frontend must cap_drop: [ALL]"
+    assert "no-new-privileges:true" in (fe.get("security_opt") or [])
+    assert fe.get("mem_limit") and fe.get("cpus") and fe.get("pids_limit")
+    assert fe.get("restart") == "unless-stopped"
+    hc = fe.get("healthcheck")
+    assert hc and hc.get("test"), "frontend must have a healthcheck"
+
+
+def test_frontend_maps_host_port_to_container_8080():
+    ports = _compose()["services"]["frontend"].get("ports") or []
+    assert any(str(p).endswith(":8080") for p in ports), \
+        f"frontend host port must map to container 8080, got {ports}"
+
+
+def test_frontend_limits_are_env_configurable():
+    raw = _read(REPO / "docker-compose.yml")
+    env = _read(REPO / ".env.example")
+    for var in ("FRONTEND_MEM_LIMIT", "FRONTEND_CPUS", "FRONTEND_PIDS_LIMIT"):
+        assert var in raw and var in env, f"{var} should be an env-overridable, documented limit"

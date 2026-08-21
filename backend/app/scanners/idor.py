@@ -27,6 +27,7 @@ from urllib.parse import parse_qsl, urlsplit
 
 import requests
 
+from .. import safe_http
 from .base import ensure_url, error, log, result
 
 _TIMEOUT = 8
@@ -110,8 +111,8 @@ def _identity_headers(identity: dict) -> dict:
 
 def _http_get(url: str, headers: dict) -> Optional[tuple]:
     try:
-        r = requests.get(url, headers={"User-Agent": _UA, **(headers or {})},
-                         timeout=_TIMEOUT, verify=False, allow_redirects=False)
+        r = safe_http.safe_request("GET", url, headers={"User-Agent": _UA, **(headers or {})},
+                                   timeout=_TIMEOUT, verify=False, allow_redirects=False)
         return r.status_code, (r.text or "")
     except requests.RequestException:
         return None
@@ -128,8 +129,8 @@ def _request(method: str, url: str, headers: dict, data=None, ctype=None) -> Opt
     if ctype:
         h["Content-Type"] = ctype
     try:
-        r = requests.request(method, url, headers={"User-Agent": _UA, **h}, data=data,
-                             timeout=_TIMEOUT, verify=False, allow_redirects=False)
+        r = safe_http.safe_request(method, url, headers={"User-Agent": _UA, **h}, data=data,
+                                   timeout=_TIMEOUT, verify=False, allow_redirects=False)
         return r.status_code, (r.text or "")
     except requests.RequestException:
         return None

@@ -10,7 +10,6 @@ app and ``crud`` both read that same singleton — so the REST ``/scan`` case
 exercises the gate through the real router without any global config change.
 """
 
-import pytest
 
 from app import crud
 from app.config import settings

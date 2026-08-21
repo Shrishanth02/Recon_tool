@@ -17,9 +17,10 @@ Wiring:
 """
 
 import logging
+import secrets
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, HTTPException, status
+from fastapi import FastAPI, HTTPException, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
 from sqlalchemy import text
@@ -56,6 +57,26 @@ def _bootstrap_seed() -> None:
         db.close()
 
 
+def _reconcile_stale_runs() -> None:
+    """One-shot startup sweep for pentest runs stranded 'running' by a hard crash.
+
+    Threshold-guarded (>> a run's max wall clock) so it never touches a pipeline a
+    sibling worker is still streaming, and idempotent so concurrent workers race
+    harmlessly — safe to run in every worker's lifespan.
+    """
+    db = SessionLocal()
+    try:
+        crud.reconcile_stale_pentest_runs(
+            db, older_than_seconds=2 * int(settings.SCAN_TIMEOUT)
+        )
+    except Exception as exc:  # noqa: BLE001 - reconciliation must never block boot
+        logging.getLogger("reconx.startup").warning(
+            "startup pentest-run reconciliation skipped: %s", exc
+        )
+    finally:
+        db.close()
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Create tables and run the optional bootstrap seed on startup.
@@ -67,6 +88,7 @@ async def lifespan(app: FastAPI):
     """
     observability.configure_logging(json_logs=settings.JSON_LOGS)
     init_models()
+    _reconcile_stale_runs()
     _bootstrap_seed()
     # Preflight: clearly report which REQUIRED scanner tools are present. Missing
     # required tools are logged loudly (never silent) but do NOT block startup;
@@ -96,7 +118,7 @@ app = FastAPI(title="RECON-X", version="4.0.0", lifespan=lifespan)
 # 429 from the rate limiter). The Phase 5 middlewares are added first so they sit
 # *inside* CORS: SecurityHeadersMiddleware only ever uses setdefault(), so it can
 # never clobber CORS headers. All three are cheap no-ops when their flag is off
-# (rate-limit defaults off; headers/metrics default on but harmless).
+# (rate-limit + /metrics default off; security headers default on but harmless).
 # --------------------------------------------------------------------------- #
 app.add_middleware(RateLimitMiddleware)
 app.add_middleware(RequestContextMiddleware)
@@ -163,13 +185,26 @@ def preflight_status():
 
 
 @app.get("/metrics")
-def metrics():
-    """Prometheus metrics exposition (unauthenticated, gated by METRICS_ENABLED).
+def metrics(request: Request):
+    """Prometheus metrics exposition (opt-in via METRICS_ENABLED; optional token auth).
 
-    Returns the Prometheus text format when ``prometheus_client`` is installed;
-    otherwise a small plain-text stub (never a 500). 404 when metrics are off.
+    Secure-by-default: disabled (404) unless ``METRICS_ENABLED`` is turned on. When
+    enabled, an optional ``METRICS_TOKEN`` gates access with a constant-time
+    ``Authorization: Bearer <token>`` check so a remote scraper can authenticate
+    over an untrusted network; with no token set, exposure is the operator's
+    explicit choice (bind it to an internal scrape interface). Returns the
+    Prometheus text format when ``prometheus_client`` is installed; otherwise a
+    small plain-text stub (never a 500).
     """
     if not settings.METRICS_ENABLED:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "metrics are disabled")
+    token = settings.METRICS_TOKEN
+    if token:
+        auth = request.headers.get("authorization", "")
+        presented = auth[7:] if auth[:7].lower() == "bearer " else ""
+        if not (presented and secrets.compare_digest(presented, token)):
+            raise HTTPException(
+                status.HTTP_401_UNAUTHORIZED, "metrics require a valid bearer token"
+            )
     body, content_type = observability.render_metrics()
     return Response(content=body, media_type=content_type)

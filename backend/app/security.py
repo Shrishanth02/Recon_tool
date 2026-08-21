@@ -82,24 +82,56 @@ def create_refresh_token(
     sub: str | int,
     org_id: int | None = None,
     token_version: int | None = None,
+    jti: str | None = None,
+    family: str | None = None,
 ) -> str:
     """Mint a long-lived refresh token for user id ``sub``.
 
     As with :func:`create_access_token`, a ``"ver"`` claim is included only when
-    ``token_version`` is passed; otherwise the token is identical to what
-    earlier phases produced.
+    ``token_version`` is passed. ``jti`` (this token's unique id) and ``family``
+    (its rotation lineage) are embedded when provided so the server-side store
+    can rotate the token and detect replay of a consumed token (see
+    :mod:`app.crud`).
     """
     payload: dict[str, Any] = {"sub": str(sub), "type": "refresh"}
     if org_id is not None:
         payload["org_id"] = org_id
     if token_version is not None:
         payload["ver"] = int(token_version)
+    if jti is not None:
+        payload["jti"] = jti
+    if family is not None:
+        payload["fam"] = family
     return _encode(payload, timedelta(days=settings.REFRESH_TTL_DAYS))
 
 
 def decode_token(token: str) -> dict[str, Any]:
     """Decode & verify a JWT. Raises ``jwt.PyJWTError`` if invalid/expired."""
     return jwt.decode(token, settings.JWT_SECRET, algorithms=[settings.JWT_ALG])
+
+
+def is_token_revoked(payload_ver: Any, current_version: Any) -> bool:
+    """Fail-CLOSED session-revocation check.
+
+    A token is revoked unless the version it carries EQUALS the user's current
+    ``token_version``. A **missing** ``ver`` claim is treated as version 0 (not a
+    bypass): once a user's ``token_version`` is bumped past 0 (e.g. by
+    ``/auth/logout-all``), any earlier token — versioned OR ver-less — is
+    rejected. This closes the pre-existing ver-less fail-open while staying
+    compatible with un-revoked (version-0) tokens.
+    """
+    return int(payload_ver or 0) != int(current_version or 0)
+
+
+def can_manage_member(actor_role: str, target_role: str) -> bool:
+    """True if a member with ``actor_role`` may mutate one with ``target_role``.
+
+    Separation-of-duties rule: a caller may only change the role of, or remove, a
+    member whose role does NOT outrank their own. Peers of equal rank may manage
+    each other (owners may manage owners — the last-owner guard still applies),
+    but an admin may never demote or remove an owner. Unknown roles fail closed.
+    """
+    return ROLE_RANK.get(target_role, 99) <= ROLE_RANK.get(actor_role, -1)
 
 
 # --------------------------------------------------------------------------- #

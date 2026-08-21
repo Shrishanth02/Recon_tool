@@ -25,7 +25,7 @@ from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import requests
 
-from .. import oast
+from .. import oast, safe_http
 from .base import ensure_url, error, log, result
 
 _TIMEOUT = 8
@@ -56,8 +56,8 @@ def _is_candidate(name: str, value: str) -> bool:
 def _http_get(url: str) -> Optional[tuple]:
     """Read-only GET; returns (status, text) or None on any request error."""
     try:
-        r = requests.get(url, headers={"User-Agent": _UA}, timeout=_TIMEOUT,
-                         verify=False, allow_redirects=False)
+        r = safe_http.safe_request("GET", url, headers={"User-Agent": _UA}, timeout=_TIMEOUT,
+                                   verify=False, allow_redirects=False)
         return r.status_code, (r.text or "")
     except requests.RequestException:
         return None

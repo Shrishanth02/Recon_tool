@@ -4,7 +4,6 @@ import {
   useContext,
   useEffect,
   useMemo,
-  useRef,
   useState,
 } from "react";
 import {
@@ -13,19 +12,21 @@ import {
   fetchMe,
   fetchWorkspaces,
   loginUser,
+  logoutSession,
   refreshTokens,
   registerUser,
   setAuthToken,
   setUnauthorizedHandler,
 } from "../api/client";
 
-// Tenancy + session state for RECON-X. Tokens live in localStorage so a reload
-// keeps you signed in; `activeWorkspace.id` is what the dashboard drives every
-// scoped call (scans, findings, history, report) off of.
+// Tenancy + session state for RECON-X. The ACCESS token lives in localStorage so
+// a reload keeps you signed in; the REFRESH token is NOT stored in JS — it lives
+// only in the httpOnly `reconx_refresh` cookie the backend sets, out of reach of
+// XSS. `activeWorkspace.id` is what the dashboard drives every scoped call
+// (scans, findings, history, report) off of.
 
 const LS = {
   access: "reconx.access",
-  refresh: "reconx.refresh",
   org: "reconx.orgId",
   ws: "reconx.wsId",
 };
@@ -56,26 +57,21 @@ export function AuthProvider({ children }) {
   const [workspaces, setWorkspaces] = useState([]);
   const [activeWorkspace, setActiveWorkspace] = useState(null);
 
-  // Refresh token is read from a ref inside the (once-registered) 401 handler so
-  // it never goes stale.
-  const refreshRef = useRef(readLS(LS.refresh));
-
-  const persistTokens = useCallback((access, refresh) => {
-    setAuthToken(access); // updates REST header source + WS ?token=
-    refreshRef.current = refresh || null;
+  const persistTokens = useCallback((access) => {
+    setAuthToken(access); // updates REST Bearer header + WS subprotocol credential
     writeLS(LS.access, access || null);
-    writeLS(LS.refresh, refresh || null);
+    // The refresh token is never written to JS storage — it lives only in the
+    // httpOnly `reconx_refresh` cookie (set by the backend on login/refresh).
   }, []);
 
   const clearSession = useCallback(() => {
-    persistTokens(null, null);
+    persistTokens(null);
     writeLS(LS.org, null);
     writeLS(LS.ws, null);
     setUser(null);
     setOrgs([]);
     setActiveOrg(null);
     setWorkspaces([]);
-    setActiveWorkspace(null);
   }, [persistTokens]);
 
   // Load the workspaces of an org and choose an active one (preferring a
@@ -123,7 +119,7 @@ export function AuthProvider({ children }) {
   const login = useCallback(
     async ({ email, password, mfa_code }) => {
       const data = await loginUser({ email, password, mfa_code });
-      persistTokens(data.access_token, data.refresh_token);
+      persistTokens(data.access_token); // refresh arrives as an httpOnly cookie
       await hydrate({ seedOrg: data.org, seedWorkspace: data.workspace });
       return data;
     },
@@ -133,7 +129,7 @@ export function AuthProvider({ children }) {
   const register = useCallback(
     async ({ email, password, full_name, org_name }) => {
       const data = await registerUser({ email, password, full_name, org_name });
-      persistTokens(data.access_token, data.refresh_token);
+      persistTokens(data.access_token); // refresh arrives as an httpOnly cookie
       await hydrate({ seedOrg: data.org, seedWorkspace: data.workspace });
       return data;
     },
@@ -141,6 +137,7 @@ export function AuthProvider({ children }) {
   );
 
   const logout = useCallback(() => {
+    logoutSession().catch(() => {}); // best-effort: clear the httpOnly cookie server-side
     clearSession();
   }, [clearSession]);
 
@@ -194,11 +191,9 @@ export function AuthProvider({ children }) {
   // ---- 401 -> silent refresh (registered once) --------------------------- //
   useEffect(() => {
     setUnauthorizedHandler(async () => {
-      const rt = refreshRef.current;
-      if (!rt) return false;
       try {
-        const tok = await refreshTokens(rt);
-        persistTokens(tok.access_token, tok.refresh_token);
+        const tok = await refreshTokens(); // rotates via the httpOnly refresh cookie
+        persistTokens(tok.access_token);
         return true;
       } catch {
         clearSession();
@@ -213,27 +208,21 @@ export function AuthProvider({ children }) {
     let alive = true;
     (async () => {
       const access = readLS(LS.access);
-      const refresh = readLS(LS.refresh);
       if (!access) {
         setBooting(false);
         return;
       }
       setAuthToken(access);
-      refreshRef.current = refresh;
       try {
         await hydrate({ preferOrgId: readLS(LS.org), preferWsId: readLS(LS.ws) });
       } catch {
-        // access likely expired — try one refresh before giving up.
-        if (refresh) {
-          try {
-            const tok = await refreshTokens(refresh);
-            persistTokens(tok.access_token, tok.refresh_token);
-            await hydrate({ preferOrgId: readLS(LS.org), preferWsId: readLS(LS.ws) });
-          } catch {
-            if (alive) clearSession();
-          }
-        } else if (alive) {
-          clearSession();
+        // access likely expired — try one refresh (httpOnly cookie) before giving up.
+        try {
+          const tok = await refreshTokens();
+          persistTokens(tok.access_token);
+          await hydrate({ preferOrgId: readLS(LS.org), preferWsId: readLS(LS.ws) });
+        } catch {
+          if (alive) clearSession();
         }
       } finally {
         if (alive) setBooting(false);

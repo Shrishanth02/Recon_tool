@@ -22,14 +22,17 @@ COPY . .
 RUN npm run build
 
 # --- Stage 2: serve ---------------------------------------------------------- #
-FROM nginx:alpine
+# Non-root nginx (runs as uid 101, listens on 8080 — no root master process and
+# no privileged port). This is the same maintained nginx, purpose-built to run
+# unprivileged, so a container escape does not start from root.
+FROM nginxinc/nginx-unprivileged:alpine
 
-# SPA-aware nginx config (try_files fallback to /index.html).
+# SPA-aware nginx config (try_files fallback to /index.html); it listens on 8080.
 COPY nginx.conf /etc/nginx/conf.d/default.conf
 
-# Ship only the built static assets.
-COPY --from=build /app/dist /usr/share/nginx/html
+# Ship only the built static assets, readable by the unprivileged nginx user.
+COPY --from=build --chown=101:101 /app/dist /usr/share/nginx/html
 
-EXPOSE 80
+EXPOSE 8080
 
-CMD ["nginx", "-g", "daemon off;"]
+# The base image already sets USER 101 and the non-root entrypoint/CMD.

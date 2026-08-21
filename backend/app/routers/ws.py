@@ -27,6 +27,33 @@ from ..scanners import get_scanner
 router = APIRouter()
 
 
+def _ws_credentials(websocket) -> tuple[str | None, str | None, str | None]:
+    """Extract the WS credential from the ``Sec-WebSocket-Protocol`` header.
+
+    STEP 3: credentials no longer belong in the URL query string, which
+    reverse-proxy / gunicorn access logs and browser history capture. The client
+    offers subprotocols ``["reconx.token", <access-jwt>]`` (browser) or
+    ``["reconx.key", <api-key>]`` (programmatic). We read the value and return the
+    SAFE protocol NAME to echo on ``accept`` (never the secret itself).
+
+    A DEPRECATED ``?token=`` / ``?key=`` query-string fallback is retained so
+    existing programmatic clients keep working; migrate them to the subprotocol
+    header (their WS libraries support it). Returns ``(token, key, subprotocol)``.
+    """
+    token = key = subprotocol = None
+    raw = websocket.headers.get("sec-websocket-protocol", "") or ""
+    protos = [p.strip() for p in raw.split(",") if p.strip()]
+    for i, p in enumerate(protos):
+        if p == "reconx.token" and i + 1 < len(protos):
+            token, subprotocol = protos[i + 1], "reconx.token"
+        elif p == "reconx.key" and i + 1 < len(protos):
+            key, subprotocol = protos[i + 1], "reconx.key"
+    if token is None and key is None:  # deprecated query-string fallback
+        token = websocket.query_params.get("token")
+        key = websocket.query_params.get("key")
+    return token, key, subprotocol
+
+
 def _authenticate(db, token: str | None, key: str | None) -> tuple[models.User | None, models.ApiKey | None]:
     """Resolve a WebSocket caller from ``?token=`` or ``?key=``.
 
@@ -47,7 +74,12 @@ def _authenticate(db, token: str | None, key: str | None) -> tuple[models.User |
         if claims.get("type") != "access":
             return None, None
         user = crud.get_user(db, int(claims.get("sub", 0)))
-        if user and user.is_active:
+        # Enforce session revocation on the WS path too (fail-closed): a token
+        # whose "ver" (missing => 0) != token_version is rejected.
+        if (
+            user and user.is_active
+            and not security.is_token_revoked(claims.get("ver"), user.token_version)
+        ):
             return user, None
     return None, None
 
@@ -83,7 +115,8 @@ def _resolve_workspace(db, user, api_key, ws_id: int) -> models.Workspace | None
 @router.websocket("/ws/scan")
 async def ws_scan(websocket: WebSocket):
     """Authenticate, run one scan, stream its events, and persist the result."""
-    await websocket.accept()
+    token, key, _subproto = _ws_credentials(websocket)
+    await websocket.accept(subprotocol=_subproto)
 
     # P1-H2: rate-limit WS scan connections by client IP (scan bucket) BEFORE auth
     # so nobody can open unlimited scan sockets. Same Redis-backed limiter as the
@@ -103,9 +136,8 @@ async def ws_scan(websocket: WebSocket):
 
     db = SessionLocal()
     try:
-        # --- Authentication (query params, since WS can't carry headers) ----- #
-        token = websocket.query_params.get("token")
-        key = websocket.query_params.get("key")
+        # --- Authentication (credential taken from the Sec-WebSocket-Protocol
+        #     header above; deprecated query-string fallback handled there) ---- #
         user, api_key = _authenticate(db, token, key)
         if user is None and api_key is None:
             await websocket.send_json({"type": "error", "data": "Authentication failed."})

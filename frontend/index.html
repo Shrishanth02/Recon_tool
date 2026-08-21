@@ -6,17 +6,9 @@
     <link rel="apple-touch-icon" href="/favicon.png" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <meta name="color-scheme" content="light dark" />
-    <script>
-      // Apply the saved theme before paint to avoid a flash. Default: light.
-      (function () {
-        try {
-          var t = localStorage.getItem("reconx.theme");
-          document.documentElement.setAttribute("data-theme", t === "dark" ? "dark" : "light");
-        } catch (e) {
-          document.documentElement.setAttribute("data-theme", "light");
-        }
-      })();
-    </script>
+    <!-- External (not inline) so the CSP can keep a strict script-src 'self';
+         render-blocking in <head>, so it still applies the theme before paint. -->
+    <script src="/theme-init.js"></script>
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
     <link

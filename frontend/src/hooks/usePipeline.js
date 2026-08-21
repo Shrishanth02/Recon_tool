@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { getPipelineWsUrl } from "../api/client";
+import { getPipelineWsUrl, wsAuthProtocols } from "../api/client";
 
 // Stage metadata — mirrors backend STAGE_NAMES
 export const STAGE_META = {
@@ -81,7 +81,7 @@ export function usePipeline(onComplete) {
     setActiveStage(null);
     setElapsed(0);
 
-    const ws = new WebSocket(getPipelineWsUrl());
+    const ws = new WebSocket(getPipelineWsUrl(), wsAuthProtocols());
     wsRef.current = ws;
 
     ws.onopen = () => {

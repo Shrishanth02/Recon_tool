@@ -23,7 +23,7 @@ from typing import Iterator, List, Optional
 
 import requests
 
-from .. import config, sandbox
+from .. import config, safe_http, sandbox
 
 
 def log(message: str) -> dict:
@@ -164,7 +164,9 @@ def reachable(target: str, timeout: float = 4.0) -> bool:
             # Any HTTP response — even 403/500/redirect — proves the host is up.
             # No redirect-following (keeps it to one round-trip) and a short
             # timeout so an unreachable host is ruled out in a few seconds.
-            requests.head(url, timeout=timeout, allow_redirects=False, headers=headers)
+            safe_http.safe_request(
+                "HEAD", url, timeout=timeout, allow_redirects=False, headers=headers
+            )
             return True
         except requests.RequestException:
             continue

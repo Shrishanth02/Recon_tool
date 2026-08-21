@@ -26,7 +26,7 @@ try:  # requests bundles urllib3; suppress the InsecureRequestWarning we opt int
 except Exception:  # noqa: BLE001 - best effort only
     pass
 
-from .. import safe_http
+from .. import netguard, safe_http
 from .base import ensure_url, error, log, result, reject_optionlike
 
 USER_AGENT = "RedOpsX-WebAudit/1.0"
@@ -349,10 +349,18 @@ def _check_tls(url, findings) -> Iterator[dict]:
     if not host:
         return
     yield log(f"Inspecting TLS certificate for {host}:{port} ...")
+    # SSRF/rebinding guard: resolve+vet the host ONCE and pin the raw TLS socket
+    # to those IPs, so the handshake cannot be steered to a private/metadata
+    # address between validation and connect (matches the HTTP path's pinning).
+    _tls_ok, _tls_why, _tls_ips = netguard.resolve_and_validate(host)
+    if not _tls_ok:
+        yield log(f"  TLS check skipped — {_tls_why}.")
+        return
     ctx = ssl.create_default_context()
     # First, a strict handshake to validate hostname + trust chain.
     try:
-        with socket.create_connection((host, port), timeout=TIMEOUT) as sock:
+        with safe_http.pinned(host, _tls_ips), \
+                socket.create_connection((host, port), timeout=TIMEOUT) as sock:
             with ctx.wrap_socket(sock, server_hostname=host) as ssock:
                 cert = ssock.getpeercert()
                 version = ssock.version()

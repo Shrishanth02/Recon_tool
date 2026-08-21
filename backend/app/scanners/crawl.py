@@ -37,7 +37,7 @@ from urllib.parse import urljoin, urlparse, urlsplit, parse_qs
 
 import requests
 
-from .. import config, safe_http, sandbox
+from .. import safe_http, sandbox
 from .base import clean_target, ensure_url, error, log, reachable, result, stream_command
 
 # ---------------------------------------------------------------------------

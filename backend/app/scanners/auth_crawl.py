@@ -37,6 +37,7 @@ import time
 from typing import Iterator, List, Optional
 from urllib.parse import urljoin, urlparse, urlsplit, parse_qs
 
+from .. import netguard
 from .base import clean_target, ensure_url, error, log, result
 
 # ---------------------------------------------------------------------------
@@ -52,6 +53,55 @@ REQ_CAP = 4000            # cap on captured network requests kept
 SECRET_CAP = 100          # cap on reported secret hits
 
 _UA = "Mozilla/5.0 (RedOpsX auth-crawl / authenticated attack-surface mapper)"
+
+
+# --------------------------------------------------------------------------- #
+# SSRF navigation guard — every browser request is netguard-checked before it
+# leaves. A page on an authorized target CANNOT redirect Chromium to a
+# private/loopback/link-local/CGNAT/cloud-metadata endpoint: such a request is
+# ABORTED, so the page never loads and its body is never scraped for secrets.
+# Split out as pure functions so the security decision is unit-testable without
+# a real browser.
+# --------------------------------------------------------------------------- #
+def _navigation_allowed(url: str) -> "tuple[bool, str]":
+    """Return ``(allowed, reason)`` for a browser request destination.
+
+    Non-network schemes (``about:``, ``data:``, ``blob:``) make no egress and are
+    allowed. http(s) destinations are resolved + vetted through netguard (which
+    blocks private/loopback/link-local/reserved/CGNAT/metadata, incl. IPv4-mapped
+    & NAT64 forms). Never raises — a validation error fails CLOSED.
+    """
+    low = (url or "").strip().lower()
+    if not low.startswith(("http://", "https://")):
+        return True, "non-network scheme"
+    try:
+        allowed, reason, _ips = netguard.resolve_and_validate(url)
+    except Exception as exc:  # noqa: BLE001 - must never crash the driver; fail closed
+        return False, f"validation error: {exc.__class__.__name__}"
+    return allowed, reason
+
+
+def _guard_route(route, blocked: list) -> None:
+    """Playwright route handler: abort SSRF-unsafe requests, continue the rest."""
+    try:
+        url = route.request.url
+    except Exception:  # noqa: BLE001
+        url = ""
+    allowed, reason = _navigation_allowed(url)
+    if not allowed:
+        try:
+            blocked.append({"url": url, "reason": reason})
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            route.abort()
+        except Exception:  # noqa: BLE001
+            pass
+        return
+    try:
+        route.continue_()
+    except Exception:  # noqa: BLE001
+        pass
 
 # Default login-form selectors, used when the caller doesn't supply their own.
 _DEFAULT_USER_SEL = "input[type=email], input[name*=user i], input[name*=email i], input[id*=user i]"
@@ -370,6 +420,16 @@ def stream(target: str, cancel: Optional[threading.Event] = None, **options) -> 
         context.set_default_navigation_timeout(NAV_TIMEOUT_MS)
         context.set_default_timeout(NAV_TIMEOUT_MS)
 
+        # SSRF guard: netguard-validate EVERY request (initial nav, redirects,
+        # subresources, XHR/fetch) BEFORE Chromium connects; abort unsafe ones.
+        # Registered on the context so it applies to every page/redirect. Does NOT
+        # rely on the initial target validation alone.
+        blocked_navigations: list = []
+        try:
+            context.route("**/*", lambda route: _guard_route(route, blocked_navigations))
+        except Exception as exc:  # noqa: BLE001
+            yield log(f"⚠ could not install navigation SSRF guard ({exc.__class__.__name__}).")
+
         # Cookie auth: set the raw cookie string on the target domain.
         if cookie:
             try:
@@ -623,9 +683,16 @@ def stream(target: str, cancel: Optional[threading.Event] = None, **options) -> 
         f"— in {elapsed}s."
     )
 
+    if blocked_navigations:
+        yield log(
+            f"⚠ SSRF guard aborted {len(blocked_navigations)} request(s) to "
+            "private/metadata destination(s) — never contacted, never scraped."
+        )
+
     yield result({
         "target": url,
         "domain": domain,
+        "ssrf_blocked": len(blocked_navigations),
         "authenticated": authenticated,
         "login_method": login_method,
         "auth_note": auth_note,

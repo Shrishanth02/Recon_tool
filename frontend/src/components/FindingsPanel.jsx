@@ -39,7 +39,12 @@ export default function FindingsPanel({ projectId, findings }) {
     setReporting(true);
     setTriageErr(null);
     const win = window.open("", "_blank");
-    if (win) win.document.write("<p style='font:14px sans-serif;padding:24px'>Generating report…</p>");
+    // STEP 4: sever the opener so the report tab can never reach back into the app
+    // window (reverse-tabnabbing hardening). Report fields are already HTML-escaped.
+    if (win) {
+      win.opener = null;
+      win.document.write("<p style='font:14px sans-serif;padding:24px'>Generating report…</p>");
+    }
     try {
       const html = await fetchReportHtml(projectId);
       const url = URL.createObjectURL(new Blob([html], { type: "text/html" }));

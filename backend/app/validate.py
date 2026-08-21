@@ -17,12 +17,12 @@ Guarantees:
 """
 
 import re
-from typing import Any, Optional
+from typing import Optional
 from urllib.parse import urlsplit
 
 import requests
 
-from . import models, netguard
+from . import models, netguard, safe_http
 from . import scope as scope_mod
 from .database import SessionLocal
 
@@ -66,8 +66,8 @@ def _safe_fetch(url: str, scope_list) -> tuple[Optional["requests.Response"], st
     if not safe:
         return None, f"blocked by netguard ({why})"
     try:
-        resp = requests.get(
-            url, headers={"User-Agent": _UA}, timeout=_TIMEOUT,
+        resp = safe_http.safe_request(
+            "GET", url, headers={"User-Agent": _UA}, timeout=_TIMEOUT,
             verify=False, allow_redirects=False,
         )
         return resp, "ok"

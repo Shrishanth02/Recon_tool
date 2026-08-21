@@ -11,6 +11,9 @@ import tempfile
 import threading
 from typing import Iterator, Optional
 
+import requests
+
+from .. import safe_http
 from .base import error, log, result, stream_command
 
 _SPLIT = re.compile(r"[\s,]+")
@@ -55,7 +58,11 @@ def stream(target: str, cancel: Optional[threading.Event] = None, **_) -> Iterat
             "-tech-detect",
             "-web-server",
             "-content-length",
-            "-follow-redirects",
+            # NOTE: redirects are deliberately NOT auto-followed here. Letting the
+            # httpx Go binary follow 30x would let a public in-scope host redirect
+            # the probe to an internal/RFC-1918/cloud-metadata endpoint (the Go
+            # binary re-resolves DNS and follows outside our guard). We report the
+            # immediate response and follow any redirect ONLY via safe_http below.
             "-timeout", "10",
         ]
         for ev in stream_command(cmd, cancel=cancel, merge_stderr=False):
@@ -85,6 +92,29 @@ def stream(target: str, cancel: Optional[threading.Event] = None, **_) -> Iterat
 
         if cancel is not None and cancel.is_set():
             return
+
+        # Follow redirecting rows through the GUARDED Python path ONLY. safe_http
+        # netguard-validates + IP-pins EVERY hop and refuses any redirect to a
+        # private/loopback/link-local/CGNAT/metadata address — it is never
+        # contacted, and the internal endpoint is never disclosed in the result.
+        _REDIRECT_CODES = {301, 302, 303, 307, 308}
+        _hdrs = {"User-Agent": "Mozilla/5.0 (RECON-X httpx redirect follow)"}
+        for row in rows:
+            if cancel is not None and cancel.is_set():
+                return
+            if row.get("status") in _REDIRECT_CODES and row.get("url"):
+                try:
+                    final = safe_http.safe_request(
+                        "GET", row["url"], timeout=10, max_redirects=5,
+                        allow_redirects=True, verify=False, headers=_hdrs,
+                    )
+                    row["redirect_final_url"] = final.url
+                    row["redirect_final_status"] = final.status_code
+                except safe_http.BlockedDestination as exc:
+                    row["redirect_blocked"] = exc.reason
+                    yield log(f"  ↳ redirect from {row['url']} NOT followed: {exc.reason}")
+                except requests.RequestException:
+                    pass
 
         rows.sort(key=lambda r: (r["status"] or 0))
         yield log(f"✔ {len(rows)} live host(s).")

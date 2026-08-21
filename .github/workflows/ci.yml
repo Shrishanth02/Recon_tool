@@ -29,7 +29,9 @@ jobs:
       # explaining why — never by loosening a version constraint.
       - name: Dependency security audit (pip-audit, production lock)
         run: |
-          pip install pip-audit
+          # Pin the major so a pip-audit release can't silently change the gate's
+          # behavior; the range still allows patch/minor advisory-DB updates.
+          pip install "pip-audit>=2.9,<3"
           # FAIL the build on any NEW advisory affecting a production dependency.
           # The reviewed pre-existing baseline (with rationale + fix versions)
           # lives in .pip-audit-ignores and is tracked for upgrade; dev-only
@@ -111,7 +113,7 @@ jobs:
           DATABASE_URL: ${{ env.MIG_DB_URL }}
         run: |
           alembic current 2>&1 | tee current.txt
-          grep -q "0013_finding_correlation (head)" current.txt
+          grep -q "0015_sso_state (head)" current.txt
       # (4) The app must BOOT and operate against the migrated schema with
       # create_all DISABLED — Alembic is the sole schema authority. Registration
       # writes across organizations/users/workspaces/memberships.
@@ -167,5 +169,15 @@ jobs:
       - uses: actions/checkout@v4
       - name: Build backend image
         run: docker build -t reconx-backend:ci ./backend
+      - name: Build worker image
+        run: docker build -t reconx-worker:ci -f ./backend/Dockerfile.worker ./backend
       - name: Build frontend image
         run: docker build -t reconx-frontend:ci ./frontend
+      # Static validation of the production compose (no containers started). Dummy
+      # secrets satisfy the `${VAR:?}` required-variable guards so `config` can run.
+      - name: Validate compose config
+        env:
+          POSTGRES_PASSWORD: ci-validate
+          REDIS_PASSWORD: ci-validate
+          JWT_SECRET: ci-validate-secret-0123456789abcdef
+        run: docker compose config -q

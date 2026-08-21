@@ -217,6 +217,46 @@ def test_rescan_dedups_instead_of_duplicating():
         db.close()
 
 
+def test_save_scan_clamps_overlong_fields_instead_of_losing_scan():
+    # STEP 4 resilience: an over-long scanner value must be clamped to the column
+    # width, not raise a Postgres DataError at flush that loses the whole scan.
+    db = SessionLocal()
+    try:
+        ws = _ws(db)
+        rec = _nuclei_record(ws.id)
+        rec["result"]["findings"][0]["name"] = "N" * 900              # > String(500)
+        rec["result"]["findings"][0]["matched_at"] = "http://x/" + "a" * 2000  # > String(1000)
+        crud.save_scan(db, rec)
+        db.commit()
+        fs = crud.list_findings(db, ws.id)
+        assert len(fs) == 1                 # finding kept, not lost
+        assert len(fs[0].name) == 500
+        assert len(fs[0].location) == 1000
+    finally:
+        db.close()
+
+
+def test_save_scan_survives_attack_mapping_error(monkeypatch):
+    # A raising ATT&CK mapper must degrade ONE finding to "unmapped", never abort
+    # the whole scan's finding set.
+    from app import attack
+
+    def _boom(tool, finding):
+        raise RuntimeError("mapper blew up")
+
+    monkeypatch.setattr(attack, "map_finding", _boom)
+    db = SessionLocal()
+    try:
+        ws = _ws(db)
+        crud.save_scan(db, _nuclei_record(ws.id))
+        db.commit()
+        fs = crud.list_findings(db, ws.id)
+        assert len(fs) == 1                              # finding still persisted
+        assert fs[0].technique_id is None and fs[0].tactic is None  # just unmapped
+    finally:
+        db.close()
+
+
 def test_different_findings_are_not_merged():
     db = SessionLocal()
     try:

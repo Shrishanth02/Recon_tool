@@ -32,15 +32,19 @@ and terminates promptly, and the persisted scan is recorded as ``"stopped"``.
 from __future__ import annotations
 
 import asyncio
+import logging
 import threading
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, AsyncIterator, Callable
 from uuid import uuid4
 
-from . import netguard
+from . import netguard, observability
 from .config import settings
 from .scanners import get_scanner
+
+logger = logging.getLogger("reconx.execution")
 
 # --------------------------------------------------------------------------- #
 # Shared inline concurrency guard (as today). Sizing matches the routers'
@@ -187,6 +191,11 @@ async def _stream_inline(
     queue: asyncio.Queue = asyncio.Queue()
     sentinel = object()
     started = _now()
+    t0 = time.monotonic()
+    logger.info(
+        "scan start job_id=%s tool=%s target=%s ws=%s",
+        job.job_id, job.tool, job.target, job.workspace_id,
+    )
 
     # Scanner isolation (environment sanitization, process restriction, or a
     # container) is applied per-subprocess in app.scanners.base.stream_command,
@@ -237,6 +246,11 @@ async def _stream_inline(
             started_at=started,
         )
         scan_id = _coerce_scan_id(on_persist(record))
+        observability.record_scan(job.tool, status)
+        logger.info(
+            "scan done job_id=%s scan_id=%s tool=%s status=%s dur=%.2fs",
+            job.job_id, scan_id, job.tool, status, time.monotonic() - t0,
+        )
         yield {
             "type": "saved",
             "scan_id": scan_id,
@@ -306,6 +320,11 @@ def _run_inline_to_completion(job: Job, persist: OnPersist) -> Any:
             "Server is at maximum concurrent scans. Try again shortly."
         )
     started = _now()
+    t0 = time.monotonic()
+    logger.info(
+        "scan start job_id=%s tool=%s target=%s ws=%s",
+        job.job_id, job.tool, job.target, job.workspace_id,
+    )
     logs: list = []
     result_data: Any = None
     error_data: Any = None
@@ -332,7 +351,14 @@ def _run_inline_to_completion(job: Job, persist: OnPersist) -> Any:
         error=error_data,
         started_at=started,
     )
-    return persist(record)
+    persisted = persist(record)
+    observability.record_scan(job.tool, status)
+    logger.info(
+        "scan done job_id=%s scan_id=%s tool=%s status=%s dur=%.2fs",
+        job.job_id, getattr(persisted, "id", None), job.tool, status,
+        time.monotonic() - t0,
+    )
+    return persisted
 
 
 def _run_queue_to_completion(job: Job) -> dict[str, Any]:

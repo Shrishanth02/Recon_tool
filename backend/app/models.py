@@ -588,6 +588,72 @@ class SsoConfig(Base):
     )
 
 
+class RefreshToken(Base):
+    """A single issued refresh token, tracked for rotation + reuse detection.
+
+    Each successful login mints one row with a fresh ``jti`` and a new
+    ``family_id`` (the rotation lineage). ``/auth/refresh`` marks the presented
+    token ``consumed_at`` and mints its successor in the same family. Presenting
+    an already-consumed token (``consumed_at`` set) is REPLAY: the whole family is
+    revoked (``revoked=True``) so a stolen token cannot outlive its rotation. This
+    is per-session, not per-account, so it never causes an account-wide lockout.
+    """
+
+    __tablename__ = "refresh_tokens"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    jti: Mapped[str] = mapped_column(String(64), nullable=False, unique=True, index=True)
+    user_id: Mapped[int] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    family_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    consumed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    revoked: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+
+class SsoState(Base):
+    """A single in-flight OIDC login transaction (CSRF + replay guard).
+
+    One row is minted by ``/auth/sso/{slug}/login`` at the moment the browser is
+    redirected to the identity provider, and consumed exactly once by the OIDC
+    callback. It binds the round-trip to:
+
+    * a specific **org** (``org_id``) — a state minted for org A can never
+      authenticate into org B;
+    * the OIDC **nonce** returned in the provider's id_token — replay of a
+      captured id_token is rejected;
+    * a short **lifetime** (``expires_at``) and **single use** (``consumed``) —
+      once the callback claims the row it is dead, so the same ``state`` value
+      can never be redeemed twice.
+
+    ``state_id`` is an unguessable random token that travels as the OIDC ``state``
+    parameter *and* is set as a browser-scoped httpOnly cookie; the callback
+    requires the two to match, which binds the flow to the browser that started
+    it (defeats login-CSRF). The row is the single source of truth for the org +
+    nonce, so neither is trusted from the tamperable ``state`` string itself.
+    """
+
+    __tablename__ = "sso_states"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    state_id: Mapped[str] = mapped_column(String(64), nullable=False, unique=True, index=True)
+    org_id: Mapped[int] = mapped_column(
+        ForeignKey("organizations.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    nonce: Mapped[str] = mapped_column(String(64), nullable=False)
+    consumed: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+
 class EmulationRun(Base):
     """One execution of the SAFE ATT&CK emulation engine (Purple-Team P2).
 

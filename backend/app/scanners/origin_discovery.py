@@ -29,7 +29,7 @@ from typing import Iterator, Optional
 import requests
 
 from .. import netguard, safe_http
-from .base import clean_target, error, log, result
+from .base import clean_target, log, result
 
 # Response-header / CNAME signatures for common CDNs & WAFs.
 _CDN_SIGNS = {
@@ -123,6 +123,11 @@ def _validate_origin(ip: str, domain: str, edge_ips: set[str]) -> Optional[dict]
         return None
     for scheme in ("https", "http"):
         try:
+            # Candidate is a LITERAL IP already vetted by netguard.validate_target
+            # immediately above (line ~121), and the URL host IS that IP with
+            # allow_redirects=False — so there is no hostname re-resolution and no
+            # DNS-rebinding window. The improved netguard address policy (CGNAT/
+            # Alibaba/IPv4-mapped/NAT64) applies through that check.
             resp = requests.get(
                 f"{scheme}://{ip}/",
                 headers={"User-Agent": _UA, "Host": domain},

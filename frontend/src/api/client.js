@@ -1,8 +1,11 @@
 // API endpoints + auth wiring for the RECON-X frontend.
 //
 // Every REST call carries the current access token as an `Authorization:
-// Bearer <token>` header (see `authHeader`). The WebSocket cannot set headers,
-// so the access token is appended to `WS_URL` as `?token=<access>` instead.
+// Bearer <token>` header (see `authHeader`). The browser WebSocket API cannot
+// set custom headers, so the access token is passed via the
+// `Sec-WebSocket-Protocol` subprotocol (see `wsAuthProtocols`) — NOT the URL
+// query string, which reverse-proxy/gunicorn access logs and browser history
+// would otherwise capture.
 //
 // Override the base with VITE_API_BASE in a .env file if your backend runs
 // somewhere other than http://127.0.0.1:8002 (the backend's default port).
@@ -33,19 +36,22 @@ let accessToken = null;
 let onUnauthorized = null; // async () => boolean  (true == token refreshed)
 
 // Called by AuthContext whenever the access token changes (login / refresh /
-// logout). Keeps both the REST header source and the WS query token in sync.
+// logout). The WS URLs are plain base URLs (no credential); the token is carried
+// out-of-band via the subprotocol (see `wsAuthProtocols`).
 export function setAuthToken(token) {
   accessToken = token || null;
-  WS_URL = accessToken
-    ? `${WS_BASE}?token=${encodeURIComponent(accessToken)}`
-    : WS_BASE;
-  PIPELINE_WS_URL = accessToken
-    ? `${PIPELINE_WS_BASE}?token=${encodeURIComponent(accessToken)}`
-    : PIPELINE_WS_BASE;
 }
 
 export function getAuthToken() {
   return accessToken;
+}
+
+// The Sec-WebSocket-Protocol list a WebSocket is opened with. The access token
+// travels here — in a header, never the URL — so it is not exposed via access
+// logs, proxy logs, or browser history. The server reads the value after the
+// "reconx.token" marker and echoes back only that (safe) protocol name.
+export function wsAuthProtocols() {
+  return accessToken ? ["reconx.token", accessToken] : [];
 }
 
 // The header object mixed into every authed fetch — also handy for callers that
@@ -62,7 +68,15 @@ export function setUnauthorizedHandler(fn) {
 
 async function request(path, { method = "GET", body, headers, raw, skipAuthRetry } = {}) {
   const build = () => {
-    const opts = { method, headers: { ...authHeader(), ...(headers || {}) } };
+    // `credentials: "include"` so the httpOnly refresh cookie is received on
+    // login/register and sent on /auth/refresh. The cookie is path-scoped to
+    // /auth/refresh, so it never rides ordinary API calls; access auth stays the
+    // Bearer header.
+    const opts = {
+      method,
+      credentials: "include",
+      headers: { ...authHeader(), ...(headers || {}) },
+    };
     if (body !== undefined) {
       opts.headers["Content-Type"] = "application/json";
       opts.body = JSON.stringify(body);
@@ -116,13 +130,22 @@ export function loginUser({ email, password, mfa_code }) {
   });
 }
 
-// Uses the refresh token directly; never itself triggers the 401 refresh path.
-export function refreshTokens(refresh_token) {
+// Rotates the session via the httpOnly refresh cookie (sent by credentials:
+// "include") — the refresh token never lives in JS. Returns { access_token };
+// the rotated refresh token is delivered only in the re-set cookie. Never itself
+// triggers the 401 refresh path.
+export function refreshTokens() {
   return request("/auth/refresh", {
     method: "POST",
-    body: { refresh_token },
     skipAuthRetry: true,
   });
+}
+
+// Single-device sign-out: clears the httpOnly refresh cookie server-side and
+// revokes the session family. Best-effort (204/no body); the caller still clears
+// local access state regardless.
+export function logoutSession() {
+  return request("/auth/logout", { method: "POST", skipAuthRetry: true, raw: true });
 }
 
 export function fetchMe() {

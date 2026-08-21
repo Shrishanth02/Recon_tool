@@ -31,11 +31,45 @@ from .config import settings
 # --------------------------------------------------------------------------- #
 # Cloud metadata endpoints — always blocked, regardless of BLOCK_PRIVATE_TARGETS
 # --------------------------------------------------------------------------- #
-#: Well-known link-local metadata service addresses (AWS/GCP/Azure IPv4 + the
-#: AWS IPv6 endpoint). Exposed as a module constant for tests and callers.
-METADATA_IPS: frozenset[str] = frozenset({"169.254.169.254", "fd00:ec2::254"})
+#: Cloud-metadata service addresses — ALWAYS blocked, regardless of
+#: BLOCK_PRIVATE_TARGETS. AWS/GCP/Azure link-local IPv4, the AWS IPv6 endpoint,
+#: and Alibaba Cloud's metadata IP (100.100.100.200, which lives inside the CGNAT
+#: 100.64.0.0/10 range and is therefore NOT caught by is_private/is_reserved).
+METADATA_IPS: frozenset[str] = frozenset(
+    {"169.254.169.254", "fd00:ec2::254", "100.100.100.200"}
+)
 
 _METADATA_IP_OBJS = {ipaddress.ip_address(ip) for ip in METADATA_IPS}
+
+#: Carrier-grade NAT / shared address space (RFC 6598). Python's ``is_private``
+#: does NOT flag this range on all interpreters, yet it routes to internal/cloud
+#: NAT infrastructure (and contains the Alibaba metadata IP), so we block it
+#: explicitly under BLOCK_PRIVATE_TARGETS.
+_CGNAT_NET = ipaddress.ip_network("100.64.0.0/10")
+
+#: NAT64 well-known prefix (RFC 6052). The low 32 bits embed an IPv4 address, so
+#: ``64:ff9b::a9fe:a9fe`` is really 169.254.169.254 — unwrap and re-check.
+_NAT64_NET = ipaddress.ip_network("64:ff9b::/96")
+
+
+def _embedded_ipv4(ip: "ipaddress._BaseAddress"):
+    """Return the IPv4 address embedded in an IPv6 wrapper form, else ``None``.
+
+    Covers IPv4-mapped (``::ffff:a.b.c.d``), 6to4 (``2002:V4::``), and NAT64
+    (``64:ff9b::/96``) so a dangerous IPv4 address cannot be smuggled past the
+    checks by expressing it as IPv6.
+    """
+    if ip.version != 6:
+        return None
+    mapped = ip.ipv4_mapped
+    if mapped is not None:
+        return mapped
+    sixto = ip.sixtofour
+    if sixto is not None:
+        return sixto
+    if ip in _NAT64_NET:
+        return ipaddress.ip_address(int(ip) & 0xFFFFFFFF)
+    return None
 
 _SCHEME = re.compile(r"^[a-z][a-z0-9+.\-]*://", re.I)
 _SPLIT = re.compile(r"[\s,]+")
@@ -60,12 +94,31 @@ def _bare_host(target: str) -> str:
 
 
 def _ip_is_dangerous(ip: ipaddress._BaseAddress) -> bool:
-    """Return ``True`` if ``ip`` is in a range scans must never reach."""
+    """Return ``True`` if ``ip`` is in a range scans must never reach.
+
+    Policy (explicit, so legitimate public scanning is not broken):
+
+    * **Always blocked** (even when ``BLOCK_PRIVATE_TARGETS`` is False): cloud
+      metadata endpoints (incl. their IPv4-mapped / NAT64 / 6to4 IPv6 forms).
+    * **Blocked only when ``BLOCK_PRIVATE_TARGETS`` is True** (the default):
+      private (RFC 1918), loopback, link-local, reserved, multicast, unspecified,
+      and CGNAT/shared-address-space (RFC 6598, ``100.64.0.0/10``) — plus any
+      IPv6 wrapper that embeds such an IPv4 address.
+    * Everything else (public, globally-routable) is allowed.
+    """
+    # Unwrap IPv4-mapped / 6to4 / NAT64 IPv6 forms and apply the SAME policy to
+    # the embedded IPv4 — a dangerous v4 address can't hide inside an IPv6 form.
+    embedded = _embedded_ipv4(ip)
+    if embedded is not None and _ip_is_dangerous(embedded):
+        return True
+
     if ip in _METADATA_IP_OBJS:
         return True
     if not settings.BLOCK_PRIVATE_TARGETS:
         # Operator opted into internal scanning; only metadata stays blocked.
         return False
+    if ip.version == 4 and ip in _CGNAT_NET:
+        return True
     return bool(
         ip.is_private
         or ip.is_loopback
@@ -76,23 +129,27 @@ def _ip_is_dangerous(ip: ipaddress._BaseAddress) -> bool:
     )
 
 
-def validate_target(target: str) -> tuple[bool, str]:
-    """Validate a single target host for SSRF safety.
+def resolve_and_validate(target: str) -> tuple[bool, str, list[str]]:
+    """Validate a target AND return the exact vetted IP set to connect to.
 
-    Returns ``(allowed, reason)``. ``allowed`` is ``True`` only when the host
-    resolves exclusively to public, routable addresses (or the private checks
-    are disabled and it is neither unresolvable nor a metadata endpoint).
+    Returns ``(allowed, reason, ips)``. ``ips`` is the de-duplicated list of
+    resolved, individually-vetted addresses (a single-element list for a literal
+    IP). This is the anti-DNS-rebinding primitive: the host is resolved **once**
+    here, every address is checked, and the caller is expected to PIN the
+    connection to exactly these IPs (see :mod:`app.safe_http`) so the subsequent
+    HTTP request cannot re-resolve to a different (private/metadata) address.
 
     A literal IP is checked directly with no DNS lookup; a hostname is resolved
-    via :func:`socket.getaddrinfo` and *every* resulting address must pass.
+    via :func:`socket.getaddrinfo` and *every* resulting address must pass or the
+    whole target is refused (``ips`` empty on refusal).
     """
     host = _bare_host(target)
     if not host:
-        return False, "empty target"
+        return False, "empty target", []
 
     if host == "localhost" or host.endswith(".localhost"):
         if settings.BLOCK_PRIVATE_TARGETS:
-            return False, "localhost is not an allowed target"
+            return False, "localhost is not an allowed target", []
         # BLOCK_PRIVATE_TARGETS=false → operator opted into internal scanning
 
     # Literal IP: check directly, skip DNS.
@@ -103,29 +160,46 @@ def validate_target(target: str) -> tuple[bool, str]:
 
     if literal is not None:
         if _ip_is_dangerous(literal):
-            return False, f"target resolves to a blocked address ({host})"
-        return True, "ok"
+            return False, f"target resolves to a blocked address ({host})", []
+        return True, "ok", [str(literal)]
 
-    # Hostname: resolve to all A/AAAA records and vet each one.
+    # Hostname: resolve ONCE to all A/AAAA records and vet each one.
     try:
         infos = socket.getaddrinfo(host, None)
     except (socket.gaierror, socket.herror, UnicodeError, OSError):
-        return False, "could not resolve host"
+        return False, "could not resolve host", []
 
-    addresses = {info[4][0] for info in infos}
-    if not addresses:
-        return False, "could not resolve host"
-
-    for addr in addresses:
-        addr = addr.split("%")[0]  # strip any IPv6 zone id
+    ips: list[str] = []
+    seen: set[str] = set()
+    for info in infos:
+        addr = str(info[4][0]).split("%")[0]  # strip any IPv6 zone id
+        if addr in seen:
+            continue
+        seen.add(addr)
         try:
             ip = ipaddress.ip_address(addr)
         except ValueError:
             continue
         if _ip_is_dangerous(ip):
-            return False, f"target resolves to a blocked address ({addr})"
+            return False, f"target resolves to a blocked address ({addr})", []
+        ips.append(str(ip))
 
-    return True, "ok"
+    if not ips:
+        return False, "could not resolve host", []
+    return True, "ok", ips
+
+
+def validate_target(target: str) -> tuple[bool, str]:
+    """Validate a single target host for SSRF safety (``(allowed, reason)``).
+
+    Thin wrapper over :func:`resolve_and_validate` for callers that only need the
+    boolean decision (scope gates, pre-flight checks). Callers that make the
+    actual outbound connection should use :func:`resolve_and_validate` and pin
+    the returned IPs, or go through :mod:`app.safe_http`, to close the
+    resolve-then-connect (DNS-rebinding) gap.
+    """
+    allowed, reason, _ips = resolve_and_validate(target)
+    return allowed, reason
 
 
 def validate_targets(raw: str) -> tuple[bool, str]:

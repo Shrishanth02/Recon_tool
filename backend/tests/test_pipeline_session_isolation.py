@@ -21,7 +21,6 @@ These tests prove the invariants the fix guarantees:
 import threading
 from datetime import datetime, timezone
 
-import pytest
 
 from app import crud
 from app.database import SessionLocal

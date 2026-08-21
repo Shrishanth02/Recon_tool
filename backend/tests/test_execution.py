@@ -83,6 +83,31 @@ def test_stream_inline_persists_and_emits_saved_done(fake_scanner):
     assert record["result"]["total"] == 1
 
 
+def test_stream_inline_records_scan_metric(fake_scanner, monkeypatch):
+    # STEP 4 observability: the terminal scan status feeds reconx_scans_total.
+    from app import observability
+
+    calls = []
+    monkeypatch.setattr(
+        observability, "record_scan", lambda tool, status: calls.append((tool, status))
+    )
+    job = execution.Job(tool="nuclei", target="example.com", workspace_id=7)
+    _drain(job, lambda record: _FakeScan(4242))
+    assert ("nuclei", "done") in calls
+
+
+def test_run_to_completion_records_scan_metric(fake_scanner, monkeypatch):
+    from app import observability
+
+    calls = []
+    monkeypatch.setattr(
+        observability, "record_scan", lambda tool, status: calls.append((tool, status))
+    )
+    job = execution.Job(tool="nuclei", target="example.com", workspace_id=3)
+    execution.run_to_completion(job, persist=lambda record: _FakeScan(99))
+    assert ("nuclei", "done") in calls
+
+
 def test_stream_ssrf_target_errors_and_skips_scanner(monkeypatch):
     calls = []
 

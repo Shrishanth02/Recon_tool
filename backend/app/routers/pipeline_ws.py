@@ -31,6 +31,7 @@ from .. import billing, correlate, crud, netguard, pipeline, ratelimit, risk, sc
 from ..config import settings
 from ..database import SessionLocal
 from ..pipeline import PipelineConfig
+from .ws import _ws_credentials  # shared: WS credential via Sec-WebSocket-Protocol
 
 router = APIRouter()
 
@@ -101,7 +102,10 @@ def _authenticate(db, token: str | None, key: str | None):
         if claims.get("type") != "access":
             return None, None
         user = crud.get_user(db, int(claims.get("sub", 0)))
-        if user and user.is_active:
+        if (
+            user and user.is_active
+            and not security.is_token_revoked(claims.get("ver"), user.token_version)
+        ):
             return user, None
     return None, None
 
@@ -137,7 +141,8 @@ def _resolve_workspace(db, user, api_key, ws_id: int):
 @router.websocket("/ws/pipeline")
 async def ws_pipeline(websocket: WebSocket):
     """Authenticate, run the full auto-pentest pipeline, stream events, persist."""
-    await websocket.accept()
+    token, key, _subproto = _ws_credentials(websocket)
+    await websocket.accept(subprotocol=_subproto)
 
     # P1-H2: rate-limit pipeline WS connections by client IP (scan bucket) BEFORE
     # auth so an attacker cannot open unlimited pipeline sockets.
@@ -157,8 +162,8 @@ async def ws_pipeline(websocket: WebSocket):
 
     db = SessionLocal()
     try:
-        token = websocket.query_params.get("token")
-        key = websocket.query_params.get("key")
+        # Credential from the Sec-WebSocket-Protocol header (read above); the
+        # deprecated ?token=/?key= query string is handled as a fallback there.
         user, api_key = _authenticate(db, token, key)
 
         async def reject(msg: str) -> None:
@@ -249,6 +254,7 @@ async def ws_pipeline(websocket: WebSocket):
         )
         db.commit()
         run_finished = False
+        crashed = False  # set when the pipeline emits its typed terminal error
 
         # Capture identifiers as plain values so the worker-thread persistence
         # callback never has to touch a coroutine-bound ORM object (which would be
@@ -338,6 +344,10 @@ async def ws_pipeline(websocket: WebSocket):
                 persist=_persist,
             ):
                 _accumulate(event)
+                # A typed terminal error means the pipeline CRASHED (vs a user
+                # Stop) — record it so the run is finalized "failed", not "stopped".
+                if event.get("type") == "error":
+                    crashed = True
                 # Persist the process at each stage boundary so an interrupted
                 # run still keeps everything completed up to that point.
                 if event.get("type") == "pipeline_stage" and event.get("status") in (
@@ -401,13 +411,16 @@ async def ws_pipeline(websocket: WebSocket):
         finally:
             cancel.set()
             receiver_task.cancel()
-            # A run cancelled/aborted before pipeline_done never got finalized —
-            # mark it stopped so it doesn't linger in the "running" state.
+            # A run aborted before pipeline_done never got finalized — mark it
+            # terminal so it doesn't linger "running". A crash (typed error) is
+            # "failed"; a user Stop / disconnect is "stopped" — distinguishable
+            # for monitoring and in the run history.
             if not run_finished:
                 try:
                     _save_process()
+                    _final_status = "failed" if crashed else "stopped"
                     crud.finish_pentest_run(
-                        db, run, "stopped", run.risk_score, run.risk_label, run.summary
+                        db, run, _final_status, run.risk_score, run.risk_label, run.summary
                     )
                     db.commit()
                 except Exception:

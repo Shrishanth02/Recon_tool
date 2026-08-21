@@ -44,7 +44,7 @@ kind of detection P3 wants to confirm.
 from __future__ import annotations
 
 import socket
-from typing import Any, Callable
+from typing import Any
 from urllib.parse import urlsplit
 
 import requests

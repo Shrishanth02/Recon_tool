@@ -116,6 +116,9 @@ def test_fetch_userinfo_no_network(monkeypatch):
 # --------------------------------------------------------------------------- #
 def test_oidc_callback_provisions_and_issues_tokens(client, monkeypatch):
     monkeypatch.setattr(app_settings, "SSO_ENABLED", True)
+    # DEBUG => the browser-binding state cookie is non-Secure, so it rides the
+    # http test client back to the callback (in production it is Secure/https).
+    monkeypatch.setattr(app_settings, "DEBUG", True)
 
     reg = client.post(
         "/auth/register",
@@ -148,9 +151,20 @@ def test_oidc_callback_provisions_and_issues_tokens(client, monkeypatch):
     assert put.json()["client_secret_set"] is True
     assert "client_secret" not in put.json()
 
-    # Stub the two network calls so the callback is fully hermetic.
+    # Begin the login: mints the single-use state record + sets the state cookie.
+    # build_auth_url is stubbed so /login never touches the network (discovery).
     monkeypatch.setattr(
-        sso, "exchange_code", lambda cfg, code, **kw: {"access_token": "at", "id_token": "it"}
+        sso, "build_auth_url", lambda cfg, state, nonce, **kw: "https://idp.example/authorize"
+    )
+    login = client.get(f"/auth/sso/{slug}/login", follow_redirects=False)
+    assert login.status_code == 302
+    state = login.cookies.get("reconx_oidc_state")
+    assert state  # browser-binding cookie was set
+
+    # Stub the two network calls so the callback is fully hermetic (no id_token ->
+    # nonce check is a no-op; dedicated nonce cases live in test_oidc_state.py).
+    monkeypatch.setattr(
+        sso, "exchange_code", lambda cfg, code, **kw: {"access_token": "at"}
     )
     monkeypatch.setattr(
         sso,
@@ -158,9 +172,10 @@ def test_oidc_callback_provisions_and_issues_tokens(client, monkeypatch):
         lambda cfg, tokens, **kw: {"email": "dana@corp.com", "name": "Dana", "sub": "7"},
     )
 
+    # The cookie set at /login rides the jar back here; state param matches it.
     resp = client.get(
         f"/auth/sso/{slug}/callback",
-        params={"code": "authcode", "state": f"{slug}:random"},
+        params={"code": "authcode", "state": state},
     )
     assert resp.status_code == 200, resp.text
     body = resp.json()

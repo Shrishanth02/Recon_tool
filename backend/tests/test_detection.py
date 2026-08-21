@@ -32,9 +32,6 @@ from app.connectors.mock import MockConnector
 
 # Reuse the P2 emulation fakes verbatim so the integration path is hermetic.
 from tests.test_emulation import (
-    FakeSocketModule,
-    RecordingRequests,
-    _patch_transport,
     _set_scope,
     safe_transport,  # noqa: F401  (pytest fixture, imported for use)
 )

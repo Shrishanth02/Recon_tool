@@ -47,7 +47,12 @@ class RefreshIn(BaseModel):
 
 class TokenOut(BaseModel):
     access_token: str
-    refresh_token: str
+    # Optional (STEP 4): on the cookie-authenticated refresh path the rotated
+    # refresh token is returned ONLY in the httpOnly cookie, never in the body, so
+    # an XSS that calls /auth/refresh cannot read it. The legacy body path (a
+    # programmatic client that presents the token in the request body) still
+    # receives it here.
+    refresh_token: str | None = None
     token_type: str = "bearer"
 
 

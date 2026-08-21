@@ -27,7 +27,7 @@ import pytest
 from sqlalchemy import create_engine, inspect, text
 
 BACKEND = Path(__file__).resolve().parents[1]
-HEAD_REVISION = "0013_finding_correlation"
+HEAD_REVISION = "0015_sso_state"
 INITIAL_REVISION = "0001_initial"
 
 

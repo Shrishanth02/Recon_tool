@@ -22,6 +22,7 @@ from urllib.parse import urlsplit
 
 import requests
 
+from .. import safe_http
 from .base import ensure_url, error, log, result
 
 _TIMEOUT = 8
@@ -47,8 +48,8 @@ def _http(method: str, url: str, headers: dict, data=None, ctype=None) -> Option
     if ctype:
         h["Content-Type"] = ctype
     try:
-        r = requests.request(method, url, headers=h, data=data, timeout=_TIMEOUT,
-                             verify=False, allow_redirects=False)
+        r = safe_http.safe_request(method, url, headers=h, data=data, timeout=_TIMEOUT,
+                                   verify=False, allow_redirects=False)
         # requests.Response.raw exposes multiple Set-Cookie headers; fall back to
         # the (possibly-joined) header for a Set-Cookie SameSite scan.
         set_cookie = ""

@@ -114,12 +114,31 @@ services:
         # must be reachable from the host, not the compose-internal hostname.
         VITE_API_BASE: ${VITE_API_BASE:-http://localhost:8002}
     restart: unless-stopped
+    # --- Runtime hardening — same model as backend/worker ------------------- #
+    # The image runs non-root (nginx-unprivileged, uid 101, listens on 8080).
+    # Drop all caps + forbid privilege escalation: a static file server needs
+    # neither. Conservative limits (nginx is tiny); override via .env.
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: ${FRONTEND_MEM_LIMIT:-256m}
+    cpus: ${FRONTEND_CPUS:-1.0}
+    pids_limit: ${FRONTEND_PIDS_LIMIT:-256}
+    # Readiness = nginx actually serves the SPA shell (busybox wget ships in the
+    # alpine base; non-destructive; leaks nothing).
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:8080/ || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
     environment:
       VITE_API_BASE: ${VITE_API_BASE:-http://localhost:8002}
     depends_on:
       - backend
     ports:
-      - "5173:80"
+      - "5173:8080"
 
   # --- Phase 2 background scan worker ----------------------------------------
   # Pulls scan jobs off Redis and runs them out of process. Built from a

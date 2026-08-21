@@ -26,8 +26,9 @@ A ``threading.Event`` (``cancel``) lets the caller abort at any point.
 from __future__ import annotations
 
 import asyncio
+import logging
 import threading
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, AsyncIterator, Iterator
 from urllib.parse import parse_qsl, urlsplit
@@ -56,6 +57,8 @@ from .scanners import (
     whois_lookup,
 )
 from .scanners.dns_zone_transfer import stream as dns_zt_stream
+
+logger = logging.getLogger("reconx.pipeline")
 
 
 # --------------------------------------------------------------------------- #
@@ -187,23 +190,36 @@ def _drain(
     produced or the scan was cancelled).
     """
     result_data = None
-    for ev in gen:
-        if cancel.is_set():
-            break
-        kind = ev.get("type")
-        if kind == "log":
-            loop.call_soon_threadsafe(
-                queue.put_nowait,
-                {"type": "pipeline_log", "stage": stage, "data": ev["data"]},
-            )
-        elif kind == "result":
-            result_data = ev.get("data")
-        elif kind == "error":
-            loop.call_soon_threadsafe(
-                queue.put_nowait,
-                {"type": "pipeline_log", "stage": stage, "data": f"⚠ {ev['data']}"},
-            )
-        # returncode events are silently swallowed
+    # STEP 4 resilience: isolate a scanner that RAISES (as opposed to the
+    # disciplined path of emitting an {"type":"error"} event). Without this, one
+    # raising scanner propagates out to the single run-wide handler and aborts
+    # every remaining stage (no Summary, no pipeline_done). Catching here turns a
+    # raise into a stage-scoped error line, exactly like an emitted error event,
+    # so the pipeline continues to the next stage.
+    try:
+        for ev in gen:
+            if cancel.is_set():
+                break
+            kind = ev.get("type")
+            if kind == "log":
+                loop.call_soon_threadsafe(
+                    queue.put_nowait,
+                    {"type": "pipeline_log", "stage": stage, "data": ev["data"]},
+                )
+            elif kind == "result":
+                result_data = ev.get("data")
+            elif kind == "error":
+                loop.call_soon_threadsafe(
+                    queue.put_nowait,
+                    {"type": "pipeline_log", "stage": stage, "data": f"⚠ {ev['data']}"},
+                )
+            # returncode events are silently swallowed
+    except Exception as exc:  # noqa: BLE001 - one raising scanner must not abort the run
+        logger.warning("pipeline stage %s scanner raised: %s", stage, exc)
+        loop.call_soon_threadsafe(
+            queue.put_nowait,
+            {"type": "pipeline_log", "stage": stage, "data": f"⚠ stage error: {exc}"},
+        )
     return result_data
 
 
@@ -998,9 +1014,17 @@ async def run_pipeline(
             _finish(ctx, cancel, loop, queue)
 
         except Exception as exc:  # noqa: BLE001 — surface pipeline crashes
+            logger.error("pipeline run crashed: %s", exc)
+            # Human-readable log line AND a typed terminal error so the client (and
+            # the persistence layer) can distinguish a crash from routine output
+            # and from a user Stop.
             loop.call_soon_threadsafe(
                 queue.put_nowait,
                 {"type": "pipeline_log", "stage": 0, "data": f"Pipeline error: {exc}"},
+            )
+            loop.call_soon_threadsafe(
+                queue.put_nowait,
+                {"type": "error", "stage": 0, "data": f"Pipeline error: {exc}"},
             )
         finally:
             loop.call_soon_threadsafe(queue.put_nowait, sentinel)

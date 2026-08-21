@@ -152,6 +152,12 @@ def update_member_role(
     target = crud.get_membership(db, user_id, org_id)
     if not target:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Membership not found")
+    # Separation of duties: a caller may not change the role of a member who
+    # outranks them — an admin cannot demote an OWNER (only owners manage owners).
+    if not security.can_manage_member(membership.role, target.role):
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN, "Cannot modify a member who outranks you"
+        )
     # Only an owner may promote anyone to owner (prevents admin self/peer escalation).
     if payload.role == "owner" and membership.role != "owner":
         raise HTTPException(
@@ -181,6 +187,11 @@ def remove_member(
     target = crud.get_membership(db, user_id, org_id)
     if not target:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Membership not found")
+    # Separation of duties: an admin cannot remove an OWNER (only owners manage owners).
+    if not security.can_manage_member(membership.role, target.role):
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN, "Cannot remove a member who outranks you"
+        )
     if target.role == "owner" and _count_owners(db, org_id) <= 1:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "Cannot remove the last owner")
 

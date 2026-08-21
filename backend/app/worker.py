@@ -20,14 +20,19 @@ the module stays import-safe exactly like the rest of the Phase 2 core.
 from __future__ import annotations
 
 import asyncio
+import logging
 import threading
+import time
 from datetime import datetime, timezone
 from typing import Any
 
+from . import observability
 from .config import settings
 from .database import SessionLocal
 from .scanners import get_scanner
 from .streaming import SyncPublisher
+
+logger = logging.getLogger("reconx.worker")
 
 # ``RedisSettings`` only parses a DSN string (no connection), but importing arq
 # must not be a hard requirement of merely importing this module. Resolve it
@@ -101,7 +106,8 @@ def _notify_new_findings(db: Any, scan: Any) -> None:
                     "finding": finding,
                 }
                 notify.dispatch(channel, event)
-    except Exception:  # noqa: BLE001 - notifications must never break a scan
+    except Exception as exc:  # noqa: BLE001 - notifications must never break a scan
+        logger.debug("new-finding notification failed: %s", exc)
         return
 
 
@@ -167,6 +173,8 @@ def _execute_and_persist(job: dict[str, Any]) -> dict[str, Any]:
 
     publisher = SyncPublisher(job_id)
     started = _now()
+    t0 = time.monotonic()
+    logger.info("queue scan start job_id=%s tool=%s target=%s", job_id, tool, target)
     logs: list = []
     result_data: Any = None
     error_data: Any = None
@@ -206,9 +214,13 @@ def _execute_and_persist(job: dict[str, Any]) -> dict[str, Any]:
                         publisher.publish(event)
                 except Exception as exc:  # noqa: BLE001 - surface any scanner crash
                     error_data = str(exc)
+                    logger.warning(
+                        "queue scan crashed job_id=%s tool=%s: %s", job_id, tool, exc
+                    )
                     publisher.publish({"type": "error", "data": error_data})
 
         status = "blocked" if blocked_reason is not None else ("error" if error_data else "done")
+        observability.record_scan(tool, status)
         record = {
             "workspace_id": job.get("workspace_id"),
             "created_by": job.get("created_by"),
@@ -250,6 +262,10 @@ def _execute_and_persist(job: dict[str, Any]) -> dict[str, Any]:
         finally:
             db.close()
 
+        logger.info(
+            "queue scan done job_id=%s scan_id=%s tool=%s status=%s dur=%.2fs",
+            job_id, scan_id, tool, status, time.monotonic() - t0,
+        )
         publisher.publish(
             {
                 "type": "saved",
@@ -324,7 +340,11 @@ def _run_purple_schedule(db: Any, sched: Any) -> bool:
             technique_ids=cfg.get("techniques"),
         )
         return True
-    except Exception:  # noqa: BLE001 - a purple schedule must never wedge the poller
+    except Exception as exc:  # noqa: BLE001 - a purple schedule must never wedge the poller
+        logger.warning(
+            "scheduled purple run failed (schedule_id=%s): %s",
+            getattr(sched, "id", "?"), exc,
+        )
         return False
 
 

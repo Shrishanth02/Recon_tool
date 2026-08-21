@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import secrets
 
-from fastapi import APIRouter, Depends, HTTPException, Path, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Path, Query, Request, Response, status
 from fastapi.responses import RedirectResponse
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
@@ -76,8 +76,11 @@ def _issue_login(db: Session, user: models.User, org: models.Organization) -> sc
     fly if the org has none (mirrors the password-login path).
     """
     ver = int(getattr(user, "token_version", 0) or 0)
+    rt = crud.issue_refresh_token(db, user.id)  # new rotation family; caller commits
     access = security.create_access_token(user.id, org_id=org.id, token_version=ver)
-    refresh = security.create_refresh_token(user.id, org_id=org.id, token_version=ver)
+    refresh = security.create_refresh_token(
+        user.id, org_id=org.id, token_version=ver, jti=rt.jti, family=rt.family_id,
+    )
 
     ws_id = crud.default_workspace_id_for_org(db, org.id)
     workspace = crud.get_workspace(db, ws_id) if ws_id else None
@@ -119,6 +122,80 @@ def _saml_sso_url(cfg: models.SsoConfig) -> str | None:
 
 
 # --------------------------------------------------------------------------- #
+# OIDC state (CSRF + replay) — browser-binding cookie helpers
+# --------------------------------------------------------------------------- #
+#: httpOnly cookie carrying the OIDC ``state`` id back to the callback. It binds
+#: the round-trip to the browser that began the login: the callback requires the
+#: cookie to match the ``state`` query parameter, so a forged callback replayed in
+#: a victim's browser (login-CSRF) — which has no matching cookie — is rejected.
+_OIDC_STATE_COOKIE = "reconx_oidc_state"
+#: The cookie (and every OIDC callback) lives under this path, so it is scoped to
+#: the SSO surface and never sent with ordinary API calls.
+_OIDC_COOKIE_PATH = "/auth/sso"
+
+
+def _set_state_cookie(resp: Response, state_id: str) -> None:
+    """Set the browser-binding OIDC state cookie on ``resp`` (the login redirect).
+
+    ``SameSite=Lax`` so it rides the provider's top-level GET redirect back to the
+    callback; ``Secure`` in production (relaxed only under DEBUG for local http);
+    ``httpOnly`` so page scripts cannot read it; ``max_age`` matches the state TTL.
+    """
+    resp.set_cookie(
+        _OIDC_STATE_COOKIE,
+        state_id,
+        max_age=int(settings.SSO_STATE_TTL_SECONDS),
+        httponly=True,
+        samesite="lax",
+        secure=not settings.DEBUG,
+        path=_OIDC_COOKIE_PATH,
+    )
+
+
+def _clear_state_cookie(resp: Response) -> None:
+    """Delete the OIDC state cookie once the callback has consumed the state."""
+    resp.delete_cookie(_OIDC_STATE_COOKIE, path=_OIDC_COOKIE_PATH)
+
+
+def _verify_oidc_state(
+    db: Session,
+    request: Request,
+    state: str,
+    *,
+    expected_org_id: int | None = None,
+) -> models.SsoState:
+    """Validate a callback's ``state`` and consume it single-use, or 400.
+
+    Every state invariant is enforced BEFORE any token work happens:
+
+    * **Browser binding** — the request must carry the ``reconx_oidc_state``
+      cookie set at ``/login`` and it must equal the ``state`` query parameter
+      (constant-time compare). A missing/mismatched cookie means the callback did
+      not originate in the browser that began the login (login-CSRF) — reject.
+      This also rejects a missing/empty ``state``.
+    * **Existence / expiry / single use / tenant** — delegated to
+      :func:`app.crud.consume_sso_state`, which atomically claims the row only if
+      it exists, is unexpired, is unused, and (when ``expected_org_id`` is given)
+      belongs to the callback's org. A replay of an already-consumed state, an
+      expired state, a tampered/unknown state, or a state minted for another org
+      all return ``invalid``.
+
+    On success the row is durably consumed (committed) before returning, so token
+    work that fails afterwards can never leave the state reusable. Returns the
+    consumed record (carrying the bound org + nonce). Raises 400 on any failure,
+    so tokens are NEVER issued for an invalid/replayed/tampered/foreign state.
+    """
+    cookie_state = request.cookies.get(_OIDC_STATE_COOKIE) or ""
+    if not state or not cookie_state or not secrets.compare_digest(cookie_state, state):
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Invalid SSO state")
+    result, rec = crud.consume_sso_state(db, state, expected_org_id=expected_org_id)
+    if result != "ok" or rec is None:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Invalid SSO state")
+    db.commit()  # lock in single-use consumption BEFORE any token work
+    return rec
+
+
+# --------------------------------------------------------------------------- #
 # Login flow
 # --------------------------------------------------------------------------- #
 @router.get("/auth/sso/{org_slug}/login")
@@ -128,11 +205,13 @@ def sso_login(
 ):
     """Begin an SSO login, redirecting the browser to the identity provider.
 
-    * **OIDC** — builds the authorization URL (via :func:`app.sso.build_auth_url`)
-      and 302s to it. ``state`` encodes the org slug so the fixed
-      ``/auth/sso/callback`` redirect URI can recover the tenant; ``nonce`` is a
-      replay guard. (State/nonce should be persisted in a production deployment;
-      here they are opaque round-trip values.)
+    * **OIDC** — mints a single-use :class:`~app.models.SsoState` row (unguessable
+      ``state`` id + ``nonce``, bound to this org, short-lived) and 302s to the
+      authorization URL. The ``state`` id is ALSO set as an httpOnly cookie, so the
+      callback can prove the round-trip returned to the same browser. The org is
+      carried by the server-side record, never by the ``state`` string, so a
+      forged ``state`` cannot select a tenant. ``nonce`` is later matched against
+      the provider's id_token.
     * **SAML** — 302s to the IdP's SingleSignOnService when the stored metadata
       advertises one, else 400 directing the caller to IdP-initiated login.
     """
@@ -140,13 +219,16 @@ def sso_login(
     provider = (cfg.provider or "oidc").strip().lower()
 
     if provider == "oidc":
-        state = f"{org.slug}:{secrets.token_urlsafe(16)}"
-        nonce = secrets.token_urlsafe(16)
+        rec = crud.create_sso_state(db, org.id)  # flushed, not yet committed
         try:
-            url = sso.build_auth_url(cfg, state=state, nonce=nonce)
+            url = sso.build_auth_url(cfg, state=rec.state_id, nonce=rec.nonce)
         except sso.SsoError as exc:
+            db.rollback()  # discard the unused state row on a config error
             raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc))
-        return RedirectResponse(url, status_code=status.HTTP_302_FOUND)
+        db.commit()
+        resp = RedirectResponse(url, status_code=status.HTTP_302_FOUND)
+        _set_state_cookie(resp, rec.state_id)
+        return resp
 
     if provider == "saml":
         url = _saml_sso_url(cfg)
@@ -161,12 +243,25 @@ def sso_login(
     raise HTTPException(status.HTTP_400_BAD_REQUEST, f"Unsupported SSO provider: {provider}")
 
 
-def _oidc_callback(db: Session, org: models.Organization, cfg: models.SsoConfig, code: str) -> schemas.RegisterOut:
-    """Shared OIDC callback logic: code -> tokens -> userinfo -> provision."""
+def _oidc_callback(
+    db: Session,
+    org: models.Organization,
+    cfg: models.SsoConfig,
+    code: str,
+    *,
+    nonce: str,
+) -> schemas.RegisterOut:
+    """Shared OIDC callback logic: code -> tokens -> nonce-check -> userinfo -> provision.
+
+    ``nonce`` is the value bound to the (already-consumed) state record; the
+    provider's id_token must echo it, or the exchange is rejected before any user
+    is provisioned or any token issued.
+    """
     if not code:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "Missing authorization code")
     try:
         tokens = sso.exchange_code(cfg, code)
+        sso.verify_id_token_nonce(tokens, nonce)  # id_token replay guard
         info = sso.fetch_userinfo(cfg, tokens)
     except sso.SsoError as exc:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc))
@@ -181,37 +276,51 @@ def _oidc_callback(db: Session, org: models.Organization, cfg: models.SsoConfig,
 
 @router.get("/auth/sso/{org_slug}/callback", response_model=schemas.RegisterOut)
 def sso_callback(
+    request: Request,
+    response: Response,
     org_slug: str = Path(...),
     code: str = Query(""),
     state: str = Query(""),
     db: Session = Depends(get_db),
 ):
-    """OIDC redirect handler (slug in the path): validate, provision, issue tokens."""
+    """OIDC redirect handler (slug in the path): validate state, provision, issue tokens.
+
+    The ``state`` must match the browser cookie AND be a live, unused record bound
+    to THIS org (``expected_org_id=org.id``) — so a state minted for another tenant
+    cannot authenticate here.
+    """
     org, cfg = _resolve_sso(db, org_slug)
     if (cfg.provider or "oidc").strip().lower() != "oidc":
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "Callback is only valid for OIDC")
-    return _oidc_callback(db, org, cfg, code)
+    rec = _verify_oidc_state(db, request, state, expected_org_id=org.id)
+    _clear_state_cookie(response)
+    return _oidc_callback(db, org, cfg, code, nonce=rec.nonce)
 
 
 @router.get("/auth/sso/callback", response_model=schemas.RegisterOut)
 def sso_callback_compat(
+    request: Request,
+    response: Response,
     code: str = Query(""),
     state: str = Query(""),
     db: Session = Depends(get_db),
 ):
-    """OIDC redirect handler matching :func:`app.sso.redirect_uri`.
+    """OIDC redirect handler matching :func:`app.sso.redirect_uri` (no slug in path).
 
-    The provider is configured with the fixed ``/auth/sso/callback`` redirect URI
-    (no slug), so the tenant is recovered from the ``org_slug:...`` prefix of the
-    ``state`` value produced by :func:`sso_login`.
+    The tenant is recovered from the single-use ``state`` *record* (its bound
+    ``org_id``), NEVER from the ``state`` string, so a forged/tampered state cannot
+    select an org. The state is browser-bound + consumed by
+    :func:`_verify_oidc_state` before the org is resolved.
     """
-    org_slug = (state or "").split(":", 1)[0]
-    if not org_slug:
-        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Missing or malformed state")
-    org, cfg = _resolve_sso(db, org_slug)
+    rec = _verify_oidc_state(db, request, state, expected_org_id=None)
+    org = crud.get_org(db, rec.org_id)
+    if not org:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Invalid SSO state")
+    _, cfg = _resolve_sso(db, org.slug)  # re-assert the SSO gate for the bound org
     if (cfg.provider or "oidc").strip().lower() != "oidc":
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "Callback is only valid for OIDC")
-    return _oidc_callback(db, org, cfg, code)
+    _clear_state_cookie(response)
+    return _oidc_callback(db, org, cfg, code, nonce=rec.nonce)
 
 
 @router.post("/auth/sso/{org_slug}/acs", response_model=schemas.RegisterOut)
@@ -263,8 +372,22 @@ def put_sso_config(
     membership: models.Membership = Depends(require_role("admin")),
     db: Session = Depends(get_db),
 ):
-    """Create or update the org's SSO configuration (admin+)."""
-    cfg = crud.upsert_sso_config(db, org_id, **payload.model_dump())
+    """Create or update the org's SSO configuration (admin+).
+
+    ``exclude_unset`` so a partial update (e.g. just ``{"enabled": true}``) never
+    clobbers unspecified fields with their schema defaults. A SAML config may not
+    be enabled without a signing certificate — an unsigned SAML assertion is
+    attacker-forgeable, so we refuse the config at write time (fail-closed).
+    """
+    cfg = crud.upsert_sso_config(db, org_id, **payload.model_dump(exclude_unset=True))
+    if (cfg.provider or "").strip().lower() == "saml" and cfg.enabled and not (
+        (cfg.x509_cert or "").strip()
+    ):
+        db.rollback()
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            "SAML SSO cannot be enabled without a signing certificate (x509_cert).",
+        )
     crud.audit(
         db, org_id, membership.user_id,
         "sso-config", f"provider={cfg.provider} enabled={cfg.enabled}",

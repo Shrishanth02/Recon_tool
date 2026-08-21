@@ -42,8 +42,14 @@ _RATE_LIMIT_EXEMPT: frozenset[str] = frozenset(
 _REQUEST_ID_HEADER = "X-Request-ID"
 
 # A conservative, self-only policy. The API serves JSON, not HTML, so a strict
-# default-src is safe and cannot break the SPA (which is served separately).
-_CSP = "default-src 'self'"
+# default-src is safe and cannot break the SPA (which is served separately). The
+# extra directives lock down framing (belt-and-braces with X-Frame-Options),
+# plugins, `<base>` hijacking, and cross-origin form posts — none of which a JSON
+# API ever needs.
+_CSP = (
+    "default-src 'self'; frame-ancestors 'none'; base-uri 'none'; "
+    "object-src 'none'; form-action 'none'"
+)
 
 
 def _route_label(request: Request) -> str:
@@ -59,7 +65,10 @@ def _route_label(request: Request) -> str:
     )
     if path_format:
         return str(path_format)
-    return request.url.path
+    # No route matched (404s, probes). Bucket to a constant instead of the raw
+    # path: the raw path is attacker-controlled, so emitting it would both leak it
+    # into /metrics and let a caller explode the label cardinality.
+    return "unmatched"
 
 
 class SecurityHeadersMiddleware(BaseHTTPMiddleware):
@@ -84,8 +93,14 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
         _setdefault("X-Frame-Options", "DENY")
         _setdefault("Referrer-Policy", "strict-origin-when-cross-origin")
         _setdefault("Content-Security-Policy", _CSP)
-        # HSTS only makes sense (and is only honored) over TLS.
-        if request.url.scheme == "https":
+        # HSTS only makes sense (and is only honored) over TLS. Behind a
+        # TLS-terminating proxy the ASGI scheme is plain http, so also honor a
+        # forwarded-proto of https. (Emitting HSTS on a genuine http response is
+        # harmless — browsers ignore the header unless it arrives over https.)
+        forwarded_proto = (
+            request.headers.get("x-forwarded-proto", "").split(",")[0].strip().lower()
+        )
+        if request.url.scheme == "https" or forwarded_proto == "https":
             _setdefault(
                 "Strict-Transport-Security",
                 "max-age=31536000; includeSubDomains",

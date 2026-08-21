@@ -190,9 +190,10 @@ def test_validation_success_promotes_signal_to_validated(monkeypatch):
         f = _header_finding(db, ws)
         db.commit()
         monkeypatch.setattr(validate.netguard, "validate_target", lambda h: (True, "ok"))
-        # Header still absent on re-fetch -> confirmed.
-        monkeypatch.setattr(validate.requests, "get",
-                            lambda *a, **k: FakeResp(200, {"server": "nginx"}, ""))
+        # Header still absent on re-fetch -> confirmed. The fetch now goes through
+        # the guarded path (safe_http), so mock that (returns the fake re-fetch).
+        monkeypatch.setattr(validate.safe_http, "safe_request",
+                            lambda method, url, **k: FakeResp(200, {"server": "nginx"}, ""))
         out = validate.validate_workspace(ws.id, scope_list=None)
         assert out["validated"] == 1
         db.expire_all()

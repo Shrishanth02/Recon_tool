@@ -22,6 +22,7 @@ The testable, network-free core is :func:`provision_sso_user` — the just-in-ti
 from __future__ import annotations
 
 import base64
+import json
 import secrets
 from typing import Any
 
@@ -34,6 +35,7 @@ __all__ = [
     "build_auth_url",
     "exchange_code",
     "fetch_userinfo",
+    "verify_id_token_nonce",
     "parse_saml_response",
     "provision_sso_user",
     "SsoError",
@@ -217,6 +219,44 @@ def fetch_userinfo(cfg: Any, tokens: dict[str, Any], *, timeout: float = 10.0) -
     return {"email": email, "name": name, "sub": sub}
 
 
+def _decode_jwt_claims(jwt_str: str) -> dict[str, Any]:
+    """Decode (WITHOUT signature verification) the claim set of a compact JWS."""
+    try:
+        payload_b64 = jwt_str.split(".")[1]
+        payload_b64 += "=" * (-len(payload_b64) % 4)  # restore stripped base64 padding
+        claims = json.loads(base64.urlsafe_b64decode(payload_b64.encode("ascii")))
+    except Exception as exc:
+        raise SsoError(f"OIDC id_token is malformed: {exc}") from exc
+    if not isinstance(claims, dict):
+        raise SsoError("OIDC id_token payload is not a JSON object")
+    return claims
+
+
+def verify_id_token_nonce(tokens: dict[str, Any], expected_nonce: str) -> None:
+    """Verify the OIDC ``nonce`` echoed in the provider's id_token (replay guard).
+
+    The id_token arrives in the token-endpoint response — a server-to-server HTTPS
+    call to the trusted issuer — so its payload is authentic without a separate
+    signature check here. (End-user identity is still taken from the TLS-
+    authenticated *userinfo* endpoint, exactly as before; this adds a check and
+    weakens nothing.) We require the id_token's ``nonce`` claim to equal the value
+    minted for *this* login transaction, so a captured/replayed id_token from a
+    different transaction is rejected.
+
+    * No id_token in the response -> nothing to verify here (the single-use
+      ``state`` record still binds the round-trip); returns quietly.
+    * id_token present but nonce missing or mismatched -> raises :class:`SsoError`.
+    """
+    if not expected_nonce:
+        raise SsoError("OIDC nonce verification requested without a stored nonce")
+    id_token = (tokens or {}).get("id_token")
+    if not id_token:
+        return  # provider supplied no id_token; the single-use state still binds the flow
+    got = _decode_jwt_claims(id_token).get("nonce")
+    if not got or not secrets.compare_digest(str(got), str(expected_nonce)):
+        raise SsoError("OIDC id_token nonce mismatch")
+
+
 # --------------------------------------------------------------------------- #
 # SAML (scaffold — production needs python3-saml/xmlsec)
 # --------------------------------------------------------------------------- #
@@ -271,7 +311,18 @@ def parse_saml_response(cfg: Any, saml_response_b64: str) -> dict[str, str]:
             "configured for this deployment before signed assertions are trusted"
         )
 
-    # --- Unsigned/test path: parse the XML with the stdlib. ---------------- #
+    # No certificate is configured. An unsigned assertion is attacker-forgeable,
+    # so it must NEVER be trusted in production — refuse. The unsigned parse below
+    # is reachable ONLY under DEBUG (local/test scaffolding).
+    from .config import settings  # noqa: PLC0415 (lazy import, mirrors this module)
+
+    if not settings.DEBUG:
+        raise SsoError(
+            "SAML requires a configured signing certificate (x509_cert) and "
+            "signature verification; refusing an unsigned assertion in production."
+        )
+
+    # --- DEBUG/TEST-ONLY unsigned path: parse the XML with the stdlib. ------ #
     try:
         root = ET.fromstring(raw)
     except Exception as exc:

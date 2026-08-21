@@ -20,7 +20,11 @@ has already passed :func:`check_destination`.
 
 from __future__ import annotations
 
+import ipaddress
 import logging
+import socket
+import threading
+from contextlib import contextmanager
 from typing import Callable, Optional
 from urllib.parse import urljoin, urlsplit
 
@@ -29,6 +33,93 @@ import requests
 from . import netguard
 
 logger = logging.getLogger("reconx.safe_http")
+
+# --------------------------------------------------------------------------- #
+# DNS-rebinding defense — pin the socket to the pre-vetted IP set.
+#
+# netguard resolves + vets a host, but requests/urllib3 open the connection by
+# re-resolving the hostname, so a low-TTL attacker record can answer a public IP
+# at validation time and a private/metadata IP at connect time (TOCTOU). We close
+# that by installing a pin-aware ``getaddrinfo`` shim: while a request is in
+# flight the calling thread pins ``host -> [vetted ips]``, so the connection's
+# re-resolution returns ONLY those vetted addresses. The URL keeps its hostname,
+# so the Host header and TLS SNI/cert validation are unchanged. When no pin is
+# active the shim delegates verbatim to the real resolver, so non-scanner traffic
+# (DB, Redis, SSO, …) is completely unaffected.
+# --------------------------------------------------------------------------- #
+_pin_state = threading.local()
+_orig_getaddrinfo = socket.getaddrinfo
+_MISSING = object()
+
+
+def _guarded_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):  # noqa: A002
+    pins = getattr(_pin_state, "pins", None)
+    key = host.lower() if isinstance(host, str) else host
+    if pins and key in pins:
+        entries = []
+        for ip in pins[key]:
+            try:
+                addr = ipaddress.ip_address(ip)
+            except ValueError:
+                continue
+            fam = socket.AF_INET6 if addr.version == 6 else socket.AF_INET
+            if family not in (0, socket.AF_UNSPEC) and family != fam:
+                continue
+            sockaddr = (ip, port) if fam == socket.AF_INET else (ip, port, 0, 0)
+            entries.append((fam, socket.SOCK_STREAM, socket.IPPROTO_TCP, "", sockaddr))
+        if entries:
+            return entries
+        # Host is pinned but nothing matches the requested family: fail closed
+        # rather than fall through to an unpinned (rebinding-capable) lookup.
+        raise socket.gaierror(
+            getattr(socket, "EAI_NONAME", -2),
+            f"pinned host {host!r} has no vetted address for family {family}",
+        )
+    return _orig_getaddrinfo(host, port, family, type, proto, flags)
+
+
+def _install_guarded_resolver() -> None:
+    """Install the pin-aware ``getaddrinfo`` shim exactly once (idempotent)."""
+    if getattr(socket, "_reconx_pin_installed", False):
+        return
+    socket.getaddrinfo = _guarded_getaddrinfo
+    socket._reconx_pin_installed = True  # type: ignore[attr-defined]
+
+
+_install_guarded_resolver()
+
+
+@contextmanager
+def _pinned(host: Optional[str], ips):
+    """Pin ``host`` to ``ips`` for the current thread while a request runs."""
+    if not host or not ips:
+        yield
+        return
+    key = host.lower()
+    pins = getattr(_pin_state, "pins", None)
+    if pins is None:
+        pins = _pin_state.pins = {}
+    prev = pins.get(key, _MISSING)
+    pins[key] = list(ips)
+    try:
+        yield
+    finally:
+        if prev is _MISSING:
+            pins.pop(key, None)
+        else:
+            pins[key] = prev
+
+
+#: Public alias: pin a host to an ALREADY-VETTED IP set for a raw socket call
+#: (e.g. a TLS handshake) that can't go through :func:`safe_request`. The caller
+#: MUST have validated the IPs via :func:`app.netguard.resolve_and_validate`
+#: first. Example::
+#:
+#:     ok, _why, vips = netguard.resolve_and_validate(host)
+#:     if ok:
+#:         with safe_http.pinned(host, vips):
+#:             sock = socket.create_connection((host, port))
+pinned = _pinned
 
 #: Default maximum number of redirect hops to follow.
 DEFAULT_MAX_REDIRECTS = 5
@@ -58,26 +149,38 @@ class BlockedDestination(requests.exceptions.RequestException):
         super().__init__(f"blocked destination {url!r}: {reason}")
 
 
-def check_destination(url: str, *, scope_check: Optional[ScopeCheck] = None) -> "tuple[bool, str]":
-    """The single gate: netguard (always) + an optional scope predicate.
+def _guard(url: str, scope_check: Optional[ScopeCheck]) -> "tuple[bool, str, str, list[str]]":
+    """netguard (resolve+vet, returning IPs) + optional scope. Never raises.
 
-    Delegates SSRF validation to :func:`app.netguard.validate_target` — it strips
-    scheme/path/port, checks literal IPs directly, and resolves hostnames to vet
-    every A/AAAA address (IPv4/IPv6, private/loopback/link-local/reserved/
-    metadata). ``scope_check`` (when supplied) additionally enforces engagement
-    scope. Returns ``(allowed, reason)``; never raises.
+    Returns ``(allowed, reason, host, ips)`` where ``ips`` is the vetted address
+    set to pin the connection to. On refusal ``host``/``ips`` are empty.
     """
-    allowed, reason = netguard.validate_target(url)
+    allowed, reason, ips = netguard.resolve_and_validate(url)
     if not allowed:
-        return False, reason
+        return False, reason, "", []
     if scope_check is not None:
         try:
             ok, sreason = scope_check(url)
         except Exception as exc:  # noqa: BLE001 - a scope hook must never crash the guard
-            return False, f"scope check error: {exc}"
+            return False, f"scope check error: {exc}", "", []
         if not ok:
-            return False, sreason
-    return True, "ok"
+            return False, sreason, "", []
+    host = urlsplit(url).hostname or netguard._bare_host(url)
+    return True, "ok", host, ips
+
+
+def check_destination(url: str, *, scope_check: Optional[ScopeCheck] = None) -> "tuple[bool, str]":
+    """The single gate: netguard (always) + an optional scope predicate.
+
+    Delegates SSRF validation to :func:`app.netguard.resolve_and_validate` — it
+    strips scheme/path/port, checks literal IPs directly, and resolves hostnames
+    to vet every A/AAAA address (IPv4/IPv6, private/loopback/link-local/reserved/
+    CGNAT/metadata incl. IPv4-mapped & NAT64 forms). ``scope_check`` (when
+    supplied) additionally enforces engagement scope. Returns ``(allowed,
+    reason)``; never raises.
+    """
+    ok, reason, _host, _ips = _guard(url, scope_check)
+    return ok, reason
 
 
 def safe_request(
@@ -104,13 +207,15 @@ def safe_request(
     follow = kwargs.pop("allow_redirects", True)
     requester = session.request if session is not None else requests.request
 
-    # 1. Validate the initial URL BEFORE issuing any request.
-    ok, reason = check_destination(url, scope_check=scope_check)
+    # 1. Validate the initial URL BEFORE issuing any request, and capture the
+    #    vetted IP set so the connection is PINNED to it (no rebinding).
+    ok, reason, host, ips = _guard(url, scope_check)
     if not ok:
         logger.warning("safe_http: initial destination blocked (%s): %s", reason, url)
         raise BlockedDestination(url, reason)
 
-    resp = requester(method, url, allow_redirects=False, **kwargs)
+    with _pinned(host, ips):
+        resp = requester(method, url, allow_redirects=False, **kwargs)
     if not follow:
         return resp
 
@@ -132,16 +237,17 @@ def safe_request(
             logger.warning("safe_http: redirect loop detected at %s", nxt)
             raise BlockedDestination(nxt, "redirect loop")
 
-        # 2. Validate the next hop BEFORE connecting to it. If blocked, we raise
-        #    here and NEVER issue the request to `nxt`.
-        ok, reason = check_destination(nxt, scope_check=scope_check)
+        # 2. Validate the next hop BEFORE connecting to it, pinning its vetted
+        #    IPs. If blocked, we raise here and NEVER issue the request to `nxt`.
+        ok, reason, host, ips = _guard(nxt, scope_check)
         if not ok:
             logger.warning("safe_http: redirect blocked (%s): %s -> %s", reason, resp.url, nxt)
             raise BlockedDestination(nxt, reason)
 
         seen.add(nxt)
         hops += 1
-        resp = requester(method, nxt, allow_redirects=False, **kwargs)
+        with _pinned(host, ips):
+            resp = requester(method, nxt, allow_redirects=False, **kwargs)
 
     return resp
 

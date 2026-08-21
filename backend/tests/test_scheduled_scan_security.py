@@ -12,7 +12,6 @@ Tested layers:
   * ``POST /schedules`` — fail-fast rejection at creation.
 """
 
-import socket
 import threading
 from datetime import datetime, timedelta, timezone
 

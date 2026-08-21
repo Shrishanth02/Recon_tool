@@ -83,13 +83,10 @@ def get_current_user(
     user = crud.get_user(db, int(payload.get("sub", 0)))
     if not user or not user.is_active:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "User not found or inactive")
-    # Phase 5 token revocation (opt-in / backward-compatible): a token only has a
-    # "ver" claim when it was minted with an explicit version. If present, it
-    # must match the user's current ``token_version``; a mismatch means the
-    # session was revoked. Tokens without "ver" (all pre-Phase-5 tokens, and the
-    # existing test suite's tokens) skip the check entirely.
-    ver = payload.get("ver")
-    if ver is not None and int(ver) != int(getattr(user, "token_version", 0) or 0):
+    # Session revocation (fail-CLOSED): a token's "ver" (missing => 0) must equal
+    # the user's current token_version. A "sign out everywhere" bumps
+    # token_version, so any earlier token — versioned OR ver-less — is rejected.
+    if security.is_token_revoked(payload.get("ver"), user.token_version):
         raise HTTPException(
             status.HTTP_401_UNAUTHORIZED,
             "session revoked",
@@ -128,6 +125,9 @@ def get_principal(
     user = crud.get_user(db, int(payload.get("sub", 0)))
     if not user or not user.is_active:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "User not found or inactive")
+    # Same fail-closed revocation check as get_current_user (this path was missing it).
+    if security.is_token_revoked(payload.get("ver"), user.token_version):
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "session revoked")
     return Principal(user=user, org_id=payload.get("org_id"))
 
 

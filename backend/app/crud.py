@@ -8,16 +8,33 @@ and ``save_scan`` logic is a faithful port of the original single-user
 """
 
 import hashlib
+import logging
 import re
 import secrets
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from . import attack, models, security, vulndb
+from .config import settings
 from .severity import is_known_severity, normalize_severity
+
+logger = logging.getLogger("reconx.crud")
+
+
+def _clamp(value: Any, limit: int) -> str:
+    """Truncate a value to a column width before persist.
+
+    Scanner-derived ``name``/``location`` can exceed the ``Finding`` column widths
+    (e.g. a very long nuclei/injection URL). SQLite silently accepts the overflow,
+    but Postgres raises ``DataError`` at flush and fails the whole ``save_scan`` —
+    losing a completed scan. Clamping at the write boundary keeps the finding.
+    """
+    s = "" if value is None else str(value)
+    return s if len(s) <= limit else s[:limit]
+
 
 # Severity ordering used when listing findings (critical first).
 _SEV_RANK = {"critical": 0, "high": 1, "medium": 2, "low": 3, "info": 4}
@@ -63,6 +80,178 @@ def authenticate(db: Session, email: str, password: str) -> models.User | None:
     if not security.verify_password(password, user.password_hash):
         return None
     return user
+
+
+# --------------------------------------------------------------------------- #
+# Refresh-token rotation + replay detection (STEP 2)
+# --------------------------------------------------------------------------- #
+def issue_refresh_token(
+    db: Session, user_id: int, *, family_id: str | None = None
+) -> models.RefreshToken:
+    """Create + persist a new refresh-token record (caller commits).
+
+    Starts a fresh rotation family unless ``family_id`` is given (rotation keeps
+    the lineage). The returned row's ``jti``/``family_id`` are embedded in the JWT.
+    """
+    now = _now()
+    rt = models.RefreshToken(
+        jti=secrets.token_urlsafe(32),
+        user_id=user_id,
+        family_id=family_id or secrets.token_urlsafe(16),
+        expires_at=now + timedelta(days=settings.REFRESH_TTL_DAYS),
+    )
+    db.add(rt)
+    db.flush()
+    return rt
+
+
+def revoke_refresh_family(db: Session, family_id: str) -> int:
+    """Revoke every token in a rotation family (this session lineage only)."""
+    return (
+        db.query(models.RefreshToken)
+        .filter(
+            models.RefreshToken.family_id == family_id,
+            models.RefreshToken.revoked.is_(False),
+        )
+        .update({"revoked": True}, synchronize_session=False)
+    )
+
+
+def revoke_user_refresh_tokens(db: Session, user_id: int) -> int:
+    """Revoke ALL of a user's refresh tokens (belt-and-suspenders for logout-all)."""
+    return (
+        db.query(models.RefreshToken)
+        .filter(
+            models.RefreshToken.user_id == user_id,
+            models.RefreshToken.revoked.is_(False),
+        )
+        .update({"revoked": True}, synchronize_session=False)
+    )
+
+
+def rotate_refresh_token(
+    db: Session, jti: str
+) -> tuple[str, "models.RefreshToken | None"]:
+    """Consume ``jti`` and mint its successor (caller commits).
+
+    Returns ``(status, successor)``:
+      * ``("ok", row)``       — rotated; embed ``row``'s jti/family in the new JWT.
+      * ``("reuse", None)``   — REPLAY of an already-consumed token; the family is
+                                revoked (contains a stolen token to its session).
+      * ``("invalid", None)`` — unknown / revoked / expired token.
+    """
+    rec = (
+        db.query(models.RefreshToken)
+        .filter(models.RefreshToken.jti == jti)
+        .one_or_none()
+    )
+    if rec is None or rec.revoked:
+        return "invalid", None
+    now = _now()
+    exp = rec.expires_at
+    if exp is not None and exp.tzinfo is None:  # SQLite reads back naive
+        exp = exp.replace(tzinfo=timezone.utc)
+    if exp is not None and exp < now:
+        return "invalid", None
+    if rec.consumed_at is not None:
+        # Replay of a rotated token -> revoke the whole family (session-scoped,
+        # never account-wide, so it cannot be abused for a lockout DoS).
+        revoke_refresh_family(db, rec.family_id)
+        return "reuse", None
+    # Atomically CLAIM the token: consume it ONLY if still unconsumed. Under a
+    # concurrent double-use exactly one UPDATE matches; the loser (0 rows) is
+    # treated as replay and the family is revoked — so a race can never mint two
+    # live successors from a single refresh token.
+    claimed = (
+        db.query(models.RefreshToken)
+        .filter(
+            models.RefreshToken.jti == jti,
+            models.RefreshToken.consumed_at.is_(None),
+            models.RefreshToken.revoked.is_(False),
+        )
+        .update({"consumed_at": now}, synchronize_session=False)
+    )
+    if not claimed:
+        revoke_refresh_family(db, rec.family_id)
+        return "reuse", None
+    successor = issue_refresh_token(db, rec.user_id, family_id=rec.family_id)
+    return "ok", successor
+
+
+# --------------------------------------------------------------------------- #
+# OIDC login-transaction state (CSRF + replay guard)
+# --------------------------------------------------------------------------- #
+def create_sso_state(
+    db: Session, org_id: int, *, ttl_seconds: int | None = None
+) -> models.SsoState:
+    """Create + persist a single-use OIDC login-transaction record (caller commits).
+
+    ``state_id`` (the OIDC ``state`` parameter, also set as a browser cookie) and
+    ``nonce`` (the OIDC ``nonce`` parameter, later matched against the id_token)
+    are unguessable random tokens. The row lives ``ttl_seconds`` and can be
+    consumed exactly once by the callback.
+    """
+    ttl = int(ttl_seconds if ttl_seconds is not None else settings.SSO_STATE_TTL_SECONDS)
+    rec = models.SsoState(
+        state_id=secrets.token_urlsafe(32),
+        org_id=org_id,
+        nonce=secrets.token_urlsafe(32),
+        expires_at=_now() + timedelta(seconds=ttl),
+    )
+    db.add(rec)
+    db.flush()
+    return rec
+
+
+def consume_sso_state(
+    db: Session, state_id: str, *, expected_org_id: int | None = None
+) -> tuple[str, "models.SsoState | None"]:
+    """Atomically claim an OIDC login-transaction row exactly once (caller commits).
+
+    Returns ``(status, record)``:
+      * ``("ok", row)``       — valid, unexpired, unused and (if requested) the
+                                right org; the row is now consumed. Read the bound
+                                org (``row.org_id``) + ``row.nonce`` from it.
+      * ``("invalid", None)`` — unknown / already-used (replay) / expired state,
+                                or a mismatch against ``expected_org_id`` (a state
+                                minted for a different org).
+
+    ``expected_org_id`` is the tenant the callback is authenticating into (from
+    the slug in the path); a state minted for another org is rejected. When
+    ``None`` (the fixed-redirect callback that carries no slug) the org is taken
+    from the record itself, so cross-tenant confusion is impossible either way.
+    """
+    if not state_id:
+        return "invalid", None
+    rec = (
+        db.query(models.SsoState)
+        .filter(models.SsoState.state_id == state_id)
+        .one_or_none()
+    )
+    if rec is None or rec.consumed:
+        return "invalid", None
+    exp = rec.expires_at
+    if exp is not None and exp.tzinfo is None:  # SQLite reads back naive
+        exp = exp.replace(tzinfo=timezone.utc)
+    if exp is not None and exp < _now():
+        return "invalid", None
+    if expected_org_id is not None and rec.org_id != expected_org_id:
+        # A state minted for org A must never authenticate into org B.
+        return "invalid", None
+    # Atomically CLAIM: mark consumed ONLY if still unconsumed. Under a concurrent
+    # double-callback exactly one UPDATE matches; the loser (0 rows) is treated as
+    # replay and rejected, so a single state can never authenticate two sessions.
+    claimed = (
+        db.query(models.SsoState)
+        .filter(
+            models.SsoState.state_id == state_id,
+            models.SsoState.consumed.is_(False),
+        )
+        .update({"consumed": True}, synchronize_session=False)
+    )
+    if not claimed:
+        return "invalid", None
+    return "ok", rec
 
 
 def list_user_orgs(db: Session, user: models.User) -> list[models.Organization]:
@@ -380,10 +569,22 @@ def save_scan(db: Session, record: dict) -> models.Scan:
             f["evidence"] = _ev
         f["severity"] = normalize_severity(_raw_sev)
 
+        # STEP 4: clamp the attacker-influenced fields to their column widths so an
+        # over-long scanner value can't raise a Postgres DataError at flush and
+        # lose the whole completed scan (see :func:`_clamp`).
+        f["name"] = _clamp(f.get("name"), 500)
+        f["location"] = _clamp(f.get("location"), 1000)
+
         # Purple-Team P1: tag the finding with its MITRE ATT&CK technique/tactic.
         # ``map_finding`` returns None when the tool has no sensible mapping, in
         # which case both columns stay NULL (the finding renders as "unmapped").
-        mapping = attack.map_finding(tool or "", f) or {}
+        # STEP 4: never let a mapper error abort the whole scan's findings —
+        # degrade this one finding to "unmapped" and keep going.
+        try:
+            mapping = attack.map_finding(tool or "", f) or {}
+        except Exception as exc:  # noqa: BLE001 - resilience: one finding must not DoS the scan
+            logger.warning("save_scan: ATT&CK mapping failed (tool=%s): %s", tool, exc)
+            mapping = {}
         key = _dedupe_key(tool or "", f["name"], f["location"], f.get("cwe"))
         existing = local.get(key) or db.scalar(
             select(models.Finding).where(
@@ -1372,6 +1573,44 @@ def finish_pentest_run(
     db.add(run)
     db.flush()
     return run
+
+
+def reconcile_stale_pentest_runs(db: Session, older_than_seconds: int) -> int:
+    """Mark orphaned ``running`` pentest runs terminal (startup reconciliation).
+
+    A :class:`~app.models.PentestRun` is committed ``running`` when the pipeline
+    starts and only finalized in a ``finally`` block. A HARD process death
+    (SIGKILL / OOM / container redeploy) skips that finally, stranding the row
+    ``running`` forever. This one-shot sweep marks such rows ``interrupted`` — but
+    ONLY those whose ``started_at`` is older than ``older_than_seconds`` (chosen
+    well beyond a run's max wall clock), so it can never touch a pipeline a sibling
+    process is legitimately still streaming. The write is idempotent, so multiple
+    workers running it concurrently at boot race harmlessly. Returns the count.
+    """
+    cutoff = _now() - timedelta(seconds=int(older_than_seconds))
+    reconciled = 0
+    for run in (
+        db.query(models.PentestRun)
+        .filter(models.PentestRun.status == "running")
+        .all()
+    ):
+        started = run.started_at
+        if started is None:
+            continue
+        if started.tzinfo is None:  # SQLite reads timestamps back naive
+            started = started.replace(tzinfo=timezone.utc)
+        if started < cutoff:
+            run.status = "interrupted"
+            run.finished_at = _now()
+            db.add(run)
+            reconciled += 1
+    if reconciled:
+        db.commit()
+        logger.info(
+            "startup: reconciled %d stale 'running' pentest run(s) -> interrupted",
+            reconciled,
+        )
+    return reconciled
 
 
 def list_pentest_runs(

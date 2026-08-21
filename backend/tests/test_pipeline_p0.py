@@ -626,3 +626,34 @@ def test_bizlogic_stage_emits_info_signals(stub_pipeline, monkeypatch):
     assert findings
     # Business-logic signals are informational and never validated automatically.
     assert all(f["kind"] == "info" and f["detection_tier"] == "signal" for f in findings)
+
+
+def test_drain_isolates_a_raising_scanner():
+    """STEP 4 resilience: a scanner that RAISES must not propagate out of _drain
+    and abort the whole pipeline — it becomes a stage error line, exactly like an
+    emitted {"type":"error"} event, so remaining stages still run."""
+    import threading
+
+    def _raising_gen():
+        yield {"type": "log", "data": "before-crash"}
+        raise RuntimeError("scanner blew up")
+
+    async def _go():
+        q: asyncio.Queue = asyncio.Queue()
+        loop = asyncio.get_running_loop()
+        cancel = threading.Event()
+        # Run like the real pipeline (in a worker thread). _drain must NOT raise.
+        result = await loop.run_in_executor(
+            None, pipeline._drain, _raising_gen(), cancel, 6, q, loop
+        )
+        await asyncio.sleep(0)  # let the scheduled call_soon_threadsafe puts run
+        events = []
+        while not q.empty():
+            events.append(q.get_nowait())
+        return result, events
+
+    result, events = asyncio.run(_go())
+    assert result is None  # no result produced, but crucially no exception propagated
+    datas = [e.get("data", "") for e in events]
+    assert any("before-crash" in d for d in datas)  # pre-crash output preserved
+    assert any("stage error" in d for d in datas)   # the crash surfaced as a stage line

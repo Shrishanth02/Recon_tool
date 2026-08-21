@@ -427,7 +427,14 @@ export default function PurpleHistory({ workspaceId }) {
                 title="Purple-Team Report"
                 className="report-frame"
                 srcDoc={reportHtml}
+                // STEP 4: sandbox the scan-derived report HTML. An empty sandbox
+                // gives the frame an opaque origin with NO script execution and NO
+                // access to parent window/localStorage, so report content can never
+                // reach the app's tokens even if an escaping gap were introduced.
+                // Inline CSS still renders (sandbox does not police styling).
+                sandbox=""
               />
+
             )}
           </div>
         </div>

@@ -16,10 +16,10 @@ carry no ``"ver"`` claim) are intentionally unaffected — see
 
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, HTTPException, Path, status
+from fastapi import APIRouter, Depends, HTTPException, Path, Response, status
 from sqlalchemy.orm import Session
 
-from .. import crud, models, schemas, security
+from .. import authcookies, crud, models, schemas, security
 from ..deps import get_current_user, get_db, require_role
 
 router = APIRouter(tags=["enterprise"])
@@ -107,25 +107,34 @@ def _primary_org(db: Session, user: models.User) -> models.Organization | None:
 
 @router.post("/auth/logout-all", response_model=schemas.TokenOut)
 def logout_all(
+    response: Response,
     user: models.User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
     """Revoke every versioned session for the caller and re-issue fresh tokens.
 
     Bumps ``token_version`` (invalidating any outstanding token that carries a
-    ``"ver"`` claim) and returns a new access/refresh pair stamped with the new
-    version so this device stays authenticated.
+    ``"ver"`` claim) and returns a new access token stamped with the new version
+    so this device stays authenticated. STEP 4: the fresh refresh token is
+    delivered ONLY in the re-set httpOnly cookie — never in the body — so an XSS
+    holding the Bearer access token cannot call this to harvest a durable refresh.
     """
     new_version = crud.bump_token_version(db, user)
+    # Also revoke every outstanding refresh-token family, then start a fresh one
+    # for THIS device (so the returned pair is rotatable and old ones are dead).
+    crud.revoke_user_refresh_tokens(db, user.id)
+    rt = crud.issue_refresh_token(db, user.id)
     org = _primary_org(db, user)
     org_id = org.id if org else None
     crud.audit(db, org_id, user.id, "logout-all", f"token_version -> {new_version}")
     db.commit()
+    new_refresh = security.create_refresh_token(
+        user.id, org_id=org_id, token_version=new_version,
+        jti=rt.jti, family=rt.family_id,
+    )
+    authcookies.set_refresh_cookie(response, new_refresh)
     return schemas.TokenOut(
         access_token=security.create_access_token(
-            user.id, org_id=org_id, token_version=new_version
-        ),
-        refresh_token=security.create_refresh_token(
             user.id, org_id=org_id, token_version=new_version
         ),
     )
