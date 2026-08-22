@@ -242,10 +242,11 @@ def _check_method_authz(url: str, identity_headers: dict) -> list[dict]:
     """Method-level authorization: does a state-changing method run without auth?
 
     Uses a deliberately-INVALID, labeled probe body so a well-behaved handler
-    rejects it before persisting anything (non-destructive). Compares the
-    authenticated vs anonymous status: if the anonymous state-changing request
-    reaches the same handler outcome (not 401/403/redirect), method-level
-    authorization is missing. DELETE is never sent — only reported if advertised.
+    rejects it before persisting anything (non-destructive). Only reports a finding
+    if the authenticated request succeeds (2xx) AND the anonymous request is denied
+    (401/403/redirect). If both return the same error status (e.g. 400/422 from
+    parse-before-authz, very common), that is inconclusive and reported as signal.
+    DELETE is never sent — only reported if advertised.
     """
     findings: list[dict] = []
     methods = _discover_methods(url, identity_headers)
@@ -263,17 +264,31 @@ def _check_method_authz(url: str, identity_headers: dict) -> list[dict]:
             continue  # method not usable even for the authorized user
         if sb in (401, 403) or 300 <= sb < 400:
             continue  # authentication enforced for the method (good)
-        if sb == sa:
+        if 200 <= sa < 300 and (sb in (401, 403) or 300 <= sb < 400):
             findings.append({
                 "severity": "high",
                 "name": f"Missing method-level authorization: {m} {urlsplit(url).path}",
                 "location": url, "cwe": ["CWE-285"], "cvss": 7.1,
                 "detection_tier": "validated", "confidence": 75,
                 "description": (
-                    f"An unauthenticated {m} request reached the same handler outcome "
-                    f"(HTTP {sb}) as the authenticated one — the {m} method does not enforce "
-                    f"authentication. Probe used a deliberately-invalid, labeled body so nothing "
-                    f"was created/modified."),
+                    f"An unauthenticated {m} request was denied (HTTP {sb}), but the "
+                    f"authenticated request succeeded (HTTP {sa}) — the {m} method does not "
+                    f"enforce authentication. Probe used a deliberately-invalid, labeled body "
+                    f"so nothing was created/modified."),
+                "evidence": {"url": url, "method": m, "status_authed": sa, "status_anon": sb,
+                             "probe": "invalid non-destructive body (X-RedOpsX-Test)"},
+            })
+        elif sa == sb and sa not in (401, 403):
+            findings.append({
+                "severity": "medium",
+                "name": f"Possible missing method-level authorization: {m} {urlsplit(url).path}",
+                "location": url, "cwe": ["CWE-285"],
+                "detection_tier": "signal", "confidence": 40,
+                "description": (
+                    f"Both authenticated and unauthenticated {m} requests returned HTTP {sa}, "
+                    f"which is inconclusive (both may have failed pre-authorization). "
+                    f"Verify manually: a 400/422 from parse-before-authz is common and does not "
+                    f"indicate missing method-level authorization."),
                 "evidence": {"url": url, "method": m, "status_authed": sa, "status_anon": sb,
                              "probe": "invalid non-destructive body (X-RedOpsX-Test)"},
             })

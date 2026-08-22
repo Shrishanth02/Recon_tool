@@ -145,9 +145,12 @@ def stream(target: str, cancel: Optional[threading.Event] = None, **options) -> 
             "evidence": {**base_ev, "token_static": True},
         })
 
-    # (3) VALIDATION: does an invalid-token request reach the handler (not rejected
-    #     for CSRF)? Non-destructive: invalid token + invalid body.
-    if cancel is None or not cancel.is_set():
+    # (3) VALIDATION: does an invalid-token request reach the handler when CSRF
+    #     protection is configured? Non-destructive: invalid token + invalid body.
+    #     Only test if we've confirmed there is CSRF protection (token field or
+    #     SameSite), and only report if the invalid-token request succeeds (2xx)
+    #     while a valid request would (assumed to succeed with auth).
+    if (cancel is None or not cancel.is_set()) and (token_field or samesite):
         body = f"{(token_field or 'csrf')}={_INVALID_TOKEN}&{_INVALID_BODY}"
         probe = _http(method, url, {**identity_headers, **_PROBE_HEADERS},
                       data=body, ctype="application/x-www-form-urlencoded")
@@ -161,22 +164,25 @@ def stream(target: str, cancel: Optional[threading.Event] = None, **options) -> 
             )
             if status == 405:
                 pass  # method not allowed — inconclusive
-            elif not csrf_rejected:
+            elif 200 <= status < 300 and not csrf_rejected:
                 findings.append({
                     "severity": "high",
                     "name": f"CSRF protection not enforced: {method} {urlsplit(url).path}",
                     "location": url, "cwe": ["CWE-352"], "cvss": 6.5,
                     "detection_tier": "validated", "confidence": 80,
                     "description": (
-                        f"A {method} request with a DELIBERATELY-INVALID CSRF token reached the "
-                        f"handler (HTTP {status}) instead of being rejected — CSRF is not enforced. "
-                        f"A benign/invalid body was used so nothing was created or modified."),
+                        f"A {method} request with a DELIBERATELY-INVALID CSRF token succeeded "
+                        f"(HTTP {status}), but CSRF protection is configured. The configured CSRF "
+                        f"token/SameSite is not being validated. A benign/invalid body was used "
+                        f"so nothing was created or modified."),
                     "evidence": {**base_ev, "probe_status": status,
                                  "probe": "invalid CSRF token + invalid body (X-RedOpsX-Test)",
                                  "validation_result": "not_enforced"},
                 })
                 yield log(f"  🚨 CSRF not enforced ({method} -> HTTP {status})")
-            else:
+            elif csrf_rejected:
                 yield log(f"  CSRF appears enforced ({method} -> HTTP {status})")
+            else:
+                yield log(f"  Invalid-token request returned HTTP {status} (inconclusive)")
 
     yield result({"target": url, "method": method, "findings": findings})

@@ -2115,8 +2115,18 @@ def _aslist(v) -> list:
 
 
 def _norm_location(loc: str) -> str:
-    """Normalize a finding location for stable dedup (lowercase, strip trailing /)."""
+    """Normalize a finding location for stable dedup.
+
+    Strips query string entirely (volatile tokens, timestamps, cache-busters, session
+    ids prevent stable deduplication across scans). Lowercases, strips trailing /.
+    """
+    from urllib.parse import urlsplit, urlunsplit
     s = (loc or "").strip().lower()
+    try:
+        parts = urlsplit(s)
+        s = urlunsplit((parts.scheme, parts.netloc, parts.path, "", parts.fragment))
+    except Exception:
+        pass
     if len(s) > 1 and s.endswith("/"):
         s = s.rstrip("/")
     return s
