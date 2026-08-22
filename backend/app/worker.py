@@ -370,7 +370,7 @@ async def check_schedules(ctx: dict) -> dict[str, Any]:
     if not settings.SCHEDULER_ENABLED:
         return {"enqueued": 0, "due": 0, "purple": 0, "reason": "scheduler disabled"}
 
-    from . import crud, execution  # local imports keep module import-safe
+    from . import crud, execution, secretbox  # local imports keep module import-safe
     from . import queue as queue_mod
 
     db = SessionLocal()
@@ -401,16 +401,34 @@ async def check_schedules(ctx: dict) -> dict[str, Any]:
                         )
                     rejected += 1
                 else:
-                    job = execution.Job(
-                        tool=sched.tool,
-                        target=sched.target,
-                        options=sched.options or {},
-                        workspace_id=sched.workspace_id,
-                        created_by=sched.created_by,
-                    )
-                    job_id = await queue_mod.enqueue_scan(execution._job_to_dict(job))
-                    if job_id:
-                        enqueued += 1
+                    # Decrypt credential-bearing option values in memory ONLY here,
+                    # immediately before building the scan job — the DB row keeps
+                    # them encrypted at rest. A wrong/rotated key (InvalidToken)
+                    # fails closed: reject + audit the leg and never run it with
+                    # garbage credentials. The schedule is still advanced below so a
+                    # bad key can't wedge the poller or re-fire every tick.
+                    try:
+                        _opts = secretbox.decrypt_options(sched.options or {})
+                    except secretbox.InvalidToken:
+                        if ws is not None:
+                            crud.audit(
+                                db, ws.org_id, sched.created_by, "schedule-rejected",
+                                f"{sched.tool} {sched.target}: credential decryption "
+                                "failed (encryption key changed?) — re-enter credentials",
+                            )
+                        rejected += 1
+                        _opts = None
+                    if _opts is not None:
+                        job = execution.Job(
+                            tool=sched.tool,
+                            target=sched.target,
+                            options=_opts,
+                            workspace_id=sched.workspace_id,
+                            created_by=sched.created_by,
+                        )
+                        job_id = await queue_mod.enqueue_scan(execution._job_to_dict(job))
+                        if job_id:
+                            enqueued += 1
             # Advance the schedule even if the leg failed, so a persistently
             # unreachable broker (or a bad purple run) can't wedge the poller.
             sched.last_run_at = datetime.now(timezone.utc)

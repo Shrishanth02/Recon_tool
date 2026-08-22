@@ -11,6 +11,7 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator
 
+from . import secretbox
 from .branding import is_hex_color, is_safe_logo_url
 from .severity import normalize_severity
 
@@ -350,6 +351,14 @@ class ScheduleOut(ORMModel):
     last_run_at: datetime | None = None
     next_run_at: datetime | None = None
     created_by: int | None = None
+
+    @field_validator("options", mode="before")
+    @classmethod
+    def _mask_secret_options(cls, v):
+        # Never expose stored credential material — schedule options hold it
+        # ENCRYPTED at rest; masking here shows presence ("***") without leaking
+        # ciphertext (or any legacy plaintext) through the API.
+        return secretbox.mask_options(v)
     created_at: datetime
 
 

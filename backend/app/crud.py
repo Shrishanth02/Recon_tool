@@ -17,7 +17,7 @@ from typing import Any
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from . import attack, models, security, vulndb
+from . import attack, models, secretbox, security, vulndb
 from .config import settings
 from .severity import is_known_severity, normalize_severity
 
@@ -518,32 +518,17 @@ def mark_asset_verified(db: Session, asset: models.Asset) -> models.Asset:
 # --------------------------------------------------------------------------- #
 # Scans + findings
 # --------------------------------------------------------------------------- #
-# Scan.options keys that carry live authentication material. Their VALUE is masked
-# to a sentinel before a scan is persisted, so an authenticated scan (e.g. the
-# Authenticated Crawl driven with a session cookie / bearer header / JWT) NEVER
-# writes the operator's secret into the DB. The key's PRESENCE is kept so scan
-# history still records that auth was supplied. Unlike the connector pattern
-# (store raw, mask on read), this masks at WRITE time — the stored value is already
-# safe, so the secret cannot leak via the ScanOut API, reports, or a raw DB read.
-_SECRET_SCAN_OPTION_KEYS = frozenset({"cookie", "auth_header", "password", "token"})
-_SCAN_SECRET_MASK = "***"
-
-
 def redact_scan_options(options):
     """Return a copy of a scan's ``options`` with secret auth VALUES masked.
 
-    Non-dict input passes through as ``{}``; non-secret keys and empty secret
-    values are left untouched (only a real secret value is replaced), so ordinary
-    tool options (scan_type, severity, selectors, login_url, …) are preserved.
+    A completed scan never needs its credential back, so — unlike the connector
+    pattern (store raw, mask on read) — the secret is masked at WRITE time: the
+    stored value is already safe, so it cannot leak via the ScanOut API, reports,
+    or a raw DB read. Non-secret options (scan_type, selectors, login_url, …) are
+    preserved. Shares :data:`app.secretbox.SECRET_OPTION_KEYS` with the schedule
+    at-rest encryption so the two paths can never disagree on what is secret.
     """
-    if not isinstance(options, dict):
-        return {}
-    return {
-        k: (_SCAN_SECRET_MASK
-            if k in _SECRET_SCAN_OPTION_KEYS and v not in (None, "", [], {})
-            else v)
-        for k, v in options.items()
-    }
+    return secretbox.mask_options(options)
 
 
 def save_scan(db: Session, record: dict) -> models.Scan:
@@ -994,7 +979,10 @@ def create_schedule(
         tool=tool,
         target=target,
         cron=cron,
-        options=options or {},
+        # Encrypt credential-bearing option values at rest; a scheduled scan must
+        # retain its session secret to re-run, so it is stored as ciphertext (not
+        # masked) and decrypted in-memory only when the worker builds the job.
+        options=secretbox.encrypt_options(options or {}),
         config=config or {},
         enabled=enabled,
         created_by=created_by,
