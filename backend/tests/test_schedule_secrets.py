@@ -75,6 +75,23 @@ def test_mask_hides_ciphertext_and_plaintext():
     assert secretbox.mask_options({"token": "raw"}) == {"token": "***"}
 
 
+def test_scalar_encrypt_decrypt_value_round_trip():
+    enc = secretbox.encrypt_value("JBSWY3DPEHPK3PXP")
+    assert enc.startswith("enc:v1:") and "JBSWY3DPEHPK3PXP" not in enc
+    assert secretbox.decrypt_value(enc) == "JBSWY3DPEHPK3PXP"
+    # idempotent + legacy/empty/non-str passthrough
+    assert secretbox.encrypt_value(enc) == enc
+    assert secretbox.decrypt_value("bare-plaintext") == "bare-plaintext"
+    assert secretbox.encrypt_value("") == "" and secretbox.decrypt_value("") == ""
+    assert secretbox.encrypt_value(None) is None
+
+
+def test_scalar_decrypt_value_tampered_raises():
+    enc = secretbox.encrypt_value("SECRET")
+    with pytest.raises(InvalidToken):
+        secretbox.decrypt_value(enc[:-2] + ("AA" if enc[-2:] != "AA" else "BB"))
+
+
 def test_non_secret_options_never_transformed():
     plain = {"scan_type": "quick", "login_url": "https://x/login", "user_sel": "#u",
              "severity": "high", "username": "alice"}

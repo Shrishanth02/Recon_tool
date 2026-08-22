@@ -14,8 +14,21 @@ import jwt
 from fastapi import APIRouter, Body, Depends, HTTPException, Request, Response, status
 from sqlalchemy.orm import Session
 
-from .. import authcookies, crud, models, schemas, security
+from .. import authcookies, crud, models, schemas, secretbox, security
 from ..deps import get_current_user, get_db
+
+
+def _decrypt_mfa_secret(user: models.User) -> str | None:
+    """Decrypt a user's at-rest MFA secret for in-memory verification only.
+
+    Returns the plaintext TOTP secret, or ``None`` (FAIL CLOSED) when the stored
+    ciphertext is tampered / undecryptable (e.g. the encryption key changed) so a
+    bad record can never satisfy MFA. Legacy bare-plaintext secrets pass through.
+    """
+    try:
+        return secretbox.decrypt_value(user.mfa_secret or "") or None
+    except secretbox.InvalidToken:
+        return None
 
 router = APIRouter(tags=["auth"])
 
@@ -87,9 +100,9 @@ def login(payload: schemas.LoginIn, response: Response, db: Session = Depends(ge
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Invalid credentials")
 
     if user.mfa_enabled:
-        if not payload.mfa_code or not security.totp_verify(
-            user.mfa_secret or "", payload.mfa_code
-        ):
+        _mfa_secret = _decrypt_mfa_secret(user)   # decrypted in memory only, here
+        if (not payload.mfa_code or not _mfa_secret
+                or not security.totp_verify(_mfa_secret, payload.mfa_code)):
             raise HTTPException(
                 status.HTTP_401_UNAUTHORIZED, "Valid MFA code required"
             )
@@ -251,7 +264,9 @@ def mfa_enroll(
     ``/auth/mfa/verify``. Re-enrolling before verifying simply rolls the secret.
     """
     secret = security.totp_new_secret()
-    user.mfa_secret = secret
+    # Store the secret ENCRYPTED at rest; the plaintext is returned to the user
+    # ONCE below so they can add it to their authenticator, but never persisted.
+    user.mfa_secret = secretbox.encrypt_value(secret)
     user.mfa_enabled = False
     db.add(user)
     crud.audit(db, None, user.id, "mfa-enroll", user.email)
@@ -271,7 +286,8 @@ def mfa_verify(
     """Confirm the enrolled TOTP secret and switch MFA on for the account."""
     if not user.mfa_secret:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "No MFA enrollment pending")
-    if not security.totp_verify(user.mfa_secret, payload.code):
+    _mfa_secret = _decrypt_mfa_secret(user)   # decrypted in memory only, here
+    if not _mfa_secret or not security.totp_verify(_mfa_secret, payload.code):
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "Invalid MFA code")
     user.mfa_enabled = True
     db.add(user)

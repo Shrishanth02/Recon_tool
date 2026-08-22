@@ -90,7 +90,10 @@ class User(Base):
     password_hash: Mapped[str] = mapped_column(String(255), nullable=False)
     full_name: Mapped[str] = mapped_column(String(200), nullable=False, default="")
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
-    mfa_secret: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    # Holds the TOTP secret ENCRYPTED at rest (app.secretbox, "enc:v1:" + Fernet
+    # token) — widened from 64 to fit ciphertext. Legacy rows may still hold a
+    # bare base32 plaintext secret; secretbox.decrypt_value passes those through.
+    mfa_secret: Mapped[str | None] = mapped_column(String(255), nullable=True)
     mfa_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     # --- Phase 5: token revocation counter ---------------------------------- #
     # Incremented to invalidate all previously issued tokens that carry a "ver"

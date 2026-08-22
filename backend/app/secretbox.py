@@ -53,37 +53,40 @@ def is_encrypted(value) -> bool:
     return isinstance(value, str) and value.startswith(_ENC_PREFIX)
 
 
+def encrypt_value(plaintext):
+    """Encrypt a single secret STRING for at-rest storage (tagged ``enc:v1:``).
+    Idempotent: empty strings, non-strings and already-encrypted values pass
+    through unchanged."""
+    if not isinstance(plaintext, str) or plaintext == "" or is_encrypted(plaintext):
+        return plaintext
+    return _ENC_PREFIX + _fernet().encrypt(plaintext.encode()).decode()
+
+
+def decrypt_value(stored):
+    """Decrypt a single at-rest secret string for in-memory USE. A value without
+    the ``enc:v1:`` prefix is treated as LEGACY PLAINTEXT and returned unchanged
+    (empties/non-strings too); ``enc:v1:`` ciphertext is decrypted and raises
+    :class:`cryptography.fernet.InvalidToken` on tamper / wrong key."""
+    if not isinstance(stored, str) or not is_encrypted(stored):
+        return stored
+    return _fernet().decrypt(stored[len(_ENC_PREFIX):].encode()).decode()
+
+
 def encrypt_options(options) -> dict:
     """Return a copy of ``options`` with credential VALUES encrypted for at-rest
-    storage. Idempotent (an already-``enc:v1:`` value is left as-is); non-secret
-    keys and empty values pass through. Non-dict input yields ``{}``."""
+    storage (idempotent; non-secret keys pass through). Non-dict input -> ``{}``."""
     if not isinstance(options, dict):
         return {}
-    f = _fernet()
-    out = {}
-    for k, v in options.items():
-        if _is_secret(k, v) and not is_encrypted(v):
-            out[k] = _ENC_PREFIX + f.encrypt(v.encode()).decode()
-        else:
-            out[k] = v
-    return out
+    return {k: (encrypt_value(v) if k in SECRET_OPTION_KEYS else v) for k, v in options.items()}
 
 
 def decrypt_options(options) -> dict:
     """Return a copy of ``options`` with credential VALUES decrypted for USE at
     execution. Raises :class:`cryptography.fernet.InvalidToken` on tampered or
-    wrong-key ciphertext. A value without the ``enc:v1:`` prefix is treated as
-    legacy plaintext and passed through unchanged. Non-dict input yields ``{}``."""
+    wrong-key ciphertext; legacy plaintext passes through. Non-dict input -> ``{}``."""
     if not isinstance(options, dict):
         return {}
-    f = _fernet()
-    out = {}
-    for k, v in options.items():
-        if k in SECRET_OPTION_KEYS and is_encrypted(v):
-            out[k] = f.decrypt(v[len(_ENC_PREFIX):].encode()).decode()
-        else:
-            out[k] = v
-    return out
+    return {k: (decrypt_value(v) if k in SECRET_OPTION_KEYS else v) for k, v in options.items()}
 
 
 def mask_options(options) -> dict:
