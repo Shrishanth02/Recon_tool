@@ -264,19 +264,33 @@ def _check_method_authz(url: str, identity_headers: dict) -> list[dict]:
         if sb in (401, 403) or 300 <= sb < 400:
             continue  # authentication enforced for the method (good)
         if sb == sa:
-            findings.append({
-                "severity": "high",
-                "name": f"Missing method-level authorization: {m} {urlsplit(url).path}",
-                "location": url, "cwe": ["CWE-285"], "cvss": 7.1,
-                "detection_tier": "validated", "confidence": 75,
-                "description": (
-                    f"An unauthenticated {m} request reached the same handler outcome "
-                    f"(HTTP {sb}) as the authenticated one — the {m} method does not enforce "
-                    f"authentication. Probe used a deliberately-invalid, labeled body so nothing "
-                    f"was created/modified."),
-                "evidence": {"url": url, "method": m, "status_authed": sa, "status_anon": sb,
-                             "probe": "invalid non-destructive body (X-RedOpsX-Test)"},
-            })
+            if 200 <= sa < 300:
+                findings.append({
+                    "severity": "high",
+                    "name": f"Missing method-level authorization: {m} {urlsplit(url).path}",
+                    "location": url, "cwe": ["CWE-285"], "cvss": 7.1,
+                    "detection_tier": "validated", "confidence": 75,
+                    "description": (
+                        f"An unauthenticated {m} request reached the same handler outcome "
+                        f"(HTTP {sb}) as the authenticated one — the {m} method does not enforce "
+                        f"authentication. Probe used a deliberately-invalid, labeled body so nothing "
+                        f"was created/modified."),
+                    "evidence": {"url": url, "method": m, "status_authed": sa, "status_anon": sb,
+                                 "probe": "invalid non-destructive body (X-RedOpsX-Test)"},
+                })
+            else:
+                findings.append({
+                    "severity": "medium",
+                    "name": f"Possible missing method-level authorization: {m} {urlsplit(url).path}",
+                    "location": url, "cwe": ["CWE-285"],
+                    "detection_tier": "signal", "confidence": 40,
+                    "description": (
+                        f"Both authed and anon {m} requests returned HTTP {sa}, which is inconclusive. "
+                        f"Both may have failed pre-authorization (e.g., input validation before auth check). "
+                        f"Manual verification needed."),
+                    "evidence": {"url": url, "method": m, "status_authed": sa, "status_anon": sb,
+                                 "probe": "invalid non-destructive body (X-RedOpsX-Test)"},
+                })
     if methods and "DELETE" in methods:
         findings.append({
             "severity": "info",
