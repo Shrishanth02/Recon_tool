@@ -183,6 +183,56 @@ def _nuclei_record(ws_id, matched="https://x/a"):
     }
 
 
+def test_redact_scan_options_masks_only_secret_values():
+    r = crud.redact_scan_options({
+        "cookie": "session=abc", "auth_header": "Bearer t", "password": "p",
+        "token": "eyJ.a.b", "username": "alice", "login_url": "https://x/login",
+        "user_sel": "#u", "scan_type": "quick",
+    })
+    assert r["cookie"] == "***" and r["auth_header"] == "***"
+    assert r["password"] == "***" and r["token"] == "***"
+    # non-secret context is preserved (presence + useful, shareable config)
+    assert r["username"] == "alice" and r["login_url"] == "https://x/login"
+    assert r["user_sel"] == "#u" and r["scan_type"] == "quick"
+    # edge cases: non-dict -> {}, empty secret left as-is (nothing to leak)
+    assert crud.redact_scan_options(None) == {}
+    assert crud.redact_scan_options("x") == {}
+    assert crud.redact_scan_options({"cookie": ""}) == {"cookie": ""}
+
+
+def test_save_scan_never_persists_authenticated_scan_secrets():
+    """The Authenticated Crawl's session secrets must never reach Scan.options in
+    the DB (and thus never the ScanOut API / reports). Presence is kept, value
+    masked."""
+    import json
+    db = SessionLocal()
+    try:
+        ws = _ws(db)
+        rec = {
+            "tool": "auth_crawl", "target": "https://app.example.com", "status": "done",
+            "options": {
+                "cookie": "session=SECRETVALUE123", "auth_header": "Bearer TOPSECRETjwt",
+                "password": "hunter2", "token": "eyJ.SECRET.sig", "username": "alice",
+                "login_url": "https://app.example.com/login", "user_sel": "#u",
+            },
+            "logs": [], "result": {}, "started_at": None, "finished_at": None,
+            "workspace_id": ws.id,
+        }
+        scan = crud.save_scan(db, rec)
+        db.commit()
+        db.refresh(scan)
+        o = scan.options
+        assert o["cookie"] == "***" and o["auth_header"] == "***"
+        assert o["password"] == "***" and o["token"] == "***"
+        assert o["username"] == "alice" and o["login_url"].endswith("/login")
+        assert o["user_sel"] == "#u"
+        blob = json.dumps({"options": o, "logs": scan.logs})
+        for secret in ("SECRETVALUE123", "TOPSECRETjwt", "hunter2", "eyJ.SECRET.sig"):
+            assert secret not in blob
+    finally:
+        db.close()
+
+
 def test_save_scan_persists_new_fields():
     db = SessionLocal()
     try:

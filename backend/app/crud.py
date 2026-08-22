@@ -518,11 +518,41 @@ def mark_asset_verified(db: Session, asset: models.Asset) -> models.Asset:
 # --------------------------------------------------------------------------- #
 # Scans + findings
 # --------------------------------------------------------------------------- #
+# Scan.options keys that carry live authentication material. Their VALUE is masked
+# to a sentinel before a scan is persisted, so an authenticated scan (e.g. the
+# Authenticated Crawl driven with a session cookie / bearer header / JWT) NEVER
+# writes the operator's secret into the DB. The key's PRESENCE is kept so scan
+# history still records that auth was supplied. Unlike the connector pattern
+# (store raw, mask on read), this masks at WRITE time — the stored value is already
+# safe, so the secret cannot leak via the ScanOut API, reports, or a raw DB read.
+_SECRET_SCAN_OPTION_KEYS = frozenset({"cookie", "auth_header", "password", "token"})
+_SCAN_SECRET_MASK = "***"
+
+
+def redact_scan_options(options):
+    """Return a copy of a scan's ``options`` with secret auth VALUES masked.
+
+    Non-dict input passes through as ``{}``; non-secret keys and empty secret
+    values are left untouched (only a real secret value is replaced), so ordinary
+    tool options (scan_type, severity, selectors, login_url, …) are preserved.
+    """
+    if not isinstance(options, dict):
+        return {}
+    return {
+        k: (_SCAN_SECRET_MASK
+            if k in _SECRET_SCAN_OPTION_KEYS and v not in (None, "", [], {})
+            else v)
+        for k, v in options.items()
+    }
+
+
 def save_scan(db: Session, record: dict) -> models.Scan:
     """Persist a completed scan and derive its findings.
 
     ``record`` keys mirror the original ``db.save_scan`` contract plus
-    ``workspace_id`` and optional ``created_by``. The caller commits.
+    ``workspace_id`` and optional ``created_by``. The caller commits. Secret auth
+    values in ``options`` are masked at this single write boundary
+    (:func:`redact_scan_options`) so credentials never reach the DB.
     """
     started_dt = _coerce_dt(record.get("started_at"))
     finished_dt = _coerce_dt(record.get("finished_at"))
@@ -541,7 +571,7 @@ def save_scan(db: Session, record: dict) -> models.Scan:
         tool=record.get("tool"),
         target=record.get("target"),
         status=record.get("status"),
-        options=record.get("options") or {},
+        options=redact_scan_options(record.get("options")),
         logs=record.get("logs") or [],
         result=record.get("result"),
         error=record.get("error"),

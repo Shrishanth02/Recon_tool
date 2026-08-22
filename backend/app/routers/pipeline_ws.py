@@ -39,16 +39,24 @@ router = APIRouter()
 def _extract_auth(raw) -> dict | None:
     """Sanitize the operator-supplied authenticated-session config.
 
-    Keeps only the known session fields (cookie / auth_header / username /
-    password / login_url), drops empties, and returns ``None`` when nothing
-    usable was supplied. The result is passed to the pipeline TRANSIENTLY and is
-    never persisted. Credentials are used solely to drive the operator's own
-    authenticated crawl — never stored, logged, or echoed.
+    Keeps only known session fields and drops empties, returning ``None`` when
+    nothing usable was supplied. The result is passed to the pipeline TRANSIENTLY
+    and is never persisted. Credentials are used solely to drive the operator's
+    own authenticated scanning — never stored, logged, or echoed.
+
+    The kept keys are exactly the option names the downstream scanners READ:
+      * ``auth_crawl`` reads ``cookie``/``auth_header``/``username``/``password``/
+        ``login_url`` and the login-form selectors ``user_sel``/``pass_sel``/
+        ``submit_sel`` (NOT ``*_selector`` — a prior mismatch dropped custom
+        selectors so the crawler always fell back to its defaults);
+      * ``jwt_audit`` reads ``token`` (a standalone JWT the operator wants
+        statically analysed) — previously stripped here, so the JWT/API stage
+        never received an operator-supplied token.
     """
     if not isinstance(raw, dict):
         return None
-    allowed = ("cookie", "auth_header", "username", "password", "login_url",
-               "login_selector", "user_selector", "pass_selector", "submit_selector")
+    allowed = ("cookie", "auth_header", "username", "password", "token", "login_url",
+               "user_sel", "pass_sel", "submit_sel")
     out = {}
     for k in allowed:
         v = raw.get(k)
