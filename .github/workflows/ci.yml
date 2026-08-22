@@ -113,7 +113,7 @@ jobs:
           DATABASE_URL: ${{ env.MIG_DB_URL }}
         run: |
           alembic current 2>&1 | tee current.txt
-          grep -q "0016_mfa_secret_encrypted (head)" current.txt
+          grep -q "0017_oast_collaborator (head)" current.txt
       # (4) The app must BOOT and operate against the migrated schema with
       # create_all DISABLED — Alembic is the sole schema authority. Registration
       # writes across organizations/users/workspaces/memberships.

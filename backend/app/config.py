@@ -223,6 +223,17 @@ class Settings(BaseSettings):
     JSON_LOGS: bool = Field(
         default=False, alias="RECONX_JSON_LOGS"
     )  # structured (JSON) access logs
+    # --- OAST / out-of-band collaborator ------------------------------------ #
+    # Self-hosted out-of-band callback listener for confirming BLIND server-side
+    # vulns (blind SSRF, etc.). OFF by default (secure-by-default): with no public
+    # base URL configured, scanners plant no OOB probes and behaviour is unchanged.
+    # OAST_BASE_URL is the PUBLIC origin the target can reach, e.g.
+    # "https://oob.example.com" — its "/oast/<token>" path is this app's callback.
+    OAST_ENABLED: bool = Field(default=False, alias="RECONX_OAST_ENABLED")
+    OAST_BASE_URL: str = Field(default="", alias="RECONX_OAST_BASE_URL")
+    OAST_PROBE_TTL_MIN: int = Field(
+        default=60, alias="RECONX_OAST_PROBE_TTL_MIN"
+    )  # how long a minted probe stays live/correlatable before cleanup
     SSO_ENABLED: bool = Field(
         default=False, alias="RECONX_SSO_ENABLED"
     )  # master switch for /auth/sso/*
@@ -250,6 +261,12 @@ class Settings(BaseSettings):
     def ai_enabled(self) -> bool:
         """True iff an Anthropic API key is configured (AI triage available)."""
         return bool(self.ANTHROPIC_API_KEY.strip())
+
+    @property
+    def oast_configured(self) -> bool:
+        """True iff the out-of-band collaborator is enabled AND has a public base
+        URL — the precondition for planting OOB probes and correlating callbacks."""
+        return bool(self.OAST_ENABLED and self.OAST_BASE_URL.strip())
 
     # --- Phase 5 convenience accessors (lowercase mirrors of the flags) ---- #
     @property

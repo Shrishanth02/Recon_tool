@@ -94,12 +94,19 @@ def stream(target: str, cancel: Optional[threading.Event] = None, **options) -> 
     if not params_list:
         yield log("No query parameters — nothing to test for SSRF.")
         yield result({"target": url, "tested_params": [], "findings": [],
-                      "oast_available": oast.available()})
+                      "oast_available": oast.available(), "oast_injected": []})
         return
 
     candidates = [
         (i, n, v) for i, (n, v) in enumerate(params_list) if _is_candidate(n, v)
     ][:_MAX_PARAMS]
+
+    # Out-of-band probes (token + callback URL) pre-minted by the caller when an
+    # OAST collaborator is configured. One is planted per candidate to confirm
+    # BLIND SSRF: pointing the param at the callback makes a vulnerable server
+    # fetch it; the pipeline later correlates the token to a recorded interaction.
+    oast_probes = [p for p in (options.get("oast_probes") or []) if isinstance(p, dict)]
+    oast_injected: list[dict] = []
 
     # In-scope canary = the target's OWN root; fetching it proves a server-side
     # request without ever touching an internal/external host.
@@ -153,5 +160,17 @@ def stream(target: str, cancel: Optional[threading.Event] = None, **options) -> 
                 "evidence": {**ev, "note": note},
             })
 
+        # Plant an out-of-band probe for this parameter (bounded pool). A blind
+        # SSRF sink will fetch the callback; correlation happens later, so the
+        # finding stays as-is here and carries the token for the pipeline to
+        # upgrade to a CONFIRMED blind-SSRF finding if a callback arrives.
+        if oast_probes:
+            probe = oast_probes.pop(0)
+            tok, ourl = probe.get("token"), probe.get("url")
+            if tok and ourl:
+                _http_get(_set_param(url, params_list, idx, ourl))
+                oast_injected.append({"parameter": name, "token": tok})
+                findings[-1]["evidence"]["oast_token"] = tok
+
     yield result({"target": url, "tested_params": tested, "findings": findings,
-                  "oast_available": oast.available()})
+                  "oast_available": oast.available(), "oast_injected": oast_injected})

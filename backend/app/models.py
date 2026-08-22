@@ -861,3 +861,47 @@ class ExploitProposal(Base):
         onupdate=func.now(),
         nullable=False,
     )
+
+
+class OastProbe(Base):
+    """A single out-of-band callback probe minted for a scan.
+
+    ``token`` is an unguessable random id planted inside an OOB payload (e.g. an
+    SSRF URL ``{OAST_BASE_URL}/oast/<token>``). It is bound to exactly ONE
+    workspace at mint time, which is the sole basis for tenant isolation: an
+    interaction recorded for this token is correlatable ONLY by the owning
+    workspace's scan. Probes are short-lived (``expires_at``) and cleaned up.
+    """
+
+    __tablename__ = "oast_probes"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    workspace_id: Mapped[int] = mapped_column(
+        ForeignKey("workspaces.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    token: Mapped[str] = mapped_column(String(64), nullable=False, unique=True, index=True)
+    kind: Mapped[str] = mapped_column(String(32), nullable=False, default="ssrf")
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class OastInteraction(Base):
+    """One recorded hit on an OAST probe — proof the target made an out-of-band
+    request to our collaborator. Bound to its probe (and thus the probe's
+    workspace) by FK, so it is never visible cross-tenant. Only minimal,
+    non-sensitive metadata is stored — never request bodies or credentials."""
+
+    __tablename__ = "oast_interactions"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    probe_id: Mapped[int] = mapped_column(
+        ForeignKey("oast_probes.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    source_ip: Mapped[str] = mapped_column(String(64), nullable=False, default="")
+    method: Mapped[str] = mapped_column(String(10), nullable=False, default="")
+    path: Mapped[str] = mapped_column(String(512), nullable=False, default="")
+    at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )

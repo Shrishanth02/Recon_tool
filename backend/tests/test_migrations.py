@@ -27,7 +27,7 @@ import pytest
 from sqlalchemy import create_engine, inspect, text
 
 BACKEND = Path(__file__).resolve().parents[1]
-HEAD_REVISION = "0016_mfa_secret_encrypted"
+HEAD_REVISION = "0017_oast_collaborator"
 INITIAL_REVISION = "0001_initial"
 
 

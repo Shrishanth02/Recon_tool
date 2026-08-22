@@ -34,8 +34,10 @@ from typing import Any, AsyncIterator, Iterator
 from urllib.parse import parse_qsl, urlsplit
 
 from . import bizlogic
+from . import oast as oast_mod
 from . import risk as risk_mod
 from . import scope as scope_mod
+from .database import SessionLocal
 from .scanners import (
     auth_crawl,
     crawl,
@@ -342,6 +344,67 @@ async def run_pipeline(
                     "data": f"⚠ Failed to persist {tool} result for {tool_target}: {exc}",
                 },
             )
+
+    def _mint_oast_probes(count: int) -> list:
+        """Mint up to ``count`` (bounded) workspace-bound OOB probes for one SSRF
+        target. Returns [{token, url}]; empty when OAST is unconfigured. Each probe
+        is tenant-bound at mint, so a callback can only be correlated by this run."""
+        if not (oast_mod.available() and workspace_id) or count <= 0:
+            return []
+        out: list = []
+        s = SessionLocal()
+        try:
+            for _ in range(min(count, 4)):
+                minted = oast_mod.mint_probe(s, workspace_id, kind="ssrf")
+                if minted:
+                    out.append({"token": minted[0], "url": minted[1]})
+            s.commit()
+        except Exception:  # noqa: BLE001 — OOB is best-effort; never break the run
+            s.rollback()
+            out = []
+        finally:
+            s.close()
+        return out
+
+    def _correlate_oast() -> None:
+        """After the in-band stages (which give callbacks time to arrive), upgrade
+        any planted SSRF probe that received an out-of-band interaction to a
+        CONFIRMED blind-SSRF finding. Reads are filtered by workspace_id AND this
+        run's own tokens, so correlation is strictly tenant-isolated."""
+        injected = ctx.get("oast_injected") or []
+        if not injected or not (oast_mod.available() and workspace_id):
+            return
+        tokens = [i["token"] for i in injected if i.get("token")]
+        s = SessionLocal()
+        try:
+            hit = oast_mod.hits_for(s, workspace_id, tokens)
+        except Exception:  # noqa: BLE001
+            hit = set()
+        finally:
+            s.close()
+        for inj in injected:
+            if inj.get("token") not in hit:
+                continue
+            u, param = inj.get("url"), inj.get("parameter")
+            finding = {
+                "severity": "high",
+                "name": f"Blind Server-Side Request Forgery in '{param}'",
+                "location": u, "cwe": ["CWE-918"], "cvss": 8.6,
+                "detection_tier": "validated", "confidence": 90,
+                "description": (
+                    f"The '{param}' parameter triggered an OUT-OF-BAND request to the "
+                    "collaborator: pointing it at a unique callback URL caused the server "
+                    "to fetch that URL (a callback was recorded), CONFIRMING a blind SSRF. "
+                    "Read-only out-of-band confirmation — no internal resource was accessed."),
+                "evidence": {"parameter": param, "method": "GET", "location": u,
+                             "confirmation": "out-of-band callback received"},
+            }
+            ctx["all_findings"].append(finding)
+            do_persist("ssrf", u, {"target": u, "findings": [finding]})
+            loop.call_soon_threadsafe(queue.put_nowait, {
+                "type": "pipeline_log", "stage": SUMMARY_STAGE,
+                "data": f"🚨 blind SSRF confirmed via OAST callback on '{param}' ({u})",
+            })
 
     def worker() -> None:
         """Run all pipeline stages in a thread."""
@@ -865,16 +928,26 @@ async def run_pipeline(
                 if any(ssrf._is_candidate(n, v) for n, v in q):
                     ssrf_urls.append(u)
             ssrf_results = []
+            ctx.setdefault("oast_injected", [])
             for u in ssrf_urls[: config.max_ssrf_targets]:
                 if cancel.is_set():
                     break
                 if not _host_allowed(u):
                     _plog(15, f"skipped (scope/egress) — {u}")
                     continue
-                r = _drain(ssrf.stream(u, cancel=cancel), cancel, 15, queue, loop)
+                # Mint one OOB probe per SSRF-candidate param on this URL (bounded)
+                # so a blind sink can be confirmed out-of-band later.
+                _ncand = sum(
+                    1 for n, v in parse_qsl(urlsplit(u).query, keep_blank_values=True)
+                    if ssrf._is_candidate(n, v)
+                )
+                probes = _mint_oast_probes(_ncand)
+                r = _drain(ssrf.stream(u, cancel=cancel, oast_probes=probes), cancel, 15, queue, loop)
                 if r:
                     ssrf_results.append(r)
                     ctx["all_findings"].extend(r.get("findings") or [])
+                    for inj in (r.get("oast_injected") or []):
+                        ctx["oast_injected"].append({**inj, "url": u})
                     do_persist("ssrf", u, r)
             if cancel.is_set():
                 return
@@ -1112,6 +1185,11 @@ async def run_pipeline(
             if rm_results:
                 emit_result(21, {"targets": rm_results})
             emit_stage(21, "done")
+
+            # OAST correlation — the in-band stages above gave any planted SSRF
+            # callback time to arrive; upgrade confirmed blind SSRF before summary.
+            if not cancel.is_set():
+                _correlate_oast()
 
             # ---------------------------------------------------------------- #
             # Stage 22 — Summary

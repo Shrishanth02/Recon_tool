@@ -15,6 +15,7 @@ from . import (
     enterprise,
     exploit,
     intel,
+    oast,
     orgs,
     pipeline_ws,
     purple,
@@ -40,6 +41,7 @@ ROUTERS = (
     billing.router,
     sso.router,
     enterprise.router,
+    oast.router,
     ws.router,
     pipeline_ws.router,
 )
@@ -59,6 +61,7 @@ __all__ = [
     "billing",
     "sso",
     "enterprise",
+    "oast",
     "ws",
     "pipeline_ws",
     "ROUTERS",
