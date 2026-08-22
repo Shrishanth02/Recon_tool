@@ -20,6 +20,7 @@ from . import (
     open_redirect,
     origin_discovery,
     reverseip,
+    role_matrix,
     ssrf,
     subdomain,
     takeover,
@@ -49,6 +50,7 @@ REGISTRY = {
     "ssrf": ssrf.stream,
     "open_redirect": open_redirect.stream,
     "idor": idor.stream,
+    "role_matrix": role_matrix.stream,
     "jwt": jwt_audit.stream,
     "csrf": csrf.stream,
 }

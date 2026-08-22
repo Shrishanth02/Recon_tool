@@ -49,6 +49,7 @@ from .scanners import (
     nuclei_scan,
     open_redirect,
     origin_discovery,
+    role_matrix,
     ssrf,
     subdomain,
     takeover,
@@ -96,6 +97,9 @@ class PipelineConfig:
     # Maximum sensitive-file/endpoint paths webaudit probes per target (bounds the
     # exposed-file sweep so it can't explode on an arbitrary site).
     max_exposed_file_probes: int = 50
+    # Maximum GET endpoints replayed across identities by the role-matrix
+    # authorization scan (bounds requests = targets * principals).
+    max_role_matrix_targets: int = 20
     # Operator-supplied authenticated-session config for the authenticated crawl
     # stage (cookie / auth_header / username+password / login_url). TRANSIENT —
     # carried only in-memory for the run and never persisted. Empty => the
@@ -128,11 +132,12 @@ STAGE_NAMES = {
     18: "CSRF Check",
     19: "Business Logic",
     20: "Open Redirect",
-    21: "Summary",
+    21: "Role Matrix",
+    22: "Summary",
 }
 
 #: The final Summary stage number (kept as a name so front/back stay in sync).
-SUMMARY_STAGE = 21
+SUMMARY_STAGE = 22
 
 
 # --------------------------------------------------------------------------- #
@@ -1057,7 +1062,59 @@ async def run_pipeline(
             emit_stage(20, "done")
 
             # ---------------------------------------------------------------- #
-            # Stage 21 — Summary
+            # Stage 21 — Role Matrix (broken access control / privilege
+            # escalation, CWE-285/862). Replays discovered GET endpoints across
+            # anonymous + each authorized identity and flags a lower-privilege
+            # principal reaching a higher one's resource. READ-ONLY (GET only);
+            # every candidate is scope+netguard gated via _host_allowed. Runs only
+            # when the operator supplied at least one authorized identity.
+            # ---------------------------------------------------------------- #
+            emit_stage(21, "started")
+            rm_results = []
+            rm_identities = [
+                i for i in (config.auth_identities or [])
+                if isinstance(i, dict) and (i.get("cookie") or i.get("auth_header"))
+            ]
+            if rm_identities:
+                rm_targets, _seen_rm = [], set()
+                # Crawl param-entries first — they carry the discovered-behind-auth
+                # flag. Only GET endpoints are replayed (never replay writes).
+                for e in ctx.get("param_entries", []):
+                    u = e.get("url")
+                    if not u or u in _seen_rm or (e.get("method") or "GET").upper() != "GET":
+                        continue
+                    _seen_rm.add(u)
+                    rm_targets.append((u, bool(e.get("authenticated"))))
+                for u in list(ctx.get("discovered_urls", [])) + list(ctx.get("api_endpoints", [])):
+                    if u and u not in _seen_rm:
+                        _seen_rm.add(u)
+                        rm_targets.append((u, False))
+                for u, is_auth in rm_targets[: config.max_role_matrix_targets]:
+                    if cancel.is_set():
+                        break
+                    if not _host_allowed(u):
+                        _plog(21, f"skipped (scope/egress) — {u}")
+                        continue
+                    r = _drain(
+                        role_matrix.stream(u, cancel=cancel,
+                                           identities=rm_identities, authenticated=is_auth),
+                        cancel, 21, queue, loop,
+                    )
+                    if r:
+                        rm_results.append(r)
+                        ctx["all_findings"].extend(r.get("findings") or [])
+                        do_persist("role_matrix", u, r)
+            else:
+                _plog(21, "Role matrix needs ≥1 authorized identity — skipping.")
+            if cancel.is_set():
+                return
+            ctx["stage_results"][21] = rm_results
+            if rm_results:
+                emit_result(21, {"targets": rm_results})
+            emit_stage(21, "done")
+
+            # ---------------------------------------------------------------- #
+            # Stage 22 — Summary
             # ---------------------------------------------------------------- #
             _finish(ctx, cancel, loop, queue)
 

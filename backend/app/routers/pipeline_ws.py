@@ -89,6 +89,11 @@ def _extract_identities(raw) -> list | None:
             v = item.get(k)
             if isinstance(v, str) and v.strip():
                 ident[k] = v.strip()
+        # Optional privilege rank (higher = more privileged) for the role-matrix
+        # authorization scan; IDOR ignores it. Defaults to list order downstream.
+        p = item.get("privilege")
+        if isinstance(p, int) and not isinstance(p, bool) and p >= 0:
+            ident["privilege"] = p
         if ident.get("cookie") or ident.get("auth_header"):
             out.append(ident)
     return out if len(out) >= 2 else None
