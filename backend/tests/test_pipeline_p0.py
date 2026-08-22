@@ -510,18 +510,23 @@ def test_idor_stage_runs_with_two_identities(stub_pipeline, monkeypatch):
                       for r in ir for f in r["result"].get("findings", []))
 
 
-def test_idor_stage_skipped_without_two_identities(stub_pipeline, monkeypatch):
-    calls = {"n": 0}
+def test_idor_stage_runs_without_two_identities_for_unauth_check(stub_pipeline, monkeypatch):
+    """With <2 identities the IDOR stage STILL runs so the scanner can perform the
+    anonymous unauthenticated-object-access check; only the cross-user comparison
+    inside the scanner is gated on >=2 identities."""
+    seen = {"n": 0, "identities": None}
 
-    def idor_stub(url, *_a, **_k):
-        calls["n"] += 1
+    def idor_stub(url, *_a, **k):
+        seen["n"] += 1
+        seen["identities"] = k.get("identities")
         yield {"type": "result", "data": {"target": url, "findings": []}}
 
     monkeypatch.setattr(pipeline.crawl, "stream",
                         _crawl_params_urls(urls=["https://app.example.com/account/123"]))
     monkeypatch.setattr(pipeline.idor, "stream", idor_stub)
     _run("example.com", persist=lambda r: None, scope_list=_SCOPE)  # no identities
-    assert calls["n"] == 0
+    assert seen["n"] == 1               # stage runs for the anonymous object-access check
+    assert seen["identities"] == []     # but with no identities to compare cross-user
 
 
 def test_jwt_stage_runs_with_bearer_token(stub_pipeline, monkeypatch):

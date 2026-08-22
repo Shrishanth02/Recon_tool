@@ -10,6 +10,8 @@ stdlib (TLS). Every check is wrapped so one failure never aborts the rest,
 and a structured ``result`` is always returned.
 """
 
+import re
+import secrets
 import socket
 import ssl
 import threading
@@ -67,21 +69,117 @@ SECURITY_HEADERS = {
     ),
 }
 
-# --- Sensitive files: path -> content signature confirming a real hit ----------
-# The signature guards against soft-404 pages that return HTTP 200 for anything.
-SENSITIVE_FILES = [
-    ("/.git/HEAD", "ref:", "high", "CWE-527"),
-    ("/.git/config", "[core]", "high", "CWE-527"),
-    ("/.env", "=", "high", "CWE-538"),
-    ("/.svn/entries", None, "high", "CWE-527"),
-    ("/.htpasswd", ":", "high", "CWE-538"),
-    ("/wp-config.php.bak", "DB_", "high", "CWE-538"),
-    ("/config.php.bak", "<?php", "high", "CWE-538"),
-    ("/phpinfo.php", "phpinfo()", "medium", "CWE-200"),
-    ("/server-status", "Apache Server Status", "medium", "CWE-200"),
-    ("/backup.zip", None, "medium", "CWE-538"),
-    ("/.DS_Store", "Bud1", "low", "CWE-527"),
+# --- Exposed / sensitive files & endpoints -------------------------------------
+# Each probe is (path, family, signatures, severity, cwe):
+#   * ``signatures`` is a list of case-insensitive regexes; a hit requires AT LEAST
+#     ONE to match the response body (strong, specific patterns — NOT a bare "=").
+#   * ``signatures is None`` marks a BINARY artifact confirmed by magic bytes
+#     (see ``_BINARY_MAGIC``) plus a non-HTML content-type.
+# A bare HTTP 200 is never sufficient: the content must actually look like the
+# resource. This catalogue is intentionally site-agnostic (framework-neutral
+# paths only) and is capped at scan time by ``max_file_probes`` so it can never
+# explode on an arbitrary site.
+_SENSITIVE_PROBES = [
+    # --- Version-control metadata (source-code exposure), CWE-527 ---
+    ("/.git/config", "vcs", [r"\[core\]", r"\[remote "], "high", "CWE-527"),
+    ("/.git/HEAD", "vcs", [r"(?m)^ref:\s*refs/"], "high", "CWE-527"),
+    ("/.svn/entries", "vcs", [r"(?m)^\d+\s*$", r"svn://", r"has-props"], "high", "CWE-527"),
+    ("/.hg/requires", "vcs", [r"(?mi)^(revlogv1|dotencode|store|fncache)"], "high", "CWE-527"),
+    # --- Secrets / credentials, CWE-538 / CWE-522 ---
+    # Require a dotenv KEY=value assignment at line start (uppercase-anchored so
+    # prose that merely mentions "password"/"secret" never matches).
+    ("/.env", "secret", [r"(?m)^\s*[A-Z][A-Z0-9_]{2,}\s*=\S"], "high", "CWE-538"),
+    ("/.env.local", "secret", [r"(?mi)^\s*[A-Z][A-Z0-9_]{2,}\s*="], "high", "CWE-538"),
+    ("/.env.production", "secret", [r"(?mi)^\s*[A-Z][A-Z0-9_]{2,}\s*="], "high", "CWE-538"),
+    ("/.htpasswd", "secret",
+     [r"(?m)^[^:\s]+:\$(?:apr1|2[aby]|1|5|6)\$", r"(?m)^[^:\s]+:\{SHA\}"], "high", "CWE-538"),
+    ("/.netrc", "secret", [r"(?mi)^\s*machine\s+\S+", r"(?mi)^\s*password\s+\S"], "high", "CWE-522"),
+    ("/.git-credentials", "secret", [r"https?://[^:@/\s]+:[^@/\s]+@"], "high", "CWE-522"),
+    ("/.npmrc", "secret", [r"_authToken\s*=", r"//[^/]+/:_authToken"], "high", "CWE-522"),
+    ("/.aws/credentials", "secret", [r"(?i)aws_secret_access_key", r"(?mi)^\[default\]"], "high", "CWE-522"),
+    ("/.ssh/id_rsa", "secret", [r"-----BEGIN (?:[A-Z ]+ )?PRIVATE KEY-----"], "high", "CWE-522"),
+    ("/id_rsa", "secret", [r"-----BEGIN (?:[A-Z ]+ )?PRIVATE KEY-----"], "high", "CWE-522"),
+    # --- Application config files, CWE-538 ---
+    ("/wp-config.php.bak", "config", [r"DB_NAME", r"DB_PASSWORD", r"<\?php"], "high", "CWE-538"),
+    ("/config.php.bak", "config", [r"<\?php", r"\bdefine\s*\(", r"\$config\b"], "high", "CWE-538"),
+    ("/web.config", "config", [r"(?i)<configuration\b", r"(?i)<connectionStrings\b"], "medium", "CWE-538"),
+    ("/appsettings.json", "config",
+     [r'"ConnectionStrings"', r'"(?:Password|ClientSecret|ApiKey)"\s*:'], "high", "CWE-538"),
+    ("/application.yml", "config",
+     [r"(?mi)^\s*(?:spring|datasource|server|password)\s*:"], "medium", "CWE-538"),
+    ("/docker-compose.yml", "config", [r"(?mi)^services\s*:", r"(?mi)^\s{2,}image\s*:"], "medium", "CWE-538"),
+    ("/Dockerfile", "config", [r"(?mi)^\s*FROM\s+\S", r"(?mi)^\s*(?:RUN|ENV|COPY)\s+\S"], "low", "CWE-538"),
+    # --- Database / archive backups & dumps, CWE-538 ---
+    ("/backup.sql", "backup",
+     [r"(?i)\b(?:CREATE TABLE|INSERT INTO|DROP TABLE|-- MySQL dump|-- Dumping data)"], "high", "CWE-538"),
+    ("/db_backup.sql", "backup",
+     [r"(?i)\b(?:CREATE TABLE|INSERT INTO|DROP TABLE|-- MySQL dump)"], "high", "CWE-538"),
+    ("/dump.sql", "backup", [r"(?i)\b(?:CREATE TABLE|INSERT INTO|DROP TABLE)"], "high", "CWE-538"),
+    ("/database.sql", "backup", [r"(?i)\b(?:CREATE TABLE|INSERT INTO|DROP TABLE)"], "high", "CWE-538"),
+    ("/backup.zip", "backup", None, "medium", "CWE-538"),        # magic: PK\x03\x04
+    ("/backup.tar.gz", "backup", None, "medium", "CWE-538"),     # magic: \x1f\x8b
+    # --- Debug / info-disclosure endpoints, CWE-200 ---
+    ("/phpinfo.php", "debug", [r"(?i)<title>\s*phpinfo\(\)", r"phpinfo\(\)", r"Zend Engine", r"PHP Credits"],
+     "medium", "CWE-200"),
+    ("/info.php", "debug", [r"(?i)<title>\s*phpinfo\(\)", r"Zend Engine", r"PHP Credits"], "medium", "CWE-200"),
+    ("/server-status", "debug", [r"Apache Server Status", r"(?i)Server uptime", r"(?i)Total accesses"],
+     "medium", "CWE-200"),
+    ("/actuator", "debug", [r'(?i)"_links"\s*:', r'(?i)"(?:health|metrics|env|beans)"\s*:'],
+     "medium", "CWE-200"),
+    ("/actuator/env", "debug", [r'(?i)"activeProfiles"', r'(?i)"propertySources"'], "high", "CWE-200"),
+    # --- API documentation, CWE-200 ---
+    ("/swagger.json", "apidoc", [r'"swagger"\s*:\s*"', r'"openapi"\s*:\s*"'], "low", "CWE-200"),
+    ("/openapi.json", "apidoc", [r'"openapi"\s*:\s*"', r'"swagger"\s*:\s*"'], "low", "CWE-200"),
+    ("/v2/api-docs", "apidoc", [r'"swagger"\s*:\s*"', r'"paths"\s*:'], "low", "CWE-200"),
+    ("/api-docs", "apidoc", [r'"(?:swagger|openapi)"\s*:\s*"', r'"paths"\s*:\s*\{'], "low", "CWE-200"),
+    # --- Auto-generated directory listings, CWE-548 (HTML expected) ---
+    ("/backup/", "dirlist", None, "medium", "CWE-548"),
+    ("/uploads/", "dirlist", None, "medium", "CWE-548"),
+    ("/files/", "dirlist", None, "medium", "CWE-548"),
+    ("/.git/", "dirlist", None, "medium", "CWE-548"),
+    # --- OS / editor artifacts, CWE-527 (binary) ---
+    ("/.DS_Store", "artifact", None, "low", "CWE-527"),          # magic: Bud1
 ]
+
+# Binary probes (``signatures is None`` and family != dirlist) confirmed by a
+# leading magic-byte signature so a soft-404 HTML page can never masquerade.
+_BINARY_MAGIC = {
+    "/backup.zip": b"PK\x03\x04",
+    "/backup.tar.gz": b"\x1f\x8b",
+    "/.DS_Store": b"\x00\x00\x00\x01Bud1",
+}
+
+# Auto-index (directory-listing) fingerprints — the Apache/nginx/Python patterns
+# a hand-written page will not contain. Directory listings are legitimately HTML.
+_DIRLIST_SIGNATURES = [
+    r"(?i)<title>\s*Index of /",
+    r"(?i)<h1>\s*Index of /",
+    r"(?i)Directory listing for /",
+    r'(?i)<a href="\?C=[NMSD];O=[AD]"',       # Apache mod_autoindex sort links
+]
+
+# Families whose real file is NEVER served as HTML — an HTML 200 is a soft-404 /
+# login / error page, not the resource, so we reject it up front. (debug/apidoc
+# are excluded: phpinfo & server-status are legitimately HTML.)
+_NON_HTML_FAMILIES = {"vcs", "secret", "config", "backup", "artifact"}
+
+# Human, secret-free confirmation labels for the finding evidence (never leaks
+# response content — see ``_check_sensitive_files``).
+_FAMILY_CONFIRM = {
+    "vcs": "version-control metadata",
+    "secret": "credential/secret content",
+    "config": "application configuration content",
+    "backup": "database/archive backup content",
+    "debug": "debug/info-disclosure page",
+    "apidoc": "API-documentation document",
+    "dirlist": "auto-generated directory index",
+    "artifact": "OS/editor metadata artifact",
+}
+
+_MAX_FILE_PROBES = 50      # default cap (clamped to the catalogue size); overridable
+                           # via the ``max_file_probes`` option to shrink the sweep
+_MIN_BODY_BYTES = 12       # responses smaller than this are treated as empty
+_SAMPLE = 8192             # bytes of body inspected for a signature
 
 
 def _finding(severity, name, location, description, cwe=None, evidence=None):
@@ -288,54 +386,142 @@ def _check_cors(url, findings) -> Iterator[dict]:
         )
 
 
-def _check_sensitive_files(base, findings, cancel) -> Iterator[dict]:
-    """Probe a curated list of sensitive paths, confirming by signature."""
-    yield log("Probing for exposed sensitive files ...")
-    for path, signature, severity, cwe in SENSITIVE_FILES:
+def _norm(text: str) -> str:
+    """Normalise a body for soft-404 comparison: drop digits and collapse
+    whitespace so a catch-all page that only differs by the echoed path/id
+    compares equal to the baseline."""
+    return re.sub(r"\s+", " ", re.sub(r"\d+", "", text or "")).strip().lower()[:2000]
+
+
+def _baseline_404(base):
+    """Learn the site's not-found behaviour by requesting a random, certainly
+    non-existent path. Returns the normalised body IF the site answers 200 (a
+    'soft-404' catch-all that 200s everything); otherwise None. A soft-404 body
+    is later used to reject probe responses that are merely the catch-all page."""
+    rand = "/%s.notfound" % secrets.token_hex(12)
+    try:
+        resp = _get(urllib.parse.urljoin(base, rand), allow_redirects=False)
+    except requests.RequestException:
+        return None
+    if resp.status_code == 200:
+        return _norm(resp.text[:_SAMPLE])
+    return None
+
+
+def _matched_signature(body: str, signatures) -> Optional[str]:
+    """Return the first signature regex that matches, else None. The regex
+    PATTERN (not the response content) is what gets surfaced as evidence, so no
+    secret material is ever recorded."""
+    for sig in signatures:
+        if re.search(sig, body):
+            return sig
+    return None
+
+
+def _finding_name(family: str, path: str) -> str:
+    if family == "dirlist":
+        return f"Directory listing exposed: {path}"
+    if family in ("debug", "apidoc"):
+        return f"Exposed {family} endpoint: {path}"
+    return f"Exposed sensitive file: {path}"
+
+
+def _check_sensitive_files(base, findings, cancel, max_probes=_MAX_FILE_PROBES) -> Iterator[dict]:
+    """Probe a curated, site-agnostic set of sensitive paths/endpoints.
+
+    Every hit must pass STRICT gates — a bare HTTP 200 never qualifies:
+      1. status is exactly 200 (redirects, 401/403 login walls, 404s -> skip);
+      2. body is non-empty;
+      3. content-type sanity — a file that is never HTML (secrets/config/backups/
+         VCS) served as ``text/html`` is a soft-404/login page -> skip;
+      4. content confirmation — a specific signature regex (or, for binaries,
+         leading magic bytes / for directories, an auto-index fingerprint);
+      5. soft-404 differential — if the site 200s everything, the body must
+         differ from the learned catch-all page.
+    All requests are GET via ``_get`` (safe_http + netguard); nothing is executed.
+    """
+    yield log("Probing for exposed sensitive files / endpoints ...")
+    soft404 = _baseline_404(base)
+    if soft404 is not None:
+        yield log("  note: site returns HTTP 200 for non-existent paths — "
+                  "requiring content to differ from that catch-all page.")
+    probed = 0
+    for path, family, signatures, severity, cwe in _SENSITIVE_PROBES[:max_probes]:
         if _cancelled(cancel):
             yield log("Cancelled — stopping file probes.")
             return
+        probed += 1
         target = urllib.parse.urljoin(base, path)
         try:
             resp = _get(target, allow_redirects=False)
         except requests.RequestException as exc:
             yield log(f"  {path}: request failed ({exc})")
             continue
+        # Gate 1 — only a real 200 counts (a 3xx/redirect, 401/403 login wall or
+        # 404 is never an exposure).
         if resp.status_code != 200:
             continue
-        sample = resp.text[:4096]
-        # Confirm by signature to avoid soft-404s that 200 everything.
-        if signature is not None and signature.lower() not in sample.lower():
-            yield log(f"  {path}: HTTP 200 but signature not matched (likely soft-404) — skipped.")
+        raw = resp.content or b""
+        # Gate 2 — reject empty / near-empty responses.
+        if len(raw) < _MIN_BODY_BYTES:
+            yield log(f"  {path}: 200 but body too small ({len(raw)}B) — skipped.")
             continue
-        # For binary/no-signature files, require a non-HTML content-type.
-        if signature is None:
-            ctype = resp.headers.get("Content-Type", "").lower()
+        ctype = (resp.headers.get("Content-Type", "") or "").lower()
+
+        if signatures is None and family != "dirlist":
+            # Binary artifact — require non-HTML + leading magic bytes.
             if "text/html" in ctype:
-                yield log(f"  {path}: HTTP 200 but HTML content — likely soft-404 — skipped.")
+                yield log(f"  {path}: 200 but HTML content — not the real file — skipped.")
                 continue
-        yield log(f"  EXPOSED: {path} (HTTP 200)")
+            magic = _BINARY_MAGIC.get(path)
+            if magic and not raw.startswith(magic):
+                yield log(f"  {path}: 200 but magic bytes not matched — skipped.")
+                continue
+            confirmed_by = "binary magic-byte signature"
+        else:
+            body = resp.text[:_SAMPLE]
+            # Gate 3 — content-type sanity for families that are never HTML.
+            if family in _NON_HTML_FAMILIES and "text/html" in ctype:
+                yield log(f"  {path}: 200 but HTML content — soft-404/login page — skipped.")
+                continue
+            sigs = _DIRLIST_SIGNATURES if family == "dirlist" else signatures
+            # Gate 4 — content signature confirmation.
+            matched = _matched_signature(body, sigs)
+            if not matched:
+                yield log(f"  {path}: 200 but content signature not matched (soft-404?) — skipped.")
+                continue
+            # Gate 5 — soft-404 differential: reject the catch-all page itself.
+            if soft404 is not None and _norm(body) == soft404:
+                yield log(f"  {path}: 200 but body equals the site's catch-all page — skipped.")
+                continue
+            confirmed_by = matched
+
+        yield log(f"  EXPOSED [{family}]: {path} (HTTP 200)")
         findings.append(
             _finding(
                 severity,
-                f"Exposed sensitive file: {path}",
+                _finding_name(family, path),
                 target,
-                f"{path} is publicly accessible (HTTP 200 with matching "
-                "content signature), potentially leaking source, secrets or "
-                "configuration.",
+                f"{path} is publicly accessible (HTTP 200) and its response "
+                f"actually contains {_FAMILY_CONFIRM.get(family, 'sensitive content')} "
+                "— confirmed by a content signature, not merely by the path "
+                "existing. This can leak source code, secrets, configuration or "
+                "internal structure.",
                 cwe,
+                # Evidence is deliberately content-free: the matched signature
+                # PATTERN and response metadata prove the finding without
+                # recording any secret value from the file.
                 evidence={
                     "path": path,
+                    "family": family,
                     "http_status": resp.status_code,
-                    "signature_matched": (signature if signature is not None
-                                          else "(binary/no-signature)"),
-                    "content_type": resp.headers.get("Content-Type", ""),
-                    # A short proof snippet (bounded) that the resource really
-                    # served matching content.
-                    "sample": sample[:200],
+                    "content_type": ctype,
+                    "bytes": len(raw),
+                    "confirmed_by": confirmed_by,
                 },
             )
         )
+    yield log(f"  probed {probed} path(s).")
 
 
 def _check_tls(url, findings) -> Iterator[dict]:
@@ -451,11 +637,20 @@ def stream(target, cancel: Optional[threading.Event] = None, **options) -> Itera
 
     yield log(f"RedOpsX WebAudit starting on {url}")
 
+    # Configurable cap on how many sensitive-file paths are probed, so scanning
+    # can never explode on an arbitrary site (each probe = one GET). Clamped to a
+    # sane range regardless of the caller-supplied value.
+    try:
+        max_probes = int(options.get("max_file_probes", _MAX_FILE_PROBES))
+    except (TypeError, ValueError):
+        max_probes = _MAX_FILE_PROBES
+    max_probes = max(0, min(max_probes, len(_SENSITIVE_PROBES)))
+
     # Each check is isolated: a crash in one is logged and the audit continues.
     checks = [
         ("security headers / cookies / content", lambda: _check_headers_cookies_content(url, findings, header_report)),
         ("CORS", lambda: _check_cors(url, findings)),
-        ("sensitive files", lambda: _check_sensitive_files(url, findings, cancel)),
+        ("sensitive files", lambda: _check_sensitive_files(url, findings, cancel, max_probes)),
         ("TLS", lambda: _check_tls(url, findings)),
     ]
 

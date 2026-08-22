@@ -15,6 +15,13 @@ Decision:
   * B is denied / sees different content  -> authorization enforced (negative);
   * only one identity                     -> SUSPECTED (id-bearing endpoint).
 
+Independently of any identity, an id endpoint that ANY anonymous caller can read,
+whose object type/response looks sensitive, and whose adjacent identifiers return
+DISTINCT records (enumerable), is reported as UNAUTHENTICATED object access
+(broken access control) — the case the cross-identity comparison alone treats as
+a public resource and drops. Genuinely public catalogues (e.g. /product/<id>) and
+single shared pages are excluded by the object-type + enumerability filters.
+
 Evidence records identity LABELS, the object identifier and response
 characteristics — never the session tokens/cookies themselves.
 """
@@ -23,7 +30,7 @@ import json
 import re
 import threading
 from typing import Iterator, Optional
-from urllib.parse import parse_qsl, urlsplit
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import requests
 
@@ -39,6 +46,58 @@ _ID_PARAM_NAMES = {
     "order_id", "doc", "document", "docid", "file", "fileid", "pid", "num", "no",
     "record", "rid", "item", "itemid", "object", "oid", "key",
 }
+
+# Object-type words that imply a per-subject SENSITIVE record (an unauthenticated
+# read is broken access control) vs a legitimately PUBLIC catalogue item (an
+# unauthenticated read is expected). Used to keep the unauthenticated-object-access
+# check from firing on public resources.
+_SENSITIVE_OBJECT_HINTS = frozenset({
+    "order", "orders", "invoice", "invoices", "account", "accounts", "acct",
+    "profile", "profiles", "user", "users", "customer", "customers", "member",
+    "members", "document", "documents", "doc", "docs", "message", "messages",
+    "msg", "ticket", "tickets", "payment", "payments", "transaction",
+    "transactions", "statement", "statements", "receipt", "receipts", "record",
+    "records", "cart", "carts", "address", "addresses", "employee", "employees",
+    "booking", "bookings", "reservation", "reservations", "subscription", "ssn",
+})
+_PUBLIC_OBJECT_HINTS = frozenset({
+    "product", "products", "item", "items", "article", "articles", "post",
+    "posts", "page", "pages", "category", "categories", "blog", "blogs", "news",
+    "faq", "faqs", "tag", "tags", "catalog", "review", "reviews", "comment",
+    "comments", "photo", "photos", "image", "images", "video", "videos",
+    "listing", "listings",
+})
+_PII_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
+
+
+def _object_type(url: str, oid: str) -> str:
+    """The object-type token for an id-bearing URL: the path segment before a
+    path id, or the id parameter's base name for a query id."""
+    parts = urlsplit(url)
+    segs = [s for s in parts.path.split("/") if s]
+    for i, s in enumerate(segs):
+        if s == oid and i > 0:
+            return segs[i - 1].lower()
+    for name, value in parse_qsl(parts.query, keep_blank_values=True):
+        if value == oid and name.lower() in _ID_PARAM_NAMES:
+            base = re.sub(r"_?(id|no)$", "", name.lower())
+            if base in _SENSITIVE_OBJECT_HINTS or base in _PUBLIC_OBJECT_HINTS:
+                return base
+            return segs[-1].lower() if segs else base
+    return ""
+
+
+def _sensitive(url: str, oid: str, body: str) -> bool:
+    """Whether an anonymously-readable id endpoint looks like a per-subject
+    sensitive object (order/invoice/account/…) rather than a public catalogue
+    item. Known-public object types are never sensitive; unknown types fall back
+    to PII (an email address) present in the response body."""
+    t = _object_type(url, oid)
+    if t in _SENSITIVE_OBJECT_HINTS:
+        return True
+    if t in _PUBLIC_OBJECT_HINTS:
+        return False
+    return bool(_PII_RE.search(body or ""))
 
 
 def _object_id(url: str) -> Optional[str]:
@@ -146,6 +205,95 @@ def _distinctive_token(body: str) -> Optional[str]:
     return toks[0][:80] if toks else None
 
 
+def _with_id(url: str, oid: str, new_id: str) -> Optional[str]:
+    """Return ``url`` with object identifier ``oid`` replaced by ``new_id`` (same
+    host/path — used only for adjacent-id enumeration probing), or None."""
+    parts = urlsplit(url)
+    segs = parts.path.split("/")
+    for i, s in enumerate(segs):
+        if s == oid:
+            segs[i] = new_id
+            return urlunsplit((parts.scheme, parts.netloc, "/".join(segs),
+                               parts.query, parts.fragment))
+    q = parse_qsl(parts.query, keep_blank_values=True)
+    newq, changed = [], False
+    for k, v in q:
+        if not changed and k.lower() in _ID_PARAM_NAMES and v == oid:
+            newq.append((k, new_id))
+            changed = True
+        else:
+            newq.append((k, v))
+    if changed:
+        return urlunsplit((parts.scheme, parts.netloc, parts.path,
+                           urlencode(newq), parts.fragment))
+    return None
+
+
+def _distinct_record(orig_body: str, other_body: str) -> bool:
+    """True if two anonymous responses are DIFFERENT per-object records (not the
+    same shared page): a differing distinctive token, or — after normalizing
+    whitespace and dropping digits so an id-echoing template isn't mistaken for
+    data — substantively different content."""
+    if not other_body:
+        return False
+    ot, nt = _distinctive_token(orig_body), _distinctive_token(other_body)
+    if nt and nt != ot:
+        return True
+
+    def _norm(s: str) -> str:
+        return re.sub(r"\d+", "", re.sub(r"\s+", " ", s or "")).strip()
+
+    a, b = _norm(orig_body), _norm(other_body)
+    return bool(a and b and a != b and abs(len(a) - len(b)) >= 8)
+
+
+def _enumerable_anon(url: str, oid: str, orig_body: str,
+                     cancel: Optional[threading.Event] = None) -> bool:
+    """Whether adjacent numeric identifiers return DISTINCT records to an
+    ANONYMOUS request — proving the endpoint serves an enumerable sequence of
+    per-object records without authentication (not one shared public page).
+
+    Read-only anonymous GETs via ``_http_get`` (netguard/SSRF-gated). Neighbour
+    URLs are the SAME host as the already scope-approved target, so they inherit
+    its engagement-scope decision; only simple numeric ids are probed."""
+    if not oid.isdigit():
+        return False
+    n = int(oid)
+    for neighbor in (n - 1, n + 1):
+        if neighbor <= 0:
+            continue
+        if cancel is not None and cancel.is_set():
+            break
+        nurl = _with_id(url, oid, str(neighbor))
+        if not nurl:
+            continue
+        r = _http_get(nurl, {})
+        if r and r[0] == 200 and _distinct_record(orig_body, r[1]):
+            return True
+    return False
+
+
+def _unauth_finding(url: str, oid: str, anon: tuple) -> dict:
+    """Build the unauthenticated-enumerable-object-access finding (generic
+    schema; per-finding tier/confidence honored by crud.derive_findings)."""
+    return {
+        "severity": "high",
+        "name": f"Unauthenticated object access ({oid})",
+        "location": url, "cwe": ["CWE-639", "CWE-284"], "cvss": 6.5,
+        "detection_tier": "validated", "confidence": 80,
+        "description": (
+            f"{url} serves a per-object record for identifier {oid} to an ANONYMOUS "
+            f"(unauthenticated) request, and adjacent identifiers return distinct "
+            f"records — the object is enumerable and exposed without authorization "
+            f"(broken object-level access control). Read-only check; no data was "
+            f"modified and no exploitation was performed."),
+        "evidence": {
+            "url": url, "method": "GET", "object_id": oid,
+            "status_anon": anon[0], "anonymous": True, "enumerable": True,
+        },
+    }
+
+
 def _targets(target: str) -> list[str]:
     out = []
     for piece in re.split(r"[\s,]+", (target or "").strip()):
@@ -190,7 +338,29 @@ def stream(target: str, cancel: Optional[threading.Event] = None, **options) -> 
             continue  # not a resource-by-id endpoint
         tested.append(url)
 
+        # (1) Unauthenticated enumerable-object access. The cross-identity check
+        # below treats "anon can read it too" as a public resource and drops it —
+        # missing a SENSITIVE object any anonymous caller can read. For GET
+        # path/query id endpoints we confirm that case directly: readable without a
+        # session, sensitive object type/response, and adjacent identifiers return
+        # DISTINCT records (enumerable). Identity-independent; every request is a
+        # read-only GET via _http_get (safe_http/netguard). ``anon`` is reused by
+        # the cross-identity control below.
+        anon = None
+        if method == "GET" and not data:
+            anon = _http_get(url, {})
+            if (anon and anon[0] == 200 and _sensitive(url, oid, anon[1])
+                    and _enumerable_anon(url, oid, anon[1], cancel)):
+                yield log(f"  🚨 {url}: unauthenticated access to enumerable object ({oid})")
+                findings.append(_unauth_finding(url, oid, anon))
+                continue
+
         if len(usable) < 2:
+            # An id endpoint we cannot validate cross-user. Skip cleanly for
+            # clearly-public object types to avoid a false positive on a catalogue.
+            if _object_type(url, oid) in _PUBLIC_OBJECT_HINTS:
+                yield log(f"{url}: public object type — not an authorization signal")
+                continue
             yield log(f"id-bearing endpoint {url} — needs ≥2 authorized identities to validate")
             findings.append({
                 "severity": "medium",
@@ -209,7 +379,8 @@ def stream(target: str, cancel: Optional[threading.Event] = None, **options) -> 
 
         a = _request(method, url, _identity_headers(usable[0]), data, content_type)
         b = _request(method, url, _identity_headers(usable[1]), data, content_type)
-        anon = _request(method, url, {}, data, content_type)
+        if anon is None:
+            anon = _request(method, url, {}, data, content_type)
         if not a or a[0] != 200:
             continue  # identity A cannot read it -> nothing to compare
         token = _distinctive_token(a[1])

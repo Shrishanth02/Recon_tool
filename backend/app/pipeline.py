@@ -47,6 +47,7 @@ from .scanners import (
     jwt_audit,
     nmap_scan,
     nuclei_scan,
+    open_redirect,
     origin_discovery,
     ssrf,
     subdomain,
@@ -90,6 +91,11 @@ class PipelineConfig:
     max_injection_targets: int = 10
     # Maximum parameterized URLs to run SSRF detection/validation against.
     max_ssrf_targets: int = 5
+    # Maximum parameterized URLs to test for open redirect (unvalidated redirect).
+    max_redirect_targets: int = 5
+    # Maximum sensitive-file/endpoint paths webaudit probes per target (bounds the
+    # exposed-file sweep so it can't explode on an arbitrary site).
+    max_exposed_file_probes: int = 50
     # Operator-supplied authenticated-session config for the authenticated crawl
     # stage (cookie / auth_header / username+password / login_url). TRANSIENT —
     # carried only in-memory for the run and never persisted. Empty => the
@@ -121,11 +127,12 @@ STAGE_NAMES = {
     17: "JWT / API Security",
     18: "CSRF Check",
     19: "Business Logic",
-    20: "Summary",
+    20: "Open Redirect",
+    21: "Summary",
 }
 
 #: The final Summary stage number (kept as a name so front/back stay in sync).
-SUMMARY_STAGE = 20
+SUMMARY_STAGE = 21
 
 
 # --------------------------------------------------------------------------- #
@@ -694,7 +701,11 @@ async def run_pipeline(
             for url in (ctx["live_urls"][: config.max_http_targets])[:8]:
                 if cancel.is_set():
                     break
-                r = _drain(webaudit.stream(url, cancel=cancel), cancel, 11, queue, loop)
+                r = _drain(
+                    webaudit.stream(url, cancel=cancel,
+                                    max_file_probes=config.max_exposed_file_probes),
+                    cancel, 11, queue, loop,
+                )
                 if r:
                     audit_results.append(r)
                     ctx["all_findings"].extend(r.get("findings") or [])
@@ -877,29 +888,31 @@ async def run_pipeline(
                 if isinstance(i, dict) and (i.get("cookie") or i.get("auth_header"))
             ]
             idor_results = []
-            if len(identities) >= 2:
-                cand, _seen_id = [], set()
-                for u in ctx.get("discovered_urls", []):
-                    if not u or u in _seen_id:
-                        continue
-                    _seen_id.add(u)
-                    if idor._object_id(u) is not None and _host_allowed(u):
-                        cand.append(u)
-                    if len(cand) >= 15:
-                        break
-                if cand:
-                    r = _drain(
-                        idor.stream(",".join(cand), cancel=cancel, identities=identities),
-                        cancel, 16, queue, loop,
-                    )
-                    if r:
-                        idor_results.append(r)
-                        ctx["all_findings"].extend(r.get("findings") or [])
-                        do_persist("idor", cand[0], r)
-                else:
-                    _plog(16, "No id-bearing in-scope URLs discovered — skipping IDOR.")
+            # Discover id-bearing in-scope object URLs. The IDOR scanner runs
+            # whenever such URLs exist: with <2 identities it performs the anonymous
+            # enumerable-object-access check (unauthenticated broken access
+            # control); with >=2 identities it additionally runs the cross-user
+            # comparison. Every candidate is scope+netguard gated via _host_allowed.
+            cand, _seen_id = [], set()
+            for u in ctx.get("discovered_urls", []):
+                if not u or u in _seen_id:
+                    continue
+                _seen_id.add(u)
+                if idor._object_id(u) is not None and _host_allowed(u):
+                    cand.append(u)
+                if len(cand) >= 15:
+                    break
+            if cand:
+                r = _drain(
+                    idor.stream(",".join(cand), cancel=cancel, identities=identities),
+                    cancel, 16, queue, loop,
+                )
+                if r:
+                    idor_results.append(r)
+                    ctx["all_findings"].extend(r.get("findings") or [])
+                    do_persist("idor", cand[0], r)
             else:
-                _plog(16, "IDOR needs ≥2 authorized identities — skipping.")
+                _plog(16, "No id-bearing in-scope URLs discovered — skipping IDOR/object-access.")
             if cancel.is_set():
                 return
             ctx["stage_results"][16] = idor_results
@@ -1009,7 +1022,42 @@ async def run_pipeline(
             emit_stage(19, "done")
 
             # ---------------------------------------------------------------- #
-            # Stage 20 — Summary
+            # Stage 20 — Open Redirect (unvalidated redirect / CWE-601).
+            # Reuses the crawl-discovered parameter corpus; every candidate URL is
+            # scope+netguard gated via _host_allowed, and the scanner injects a
+            # NON-RESOLVING external canary WITHOUT following it (read-only).
+            # ---------------------------------------------------------------- #
+            emit_stage(20, "started")
+            redir_urls, _seen_or = [], set()
+            for e in ctx.get("param_entries", []):
+                u = e.get("url")
+                if not u or u in _seen_or:
+                    continue
+                _seen_or.add(u)
+                q = parse_qsl(urlsplit(u).query, keep_blank_values=True)
+                if any(open_redirect._is_candidate(n, v) for n, v in q):
+                    redir_urls.append(u)
+            redir_results = []
+            for u in redir_urls[: config.max_redirect_targets]:
+                if cancel.is_set():
+                    break
+                if not _host_allowed(u):
+                    _plog(20, f"skipped (scope/egress) — {u}")
+                    continue
+                r = _drain(open_redirect.stream(u, cancel=cancel), cancel, 20, queue, loop)
+                if r:
+                    redir_results.append(r)
+                    ctx["all_findings"].extend(r.get("findings") or [])
+                    do_persist("open_redirect", u, r)
+            if cancel.is_set():
+                return
+            ctx["stage_results"][20] = redir_results
+            if redir_results:
+                emit_result(20, {"targets": redir_results})
+            emit_stage(20, "done")
+
+            # ---------------------------------------------------------------- #
+            # Stage 21 — Summary
             # ---------------------------------------------------------------- #
             _finish(ctx, cancel, loop, queue)
 

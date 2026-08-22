@@ -143,3 +143,96 @@ def test_form_body_id_single_identity_suspected(monkeypatch):
     sig = [f for f in res["findings"] if f["detection_tier"] == "signal"]
     assert sig and sig[0]["evidence"]["object_id"] == "9"
     assert sig[0]["evidence"]["method"] == "POST"
+
+
+# --------------------------------------------------------------------------- #
+# Unauthenticated enumerable-object access — broken access control with NO
+# session (the case the cross-identity comparison alone drops as "public").
+# --------------------------------------------------------------------------- #
+def test_unauthenticated_enumerable_object_flagged(monkeypatch):
+    """VulnShop-style /order/<id>: readable with NO session and adjacent ids
+    return DISTINCT records -> unauthenticated broken-access-control finding."""
+    orders = {
+        "/order/5": (200, "Order 5 customer alice@shop.test total 42 WIDGETSKU0000000005"),
+        "/order/4": (200, "Order 4 customer bob@shop.test total 99 GADGETSKU0000000004"),
+        "/order/6": (200, "Order 6 customer carol@shop.test total 17 GIZMOSKU00000000006"),
+    }
+
+    def fake(url, headers):
+        for path, resp in orders.items():
+            if url.endswith(path):
+                return resp
+        return (404, "not found")
+
+    res = _stream(monkeypatch, fake, "https://shop.test/order/5", [])  # no identities
+    unauth = [f for f in res["findings"] if f["name"].startswith("Unauthenticated object access")]
+    assert len(unauth) == 1
+    f = unauth[0]
+    assert f["detection_tier"] == "validated" and f["severity"] == "high"
+    assert f["evidence"]["object_id"] == "5" and f["evidence"]["anonymous"] is True
+    assert "CWE-639" in f["cwe"] and "CWE-284" in f["cwe"]
+    # The validated unauth finding supersedes the unconfirmed "Possible IDOR" signal.
+    assert not [x for x in res["findings"] if x["name"].startswith("Possible IDOR")]
+
+
+def test_public_catalogue_object_not_flagged(monkeypatch):
+    """A genuinely public catalogue object (/product/<id>) is enumerable but NOT a
+    sensitive object type -> no unauthenticated-access false positive, and no
+    low-confidence signal either."""
+    prods = {
+        "/product/5": (200, "Product 5 Blue Widget CATALOGSKU0000000005"),
+        "/product/4": (200, "Product 4 Red Gadget CATALOGSKU0000000004"),
+        "/product/6": (200, "Product 6 Green Gizmo CATALOGSKU0000000006"),
+    }
+
+    def fake(url, headers):
+        for path, resp in prods.items():
+            if url.endswith(path):
+                return resp
+        return (404, "x")
+
+    res = _stream(monkeypatch, fake, "https://shop.test/product/5", [])
+    assert res["findings"] == []   # public object type -> nothing flagged
+
+
+def test_sensitive_but_not_enumerable_not_flagged(monkeypatch):
+    """A sensitive-looking path where every id returns the SAME page is a single
+    shared resource, not per-object records -> not enumerable -> not flagged."""
+    def fake(url, headers):
+        return (200, "Account help centre contact support SHAREDHELPPAGEZZZ")  # identical for all ids
+
+    res = _stream(monkeypatch, fake, "https://shop.test/account/5", [])
+    assert not [f for f in res["findings"] if f["name"].startswith("Unauthenticated object access")]
+
+
+def test_unauth_object_requires_anonymous_read(monkeypatch):
+    """If the object is NOT anonymously readable (403), the unauthenticated check
+    does not fire — that path is for the two-identity cross-user comparison."""
+    res = _stream(monkeypatch, lambda u, h: (403, "forbidden"), "https://shop.test/order/5", [])
+    assert not [f for f in res["findings"] if f["name"].startswith("Unauthenticated object access")]
+
+
+def test_sensitive_object_type_classification():
+    assert idor._object_type("https://x/order/5", "5") == "order"
+    assert idor._object_type("https://x/product/9", "9") == "product"
+    assert idor._object_type("https://x/api/user?id=7", "7") == "user"
+    assert idor._sensitive("https://x/order/5", "5", "") is True
+    assert idor._sensitive("https://x/product/5", "5", "") is False
+    assert idor._sensitive("https://x/x/5", "5", "contact a@b.co") is True   # unknown + PII
+    assert idor._sensitive("https://x/x/5", "5", "no pii here") is False
+
+
+def test_with_id_and_distinct_record_helpers():
+    assert idor._with_id("https://x/order/5", "5", "6") == "https://x/order/6"
+    assert idor._with_id("https://x/api?id=5", "5", "6") == "https://x/api?id=6"
+    assert idor._distinct_record("alice@a.com XYZTOKEN1234567890", "bob@b.com QRSTOKEN0987654321")
+    assert not idor._distinct_record("same body content here", "same body content here")
+
+
+def test_derive_unauth_object_finding_is_vuln():
+    result = {"findings": [idor._unauth_finding("https://x/order/5", "5", (200, ""))]}
+    out = crud.derive_findings("idor", result)
+    assert out[0]["detection_tier"] == "validated"
+    assert out[0]["kind"] == "vuln"
+    assert out[0]["confidence"] == 80
+    assert "CWE-639" in out[0]["cwe"]
