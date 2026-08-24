@@ -6,15 +6,21 @@ prevented. It NEVER performs a real destructive action:
   * inspect the form for a CSRF-token field and the response for SameSite cookies
     — a state-changing form with NO token AND NO SameSite protection is a SIGNAL;
   * fetch the form twice and compare the token — a STATIC token is a SIGNAL;
-  * VALIDATION: a DIFFERENTIAL probe. Two state-changing requests are sent that
-    are identical in method, identity, headers and body and differ only in the
-    CSRF control — one carries the harvested token and a same-origin
-    Origin/Referer, the other a deliberately-invalid token and a foreign
-    Origin/Referer. If the forged request is rejected, the control is enforced.
-    If it SUCCEEDS exactly as the control did, protection is not enforced
-    (VALIDATED). If both fail identically the result is inconclusive — they may
-    have failed before any CSRF check ran — so it is reported as a SIGNAL. Both
-    bodies are invalid, so nothing is created either way.
+  * VALIDATION: a DIFFERENTIAL probe in which BOTH halves are non-destructive.
+    Two requests are sent carrying the SAME deliberately-invalid CSRF token and
+    the same junk body, differing only in Origin/Referer — one same-origin, one
+    foreign. An app that validates the token rejects both, exactly as it would
+    reject a real forgery. If the foreign-origin request is rejected the control
+    is enforced; if BOTH are accepted, neither the token nor the origin is
+    checked (VALIDATED, unless a SameSite attribute means a browser would not
+    send the cookie cross-site — then SIGNAL). Identical non-2xx results are
+    inconclusive and reported as a SIGNAL.
+
+    The form's real token is read for the static-token check but is NEVER sent
+    in a state-changing request: replaying a valid token would make the probe
+    indistinguishable from a genuine user submission and would perform the very
+    action under test. DELETE is never sent at all — it is identified by its URL,
+    so no choice of body makes it safe — and is reported as untested instead.
 
 Scope + netguard are enforced by the caller. Cookie VALUES are never stored —
 only names/attributes (SameSite presence).
@@ -32,14 +38,27 @@ from .base import ensure_url, error, log, result
 
 _TIMEOUT = 8
 _UA = "RedOpsX-CSRF/1.0"
+#: Methods that change state, and therefore need a CSRF control at all.
 _STATE_METHODS = ("POST", "PUT", "PATCH", "DELETE")
+#: Methods we may ACTIVELY probe. DELETE is deliberately excluded and is never
+#: sent — a DELETE is identified by its URL, so no choice of request body can
+#: make it non-destructive. It is reported as untested instead (same discipline
+#: as ``jwt_audit._check_method_authz``).
+_PROBE_METHODS = ("POST", "PUT", "PATCH")
 _PROBE_HEADERS = {"X-RedOpsX-Test": "1"}
-_INVALID_TOKEN = "redopsx-invalid-csrf-token"
+#: A token that is never valid anywhere. Deliberately free of the substring
+#: "csrf": it is echoed back by apps that re-render the submitted form, and
+#: ``_csrf_rejected`` scans the body for that marker — a token containing it
+#: would make the probe suppress its own finding.
+_INVALID_TOKEN = "redopsx-invalid-token-000000"
 #: Junk single-field body: reaches past a CSRF gate but is rejected by input
 #: validation, so nothing is created/modified.
 _INVALID_BODY = "redopsx_probe=1"
-#: A Origin/Referer that can never be same-site with a real target, used as the
-#: "forged" half of the differential probe.
+#: Field name used when the form declares no CSRF field. Also free of "csrf",
+#: for the same self-suppression reason.
+_FALLBACK_FIELD = "redopsx_token"
+#: An Origin/Referer that can never be same-site with a real target. This is the
+#: ONLY thing varied between the two probes.
 _FOREIGN_ORIGIN = "https://csrf-probe.invalid"
 
 _CSRF_FIELD_NAMES = {
@@ -94,14 +113,34 @@ def _token_value_from_html(html: str) -> Optional[str]:
     return nv[1] if nv else None
 
 
+def _token_field_name(html: str) -> Optional[str]:
+    """The NAME of the form's CSRF field — deliberately never its value.
+
+    The probe needs a plausible field name so the request is shaped like a real
+    submission; it must never carry the real token, which would turn the probe
+    into a genuine, accepted state-changing request.
+    """
+    nv = _token_name_value_from_html(html)
+    return nv[0] if nv else None
+
+
 def _origin_of(url: str) -> str:
     p = urlsplit(url)
     return f"{p.scheme}://{p.netloc}"
 
 
-def _csrf_rejected(status: int, text: str) -> bool:
-    """Does the response look like a CSRF / authorization rejection?"""
+def _csrf_rejected(status: int, text: str, echoed: tuple = ()) -> bool:
+    """Does the response look like a CSRF / authorization rejection?
+
+    ``echoed`` lists strings THIS probe put into the request. An app that
+    re-renders the submitted form echoes them back, so matching the rejection
+    markers against the raw body would let the probe suppress its own finding.
+    They are removed before the markers are looked for.
+    """
     low = (text or "").lower()
+    for frag in echoed:
+        if frag:
+            low = low.replace(str(frag).lower(), " ")
     return (status in (401, 403) or 300 <= status < 400
             or "csrf" in low or "forbidden" in low)
 
@@ -171,87 +210,117 @@ def stream(target: str, cancel: Optional[threading.Event] = None, **options) -> 
             "evidence": {**base_ev, "token_static": True},
         })
 
-    # (3) VALIDATION — DIFFERENTIAL probe.
+    # (3) VALIDATION — DIFFERENTIAL probe, with BOTH halves non-destructive.
     #
-    #     A single probe cannot distinguish "the CSRF control is missing" from
-    #     "the request failed for an unrelated reason": a 400 produced by body
-    #     validation and a 400 produced by a handler that never checked CSRF are
-    #     indistinguishable. So send TWO state-changing requests that are
-    #     identical in method, identity, headers and body, and differ ONLY in the
-    #     CSRF control being exercised:
+    #     Both requests carry a DELIBERATELY-INVALID CSRF token and a junk body,
+    #     so neither can complete a legitimate action: an app that validates the
+    #     token rejects both, exactly as it would reject a real forgery. The ONLY
+    #     thing varied between them is the request origin:
     #
-    #       control — the harvested (valid) token + a SAME-origin Origin/Referer
-    #       forged  — a deliberately-invalid token + a FOREIGN Origin/Referer
+    #       same-origin — invalid token, Origin/Referer of the target itself
+    #       foreign     — invalid token, Origin/Referer of an unrelated site
     #
-    #     Any difference in outcome is then attributable to the CSRF control
-    #     alone. If exercising the control changes nothing, it is not enforced.
-    #     Both bodies are junk, so nothing is created or modified either way.
-    if cancel is None or not cancel.is_set():
-        nv = _token_name_value_from_html(r1[1]) if r1 else None
-        field = token_field or (nv[0] if nv else "csrf")
-        valid_token = nv[1] if nv else None
+    #     A VALID token is never sent. Harvesting the form's real token and
+    #     replaying it would make one half indistinguishable from a genuine user
+    #     submission — it would perform the very action under test — so the
+    #     harvested token is used only for the static-token check above, never in
+    #     a state-changing request. DELETE is never sent at all.
+    if method in _PROBE_METHODS and (cancel is None or not cancel.is_set()):
+        field = token_field or _token_field_name(r1[1] if r1 else "") or _FALLBACK_FIELD
+        body = f"{field}={_INVALID_TOKEN}&{_INVALID_BODY}"
+        echoed = (field, _INVALID_TOKEN, _INVALID_BODY)
 
-        def _probe(token: str, origin: str, referer: str):
+        def _probe(origin: str, referer: str):
             return _http(method, url,
                          {**identity_headers, **_PROBE_HEADERS,
                           "Origin": origin, "Referer": referer},
-                         data=f"{field}={token}&{_INVALID_BODY}",
-                         ctype="application/x-www-form-urlencoded")
+                         data=body, ctype="application/x-www-form-urlencoded")
 
-        control = _probe(valid_token or _INVALID_TOKEN, _origin_of(url), url)
-        forged = _probe(_INVALID_TOKEN, _FOREIGN_ORIGIN, _FOREIGN_ORIGIN + "/")
+        same = _probe(_origin_of(url), url)
+        foreign = _probe(_FOREIGN_ORIGIN, _FOREIGN_ORIGIN + "/")
 
-        if control is not None and forged is not None:
-            c_status = control[0]
-            f_status, f_text = forged[0], forged[1]
-            ev = {**base_ev, "probe_status": f_status, "control_status": c_status,
-                  "probe": ("forged CSRF token + foreign Origin, against a same-origin "
-                            "control (X-RedOpsX-Test, invalid body)")}
+        if foreign is None:
+            yield log("  CSRF check inconclusive (no response to the probe)")
+        else:
+            f_status, f_text = foreign[0], foreign[1]
+            s_status = same[0] if same else None
+            ev = {**base_ev, "probe_status": f_status, "control_status": s_status,
+                  "probe": ("invalid CSRF token in BOTH halves; only the request "
+                            "Origin/Referer differs (X-RedOpsX-Test, invalid body)")}
             if f_status == 405:
                 yield log(f"  CSRF check inconclusive ({method} not allowed)")
-            elif _csrf_rejected(f_status, f_text):
-                # The forged request was rejected -> the control IS enforced.
+            elif _csrf_rejected(f_status, f_text, echoed):
+                # The forged-origin request was rejected -> a control IS enforced.
                 yield log(f"  CSRF appears enforced ({method} -> HTTP {f_status})")
-            elif f_status != c_status:
-                # Exercising the control changed the outcome, but not into a
-                # recognisable rejection -> no claim either way.
+            elif s_status is None:
+                yield log("  CSRF check inconclusive (same-origin half failed)")
+            elif f_status != s_status:
+                # Changing only the Origin changed the outcome: the server is
+                # doing something origin-aware, just not a recognisable rejection.
                 yield log(f"  CSRF check inconclusive "
-                          f"(control {c_status} vs forged {f_status})")
-            elif 200 <= f_status < 300:
-                # Both SUCCEEDED: a forged-token, foreign-Origin state-changing
-                # request was accepted. That is the vulnerability itself.
+                          f"(same-origin {s_status} vs foreign {f_status})")
+            elif 200 <= f_status < 300 and not samesite:
                 findings.append({
                     "severity": "high",
                     "name": f"CSRF protection not enforced: {method} {urlsplit(url).path}",
                     "location": url, "cwe": ["CWE-352"], "cvss": 6.5,
                     "detection_tier": "validated", "confidence": 80,
                     "description": (
-                        f"A {method} request carrying a DELIBERATELY-INVALID CSRF token and a "
-                        f"FOREIGN Origin SUCCEEDED (HTTP {f_status}), exactly as the same-origin "
-                        f"control did — the CSRF control is not enforced. A benign/invalid body "
-                        f"was used so nothing was created or modified."),
+                        f"A {method} request carrying an INVALID CSRF token and a FOREIGN "
+                        f"Origin was accepted (HTTP {f_status}), exactly as the same-origin "
+                        f"request was — neither the token nor the origin is checked, and no "
+                        f"SameSite cookie attribute limits cross-site use. The body was "
+                        f"invalid, so nothing was created or modified."),
                     "evidence": {**ev, "validation_result": "not_enforced"},
                 })
                 yield log(f"  🚨 CSRF not enforced ({method} -> HTTP {f_status})")
+            elif 200 <= f_status < 300 and samesite:
+                # The probe sends the session cookie explicitly; a real browser
+                # would withhold it cross-site, so this is NOT exploitable proof.
+                findings.append({
+                    "severity": "medium",
+                    "name": f"CSRF token not validated (SameSite only): {urlsplit(url).path}",
+                    "location": url, "cwe": ["CWE-352"],
+                    "detection_tier": "signal", "confidence": 45,
+                    "description": (
+                        f"An INVALID CSRF token was accepted (HTTP {f_status}) regardless of "
+                        f"request origin, so the token itself is not validated. A SameSite "
+                        f"cookie attribute is present, and a real browser would not send the "
+                        f"session cookie cross-site — this probe sends it explicitly, so the "
+                        f"finding is not proof of an exploitable CSRF. Verify manually."),
+                    "evidence": {**ev, "validation_result": "samesite_mitigated"},
+                })
+                yield log(f"  ⚠ invalid token accepted, but SameSite is set (HTTP {f_status})")
             else:
-                # Identical NON-2xx outcomes: exercising the control changed
-                # nothing, but both requests may have failed BEFORE any CSRF
-                # check ran (input validation, authorization). Report the
-                # observation, do not claim it is exploitable.
                 findings.append({
                     "severity": "medium",
                     "name": f"Possible CSRF: control had no effect on {urlsplit(url).path}",
                     "location": url, "cwe": ["CWE-352"],
                     "detection_tier": "signal", "confidence": 40,
                     "description": (
-                        f"A forged-token, foreign-Origin {method} request and the same-origin "
-                        f"control both returned HTTP {f_status}, so exercising the CSRF control "
-                        f"changed nothing. Inconclusive: a shared non-2xx status means both may "
-                        f"have failed before any CSRF check ran (input validation, "
-                        f"authorization). Verify manually."),
+                        f"The foreign-Origin and same-origin requests both returned HTTP "
+                        f"{f_status}, so changing the origin made no difference. Inconclusive: "
+                        f"a shared non-2xx status means both may have failed before any CSRF "
+                        f"check ran (input validation, authorization). Verify manually."),
                     "evidence": {**ev, "validation_result": "inconclusive"},
                 })
-                yield log(f"  ⚠ CSRF control had no effect, but both requests "
+                yield log(f"  ⚠ origin made no difference, but both requests "
                           f"failed (HTTP {f_status}) — inconclusive")
+    elif method not in _PROBE_METHODS:
+        # DELETE: state-changing, but no request body can make it safe to send.
+        findings.append({
+            "severity": "info",
+            "name": f"{method} endpoint not actively CSRF-tested: {urlsplit(url).path}",
+            "location": url, "cwe": ["CWE-352"],
+            "detection_tier": "signal", "confidence": 25,
+            "description": (
+                f"This endpoint accepts {method}, which is destructive and is therefore "
+                f"NEVER sent by RECON-X — a {method} is identified by its URL, so no choice "
+                f"of request body makes the probe safe. The passive checks above still "
+                f"apply; verify manually that {method} enforces a CSRF control."),
+            "evidence": {**base_ev, "actively_probed": False,
+                         "reason": f"{method} is destructive and is never sent"},
+        })
+        yield log(f"  {method} is destructive — not sent; reported as untested")
 
     yield result({"target": url, "method": method, "findings": findings})

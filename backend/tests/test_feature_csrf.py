@@ -132,30 +132,116 @@ def test_csrf_token_is_actually_validated_is_negative(monkeypatch):
     assert not [f for f in res["findings"] if f["detection_tier"] == "validated"]
 
 
-def test_csrf_differential_probes_differ_only_in_control(monkeypatch):
-    """The two probes must be identical except for the CSRF control, otherwise a
-    difference in outcome could not be attributed to the control."""
+def test_csrf_differential_probes_differ_only_in_origin(monkeypatch):
+    """The two probes must be identical except for the request origin, otherwise
+    a difference in outcome could not be attributed to the CSRF control."""
     seen = []
 
     def http(method, url, headers, data=None, ctype=None):
         if method == "GET":
-            return (200, '<form><input name="csrf_token" value="TOK"></form>', "s=1")
-        seen.append({"method": method, "url": url, "ctype": ctype,
-                     "origin": headers.get("Origin"), "data": data})
+            return (200, '<form><input name="csrf_token" value="REALTOKEN"></form>', "s=1")
+        seen.append({"method": method, "url": url, "ctype": ctype, "data": data,
+                     "origin": headers.get("Origin"), "referer": headers.get("Referer")})
         return (200, "ok", "")
 
     _run(monkeypatch, http)
-    assert len(seen) == 2, "expected a control probe and a forged probe"
-    control, forged = seen
-    assert control["method"] == forged["method"] == "POST"
-    assert control["url"] == forged["url"]
-    assert control["ctype"] == forged["ctype"]
-    assert control["origin"] != forged["origin"], "Origin must be the varied control"
-    assert "csrf-probe.invalid" in forged["origin"]
-    # body differs only in the token value; the junk payload is held constant
-    assert control["data"].endswith("&redopsx_probe=1")
-    assert forged["data"].endswith("&redopsx_probe=1")
-    assert "TOK" in control["data"] and "TOK" not in forged["data"]
+    assert len(seen) == 2, "expected a same-origin probe and a foreign-origin probe"
+    same, foreign = seen
+    assert same["method"] == foreign["method"] == "POST"
+    assert same["url"] == foreign["url"]
+    assert same["ctype"] == foreign["ctype"]
+    # The body — token included — is byte-identical; ONLY the origin varies.
+    assert same["data"] == foreign["data"], "only the Origin may differ"
+    assert same["origin"] != foreign["origin"]
+    assert "csrf-probe.invalid" in foreign["origin"]
+
+
+# --------------------------------------------------------------------------- #
+# Non-destructiveness. These are safety properties, not detection behaviour:
+# a regression here means the scanner damages the system under test.
+# --------------------------------------------------------------------------- #
+def test_delete_is_never_sent(monkeypatch):
+    """REGRESSION (P0): a DELETE is identified by its URL, so no request body can
+    make it safe. It must never be issued — only reported as untested."""
+    sent = []
+
+    def http(method, url, headers, data=None, ctype=None):
+        sent.append(method)
+        return (200, "<form></form>", "s=1")
+
+    res = _run(monkeypatch, http, method="DELETE")
+    assert "DELETE" not in sent, f"DELETE was sent to the target: {sent}"
+    assert set(sent) <= {"GET"}, f"only safe reads may be issued, got {sent}"
+    untested = [f for f in res["findings"] if "not actively CSRF-tested" in f["name"]]
+    assert untested, "DELETE must still be reported as untested"
+    assert untested[0]["evidence"]["actively_probed"] is False
+    assert untested[0]["detection_tier"] == "signal"
+
+
+def test_no_probe_ever_carries_the_real_token(monkeypatch):
+    """REGRESSION (P0): replaying the form's real CSRF token would make the probe
+    a genuine, accepted state-changing request — it would perform the action
+    under test. The harvested token may inform the static-token check only."""
+    html = '<form><input name="csrf_token" value="REALTOKEN123"></form>'
+    bodies = []
+
+    def http(method, url, headers, data=None, ctype=None):
+        if method == "GET":
+            return (200, html, "s=1")
+        bodies.append(data or "")
+        return (200, "ok", "")
+
+    for m in ("POST", "PUT", "PATCH"):
+        bodies.clear()
+        _run(monkeypatch, http, method=m)
+        assert bodies, f"{m} should have been probed"
+        for b in bodies:
+            assert "REALTOKEN123" not in b, f"{m} probe replayed the real token: {b}"
+            assert "redopsx-invalid-token" in b, f"{m} probe must carry an invalid token"
+
+
+def test_probe_token_cannot_suppress_its_own_finding(monkeypatch):
+    """REGRESSION: the rejection check scans the body for "csrf". An app that
+    echoes the submitted form must not make the probe mark itself enforced, so
+    neither the probe token nor the fallback field name may contain that string."""
+    from app.scanners import csrf as mod
+    assert "csrf" not in mod._INVALID_TOKEN.lower()
+    assert "csrf" not in mod._FALLBACK_FIELD.lower()
+
+    def http(method, url, headers, data=None, ctype=None):
+        if method == "GET":
+            return (200, "<form></form>", "session=abc")
+        return (200, f"You submitted: {data}", "")   # echoes the probe verbatim
+
+    res = _run(monkeypatch, http)
+    assert [f for f in res["findings"] if f["detection_tier"] == "validated"],         "an echoed probe body must not suppress the finding"
+
+
+def test_genuine_csrf_error_still_reads_as_enforced(monkeypatch):
+    """The echo-stripping must not blind the check to a real CSRF error message."""
+    def http(method, url, headers, data=None, ctype=None):
+        if method == "GET":
+            return (200, "<form></form>", "session=abc")
+        return (200, "CSRF token missing or incorrect", "")
+
+    res = _run(monkeypatch, http)
+    assert not [f for f in res["findings"] if f["detection_tier"] == "validated"]
+
+
+def test_samesite_downgrades_validated_to_signal(monkeypatch):
+    """The probe sends the session cookie explicitly; a browser would withhold it
+    cross-site. With SameSite set, an accepted invalid token is not proof of an
+    exploitable CSRF."""
+    def http(method, url, headers, data=None, ctype=None):
+        if method == "GET":
+            return (200, "<form></form>", "session=abc; SameSite=Lax")
+        return (200, "ok", "")
+
+    res = _run(monkeypatch, http)
+    assert not [f for f in res["findings"] if f["detection_tier"] == "validated"]
+    sig = [f for f in res["findings"] if "SameSite only" in f["name"]]
+    assert sig and sig[0]["detection_tier"] == "signal"
+    assert sig[0]["evidence"]["validation_result"] == "samesite_mitigated"
 
 
 def test_csrf_enforced_403_is_negative(monkeypatch):
