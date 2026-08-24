@@ -82,6 +82,11 @@ def _mode() -> str:
     return "exploit" if m == "exploit" else "check"
 
 
+def current_mode() -> str:
+    """Public view of the configured mode, for pinning onto an approval."""
+    return _mode()
+
+
 def _search_module(client: Any, *, cve: str | None, name: str | None,
                    service: str | None) -> str | None:
     """Find the fullname of a Metasploit exploit module matching the finding.
@@ -109,7 +114,7 @@ def _search_module(client: Any, *, cve: str | None, name: str | None,
 
 
 def run_exploit(target: str, *, cve: str | None = None, name: str | None = None,
-                service: str | None = None) -> dict[str, Any]:
+                service: str | None = None, mode: str | None = None) -> dict[str, Any]:
     """Run a real Metasploit module against ``target`` for the given finding.
 
     Returns a structured result dict (never raises):
@@ -123,7 +128,7 @@ def run_exploit(target: str, *, cve: str | None = None, name: str | None = None,
     that and the caller falls back to the safe probe.
     """
     host, port = _host_port(target)
-    mode = _mode()
+    mode = mode if mode in ("check", "exploit") else _mode()
     result: dict[str, Any] = {
         "engine": "metasploit",
         "available": False,

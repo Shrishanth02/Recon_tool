@@ -2479,16 +2479,28 @@ def set_exploit_status(
     status: str,
     *,
     approved_by: int | None = None,
+    approved_target: str | None = None,
+    approved_engine: str | None = None,
+    approved_mode: str | None = None,
     result: dict | None = None,
 ) -> models.ExploitProposal:
-    """Transition a proposal's ``status`` (and optionally record approver/result).
+    """Transition a proposal's ``status`` (and optionally record the approval).
 
-    ``approved_by`` is stamped when supplied (on the approve transition); ``result``
-    is stored when supplied (on execute). Flushes but does not commit.
+    ``approved_by`` and the pinned authorization envelope
+    (``approved_target``/``approved_engine``/``approved_mode``) are stamped on the
+    approve transition; ``result`` is stored on execute. Flushes but does not
+    commit. The envelope is the authorization of record: execution reads it and
+    must not deviate from it.
     """
     proposal.status = status
     if approved_by is not None:
         proposal.approved_by = approved_by
+    if approved_target is not None:
+        proposal.approved_target = approved_target
+    if approved_engine is not None:
+        proposal.approved_engine = approved_engine
+    if approved_mode is not None:
+        proposal.approved_mode = approved_mode
     if result is not None:
         proposal.result = result
     db.add(proposal)

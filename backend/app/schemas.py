@@ -906,6 +906,10 @@ class ExploitProposalOut(ORMModel):
     status: str = "proposed"
     created_by: int | None = None
     approved_by: int | None = None
+    #: The authorization envelope pinned at approve time (NULL until approved).
+    approved_target: str | None = None
+    approved_engine: str | None = None
+    approved_mode: str | None = None
     result: dict[str, Any] | None = None
     created_at: datetime
     updated_at: datetime
@@ -918,13 +922,15 @@ class ProposeOut(BaseModel):
 
 
 class ExecuteIn(BaseModel):
-    """Request body for executing an approved proposal's SAFE validation probe.
+    """Request body for executing an approved proposal's validation probe.
 
-    ``target`` is the authorized host/URL the benign probe runs against; the
-    router scope + netguard gates it before :func:`app.exploit.execute` acts.
+    ``target`` is OPTIONAL and is no longer how the target is chosen: the target
+    is pinned onto the approval (resolved from the finding) and cannot be changed
+    at execution. If supplied it must equal the pinned target, otherwise the
+    request is refused — it is accepted only as an explicit confirmation.
     """
 
-    target: str = Field(min_length=1, max_length=500)
+    target: str | None = Field(default=None, max_length=500)
 
 
 class ExecuteOut(BaseModel):
