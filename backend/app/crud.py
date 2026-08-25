@@ -554,7 +554,13 @@ def save_scan(db: Session, record: dict) -> models.Scan:
         workspace_id=record["workspace_id"],
         created_by=record.get("created_by"),
         tool=record.get("tool"),
-        target=record.get("target"),
+        # Clamp to the column width: the pipeline persists crawler/attacker-derived
+        # URLs as the per-tool target (see ``do_persist``), and a query-heavy URL
+        # can exceed String(500). SQLite silently accepts the overflow, but Postgres
+        # raises DataError at flush — and the persist callback swallows it, so the
+        # whole completed scan AND its findings would vanish from the run. Truncate
+        # the stored label instead; the full URL survives in each finding's location.
+        target=_clamp(record.get("target"), 500),
         status=record.get("status"),
         options=redact_scan_options(record.get("options")),
         logs=record.get("logs") or [],
@@ -1557,7 +1563,10 @@ def create_pentest_run(
     run = models.PentestRun(
         workspace_id=workspace_id,
         created_by=created_by,
-        target=target,
+        # Clamp to the column width: the pipeline WS request supplies the root
+        # target unbounded (no schema max_length, unlike the REST path), so a very
+        # long target would raise a Postgres DataError here and fail the run start.
+        target=_clamp(target, 500),
         status="running",
         risk_score=0,
         risk_label="",

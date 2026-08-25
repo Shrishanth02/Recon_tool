@@ -286,6 +286,58 @@ def test_save_scan_clamps_overlong_fields_instead_of_losing_scan():
         db.close()
 
 
+def test_save_scan_clamps_overlong_target_instead_of_losing_scan():
+    # P1: the pipeline persists crawler-derived URLs as the per-tool target; a
+    # query-heavy URL can exceed Scan.target's String(500). On Postgres that is a
+    # DataError at flush, and the persist callback swallows it — so the whole
+    # completed scan AND its findings would silently vanish. The target must be
+    # clamped so the scan (and its finding) survive round-trip.
+    db = SessionLocal()
+    try:
+        ws = _ws(db)
+        long_target = "https://shop.example.com/search?q=" + "a" * 2000  # > String(500)
+        rec = _nuclei_record(ws.id)
+        rec["target"] = long_target
+        scan = crud.save_scan(db, rec)
+        db.commit()
+        assert len(scan.target) == 500                     # clamped, not rejected
+        assert scan.target == long_target[:500]            # kept the leading, usable part
+        fs = crud.list_findings(db, ws.id)
+        assert len(fs) == 1                                # the finding survived with it
+    finally:
+        db.close()
+
+
+def test_save_scan_preserves_a_normal_target():
+    # Existing behaviour intact: a within-width target round-trips verbatim.
+    db = SessionLocal()
+    try:
+        ws = _ws(db)
+        rec = _nuclei_record(ws.id)
+        rec["target"] = "https://example.com/app"
+        scan = crud.save_scan(db, rec)
+        db.commit()
+        assert scan.target == "https://example.com/app"
+    finally:
+        db.close()
+
+
+def test_create_pentest_run_clamps_overlong_target():
+    # P1 sibling: the pipeline WS request supplies the root target unbounded (no
+    # schema max_length, unlike REST), so a very long target would DataError at
+    # PentestRun flush and fail the run start. It must be clamped, not raise.
+    db = SessionLocal()
+    try:
+        ws = _ws(db)
+        long_target = "https://" + "a" * 2000 + ".example.com"        # > String(500)
+        run = crud.create_pentest_run(db, ws.id, None, long_target)
+        db.commit()
+        assert len(run.target) == 500
+        assert run.target == long_target[:500]
+    finally:
+        db.close()
+
+
 def test_save_scan_survives_attack_mapping_error(monkeypatch):
     # A raising ATT&CK mapper must degrade ONE finding to "unmapped", never abort
     # the whole scan's finding set.
