@@ -18,6 +18,7 @@ Design rules:
   and callers preserve the ORIGINAL value in evidence/metadata for auditability.
 """
 
+import math
 from typing import Any
 
 #: The five supported severities, worst-first. Single source of truth.
@@ -71,3 +72,40 @@ def normalize_severity(value: Any, *, default: str = FALLBACK_SEVERITY) -> str:
     if token in _SEVERITY_ALIASES:
         return _SEVERITY_ALIASES[token]
     return default
+
+
+def coerce_cvss(value: Any) -> float | None:
+    """Return a valid CVSS base score as a float, or ``None``. Never raises.
+
+    The nuclei ``cvss-score`` (and the CVE-lookup path) are template/data
+    controlled, so ``Finding.cvss`` — a nullable ``Float`` — can be handed a bare
+    string (``"7.5"`` or ``"high"``), a bool, ``NaN``/``inf``, a list, or ``None``.
+    Two failure modes follow if that reaches the column verbatim:
+
+    * ``save_scan``'s dedup merge does ``max(existing.cvss, f["cvss"])`` — a
+      ``str`` vs ``float`` raises ``TypeError`` mid-scan, losing the whole scan;
+    * a non-numeric value that persisted (SQLite is permissive) then fails the
+      strict ``float`` on :class:`app.schemas.FindingOut` and 500s the ENTIRE
+      findings/report/risk/triage surface — the same blast radius the severity
+      guard closed.
+
+    So: a finite number (or a numeric string) in the valid CVSS range 0-10 is
+    returned as a float unchanged; everything else — ``None``, bools, non-numeric
+    or out-of-range values, ``NaN``/``inf`` — collapses to ``None`` (unscored),
+    never a guess. Booleans are rejected (a score of ``True`` is nonsense) even
+    though ``bool`` is an ``int`` subclass.
+    """
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        num = float(value)
+    elif isinstance(value, str):
+        try:
+            num = float(value.strip())
+        except (TypeError, ValueError):
+            return None
+    else:
+        return None
+    if not math.isfinite(num) or not (0.0 <= num <= 10.0):
+        return None
+    return num

@@ -21,6 +21,7 @@ from app.schemas import FindingOut
 from app.severity import (
     FALLBACK_SEVERITY,
     SEVERITIES,
+    coerce_cvss,
     is_known_severity,
     normalize_severity,
 )
@@ -245,3 +246,139 @@ def test_risk_and_report_endpoints_survive_a_malformed_row(client, auth):
     # The report still renders both findings (the bad one under a real bucket).
     assert "RealHigh" in r_report.text
     assert "Broken" in r_report.text
+
+
+# =========================================================================== #
+# P1 — CVSS robustness. A template/data-controlled cvss must never crash the
+# dedup merge (max(str, float) TypeError) or 500 the findings/report surface.
+# Mirrors the severity strategy: pure coercer + FindingOut + write boundary.
+# =========================================================================== #
+@pytest.mark.parametrize(
+    "raw,expected",
+    [
+        (7.5, 7.5), (7, 7.0), ("7.5", 7.5), ("  9 ", 9.0), (0, 0.0), (10, 10.0),
+        (None, None), ("high", None), ("", None), (True, None), (False, None),
+        ([1], None), ({"a": 1}, None), (11.0, None), (-1.0, None),
+        (float("nan"), None), (float("inf"), None),
+    ],
+)
+def test_coerce_cvss_unit(raw, expected):
+    assert coerce_cvss(raw) == expected
+
+
+@pytest.mark.parametrize(
+    "stored,expected",
+    [(7.5, 7.5), ("7.5", 7.5), (None, None), ("high", None), (True, None),
+     (11.0, None), (float("nan"), None)],
+)
+def test_findingout_coerces_any_stored_cvss(stored, expected):
+    """FindingOut must never 500 on a non-numeric/out-of-range stored cvss."""
+    out = FindingOut.model_validate(_finding_row(cvss=stored))
+    assert out.cvss == expected  # no ValidationError raised
+
+
+def _nuclei_record_cvss(name: str, cvss, location: str) -> dict:
+    rec = _nuclei_record(name, "high", location)
+    rec["result"]["findings"][0]["cvss"] = cvss
+    return rec
+
+
+def test_save_scan_coerces_malformed_cvss_and_keeps_scan():
+    """A non-numeric cvss must not raise; the scan + finding survive with cvss=None."""
+    ws_id = _new_ws("cvss-write@example.com")
+    db = SessionLocal()
+    try:
+        crud.save_scan(db, {**_nuclei_record_cvss("BadCvss", "not-a-number", "http://a/x"),
+                            "workspace_id": ws_id})
+        db.commit()
+        f = next(f for f in crud.list_findings(db, ws_id) if f.name == "BadCvss")
+        assert f.cvss is None
+    finally:
+        db.close()
+
+
+def test_save_scan_preserves_a_valid_cvss():
+    """Existing behaviour intact: a valid numeric cvss round-trips unchanged."""
+    ws_id = _new_ws("cvss-write2@example.com")
+    db = SessionLocal()
+    try:
+        crud.save_scan(db, {**_nuclei_record_cvss("GoodCvss", 7.5, "http://a/y"),
+                            "workspace_id": ws_id})
+        db.commit()
+        f = next(f for f in crud.list_findings(db, ws_id) if f.name == "GoodCvss")
+        assert f.cvss == 7.5
+    finally:
+        db.close()
+
+
+def test_dedup_merge_with_malformed_cvss_does_not_crash():
+    """The re-scan merge does max(existing.cvss, f['cvss']). A malformed cvss on
+    either observation must be coerced so the merge never raises TypeError and
+    the surviving row keeps the valid score."""
+    ws_id = _new_ws("cvss-merge@example.com")
+    db = SessionLocal()
+    try:
+        # First observation: a valid 7.5.
+        crud.save_scan(db, {**_nuclei_record_cvss("Merge", 7.5, "http://a/m"),
+                            "workspace_id": ws_id})
+        db.commit()
+        # Re-scan the SAME finding with a malformed cvss — must not crash the merge.
+        crud.save_scan(db, {**_nuclei_record_cvss("Merge", "garbage", "http://a/m"),
+                            "workspace_id": ws_id})
+        db.commit()
+        rows = [f for f in crud.list_findings(db, ws_id) if f.name == "Merge"]
+        assert len(rows) == 1                 # merged, not duplicated
+        assert rows[0].seen_count == 2
+        assert rows[0].cvss == 7.5            # kept the valid score
+    finally:
+        db.close()
+
+
+def test_dedup_merge_takes_max_of_valid_cvss():
+    """Two valid observations still merge to the higher score (behaviour intact)."""
+    ws_id = _new_ws("cvss-merge2@example.com")
+    db = SessionLocal()
+    try:
+        crud.save_scan(db, {**_nuclei_record_cvss("MergeMax", 5.0, "http://a/n"),
+                            "workspace_id": ws_id})
+        db.commit()
+        crud.save_scan(db, {**_nuclei_record_cvss("MergeMax", 8.8, "http://a/n"),
+                            "workspace_id": ws_id})
+        db.commit()
+        rows = [f for f in crud.list_findings(db, ws_id) if f.name == "MergeMax"]
+        assert len(rows) == 1 and rows[0].cvss == 8.8
+    finally:
+        db.close()
+
+
+def _corrupt_cvss(finding_id: int, bad) -> None:
+    """Write a numeric-but-invalid cvss straight to the column, simulating a
+    legacy row persisted before the write boundary coerced cvss. (The Float
+    column's driver processor already rejects a NON-numeric value on write, so a
+    bad *stored* cvss is necessarily a number the column accepts but a strict
+    consumer must not — NaN/inf/out-of-range.)"""
+    db = SessionLocal()
+    try:
+        row = db.get(models.Finding, finding_id)
+        row.cvss = bad
+        db.add(row)
+        db.commit()
+    finally:
+        db.close()
+
+
+@pytest.mark.parametrize("bad", [float("nan"), float("inf"), 11.0])
+def test_findings_api_does_not_500_on_a_malformed_cvss_row(client, auth, bad):
+    """End-to-end: a legacy row with a NaN/inf/out-of-range cvss must not 500
+    /findings (NaN in particular would otherwise emit invalid JSON)."""
+    ws_id = auth["ws_id"]
+    good = _persist_finding(ws_id, "GoodCvssRow", "high", "http://a/gc")
+    bad_id = _persist_finding(ws_id, "BadCvssRow", "high", "http://a/bc")
+    _corrupt_cvss(bad_id, bad)
+
+    r = client.get(f"/workspaces/{ws_id}/findings", headers=auth["headers"])
+    assert r.status_code == 200, r.text
+    by_name = {f["name"]: f for f in r.json()}
+    assert by_name["BadCvssRow"]["cvss"] is None    # coerced, not a 500
+    assert by_name["GoodCvssRow"]["name"] == "GoodCvssRow"
+    assert good != bad_id

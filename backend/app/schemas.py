@@ -13,7 +13,7 @@ from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator
 
 from . import secretbox
 from .branding import is_hex_color, is_safe_logo_url
-from .severity import normalize_severity
+from .severity import coerce_cvss, normalize_severity
 
 Role = Literal["owner", "admin", "analyst", "viewer"]
 Severity = Literal["critical", "high", "medium", "low", "info"]
@@ -291,6 +291,20 @@ class FindingOut(ORMModel):
         if isinstance(v, (list, tuple)):
             return list(v)
         return [str(v)]
+
+    @field_validator("cvss", mode="before")
+    @classmethod
+    def _coerce_cvss(cls, v):
+        """Coerce any stored/scanner CVSS to a valid float or None.
+
+        A finding persisted with a non-numeric or out-of-range CVSS (nuclei's
+        ``cvss-score`` is template-controlled; SQLite stores it verbatim) would
+        otherwise fail the strict ``float`` here and 500 the ENTIRE findings/
+        report/risk surface — the same blast radius the severity guard closed.
+        New writes are already coerced at the write boundary; this covers legacy
+        rows and any other producer.
+        """
+        return coerce_cvss(v)
 
     # Legacy rows created before these columns existed can surface as NULL;
     # collapse each to its safe default rather than failing serialization.

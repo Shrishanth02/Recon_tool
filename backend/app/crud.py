@@ -19,7 +19,7 @@ from sqlalchemy.orm import Session
 
 from . import attack, models, secretbox, security, vulndb
 from .config import settings
-from .severity import is_known_severity, normalize_severity
+from .severity import coerce_cvss, is_known_severity, normalize_severity
 
 logger = logging.getLogger("reconx.crud")
 
@@ -595,6 +595,19 @@ def save_scan(db: Session, record: dict) -> models.Scan:
         # lose the whole completed scan (see :func:`_clamp`).
         f["name"] = _clamp(f.get("name"), 500)
         f["location"] = _clamp(f.get("location"), 1000)
+
+        # P1: coerce the template/data-controlled CVSS to a valid float (or None)
+        # at the same write boundary. Left raw, a non-numeric value makes the
+        # dedup merge's ``max(existing.cvss, f["cvss"])`` raise TypeError mid-scan
+        # (losing the scan), and — if it persisted — 500s FindingOut serialization
+        # for the whole workspace. See :func:`coerce_cvss`.
+        f["cvss"] = coerce_cvss(f.get("cvss"))
+
+        # P1: coerce the template/data-controlled CVSS to a valid float (or None)
+        # at the same write boundary. Left raw, a non-numeric value makes the
+        # dedup merge's ``max(existing.cvss, f["cvss"])`` raise TypeError mid-scan
+        # (losing the scan), and — if it persisted — 500s FindingOut serialization
+        # for the whole workspace. See :func:`coerce_cvss`.
 
         # Purple-Team P1: tag the finding with its MITRE ATT&CK technique/tactic.
         # ``map_finding`` returns None when the tool has no sensible mapping, in
