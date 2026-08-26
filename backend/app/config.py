@@ -133,6 +133,11 @@ class Settings(BaseSettings):
     ANTHROPIC_API_KEY: str = Field(default="", alias="ANTHROPIC_API_KEY")
     AI_MODEL: str = Field(default="claude-opus-4-8", alias="RECONX_AI_MODEL")
     AI_EFFORT: str = Field(default="high", alias="RECONX_AI_EFFORT")
+    # Hard per-request timeout (seconds) for the Anthropic client. Triage runs
+    # inline in a request, so without a bound a hung/slow API call would pin a
+    # worker (and the DB connection it holds) indefinitely — the SDK's own
+    # default is 10 minutes. Configurable so operators can tune it.
+    AI_TIMEOUT: float = Field(default=60.0, alias="RECONX_AI_TIMEOUT")
 
     SCHEDULER_ENABLED: bool = Field(
         default=False, alias="RECONX_SCHEDULER_ENABLED"

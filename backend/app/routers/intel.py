@@ -104,6 +104,13 @@ def run_triage(
     _require_ws_role(membership, "analyst")
 
     findings = _finding_dicts(crud.list_findings(db, ws.id))
+    # Release the read transaction/connection BEFORE the (potentially slow)
+    # external AI call: the findings are already materialized to plain dicts and
+    # this path has no pending writes, so holding a pooled DB connection across a
+    # network call is unnecessary. save_triage/audit below re-acquire a fresh
+    # transaction. (The purple path shares a write transaction by design and is
+    # bounded by AI_TIMEOUT instead — see app.purple.chain_triage.)
+    db.rollback()
     outcome = ai.triage_findings(findings)
 
     if outcome.get("enabled") and isinstance(outcome.get("result"), dict):

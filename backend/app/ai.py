@@ -74,7 +74,9 @@ def _client() -> Any:
     """
     import anthropic  # lazy: only needed when AI is actually invoked
 
-    return anthropic.Anthropic()
+    # Bound every request: triage runs inline in a web request, so a hung/slow
+    # call must not pin a worker (and its DB connection) indefinitely.
+    return anthropic.Anthropic(timeout=settings.AI_TIMEOUT)
 
 
 def _compact_findings(findings: list[dict]) -> list[dict]:
