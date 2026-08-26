@@ -16,7 +16,8 @@ if/when the endpoint is added.
 
 import pytest
 
-from app import report
+from app import ai, crud, report
+from app.database import SessionLocal
 
 
 # --------------------------------------------------------------------------- #
@@ -208,3 +209,66 @@ def test_purple_report_route_member_readable(client, auth):
     ctype = resp.headers.get("content-type", "")
     assert "html" in ctype.lower()
     assert "Coverage" in resp.text
+
+
+# --------------------------------------------------------------------------- #
+# P1 — router -> renderer boundary. The persisted TriageResult.data is the raw
+# TriageOut shape (no `enabled`); the renderer gates the section on `enabled`.
+# These prove the flagship AI-triage section renders when triage actually ran
+# (using the REAL persisted shape via crud.save_triage) and stays "unavailable"
+# when it did not.
+# --------------------------------------------------------------------------- #
+
+
+def _persist_real_triage(ws_id: int) -> dict:
+    """Persist a TriageResult exactly as the production save paths do: the INNER
+    TriageOut dict (summary / risk_narrative / items / dedup_groups), with NO
+    `enabled` key. Returns the persisted dict for assertions."""
+    triage_out = ai.TriageOut(
+        summary="Two criticals need immediate remediation.",
+        risk_narrative="Exploitable RCE dominates the risk.",
+        items=[
+            ai.TriagedFinding(
+                finding_id=4242,
+                verdict="real",
+                suggested_severity="critical",
+                remediation="Patch the admin RCE immediately.",
+                rationale="Unauthenticated and network-reachable.",
+            )
+        ],
+        dedup_groups=[],
+    )
+    triage_dict = triage_out.model_dump()
+    assert "enabled" not in triage_dict  # the persisted shape genuinely lacks it
+    db = SessionLocal()
+    try:
+        crud.save_triage(db, ws_id, None, "claude-test", triage_dict)
+        db.commit()
+    finally:
+        db.close()
+    return triage_dict
+
+
+def test_purple_report_renders_triage_section_when_triage_ran(client, auth):
+    """With a real persisted triage, the route renders the prioritized-actions
+    section (headline + item), NOT the 'unavailable' note."""
+    ws_id = auth["ws_id"]
+    _persist_real_triage(ws_id)
+
+    resp = client.get(f"/workspaces/{ws_id}/purple-report", headers=auth["headers"])
+    assert resp.status_code == 200, resp.text
+    html = resp.text
+    assert "AI triage unavailable" not in html
+    assert "Two criticals need immediate remediation." in html   # headline/summary
+    assert "Patch the admin RCE immediately." in html            # item remediation
+    assert "#4242" in html                                       # item finding id
+
+
+def test_purple_report_triage_unavailable_when_no_triage(client, auth):
+    """With no persisted triage, the section still shows 'unavailable' (unchanged
+    behaviour) — the fix must not make an absent triage render as present."""
+    resp = client.get(
+        f"/workspaces/{auth['ws_id']}/purple-report", headers=auth["headers"]
+    )
+    assert resp.status_code == 200, resp.text
+    assert "AI triage unavailable" in resp.text

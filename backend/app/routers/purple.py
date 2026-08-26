@@ -218,7 +218,14 @@ def workspace_purple_report(
     }
     coverage = crud.coverage_dashboard(db, ws.id)
     triage_row = crud.latest_triage(db, ws.id)
-    triage = triage_row.data if triage_row else None
+    # The persisted payload is the raw TriageOut shape (summary / risk_narrative /
+    # items / dedup_groups) — the `enabled` flag lived only on the triage_findings
+    # ENVELOPE, which both save paths strip before persisting. The renderer gates
+    # the section on `enabled`, so without re-adding it the flagship AI-triage
+    # section always rendered "unavailable" even when triage ran. A persisted row
+    # only ever exists for a successful, enabled triage (both save paths gate on
+    # it), so marking it enabled here is correct; no row -> None -> "unavailable".
+    triage = {**triage_row.data, "enabled": True} if triage_row else None
     org = crud.get_org(db, ws.org_id)
     branding = crud.org_branding(org)
     return HTMLResponse(
