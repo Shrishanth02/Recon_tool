@@ -32,6 +32,7 @@ import sysconfig
 import tempfile
 import threading
 import time
+from html.parser import HTMLParser
 from typing import Iterator, List, Optional
 from urllib.parse import urljoin, urlparse, urlsplit, parse_qs
 
@@ -53,6 +54,11 @@ PAGE_FETCH_TIMEOUT = 12
 URL_CAP = 3000
 ARJUN_ENDPOINT_CAP = 5
 ARJUN_TIMEOUT_EACH = 90
+#: Bounds for the passive, same-origin form / API-endpoint discovery. Keeps the
+#: unauthenticated attack surface useful without letting it explode.
+FORM_CAP = 25
+FORM_INPUT_CAP = 30
+API_ENDPOINT_CAP = 50
 
 _UA = {"User-Agent": "Mozilla/5.0 (RedOpsX crawl / attack-surface expander)"}
 
@@ -149,6 +155,88 @@ def _mask(value: str) -> str:
     if len(value) <= 8:
         return value[:2] + "…"
     return f"{value[:4]}…{value[-4:]} (len {len(value)})"
+
+
+#: Path shapes that mark a URL as an API endpoint (JWT/API + GraphQL scanning).
+_API_PATH_RE = re.compile(r"(?:^|/)(?:api|graphql|graphiql|rest|v[0-9]+)(?:/|$)", re.I)
+
+
+class _FormExtractor(HTMLParser):
+    """Collect ``<form>`` action/method/input-names from one HTML page.
+
+    Pure parsing — no script execution, no network. Used for passive,
+    non-destructive CSRF-surface discovery on the unauthenticated crawl.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.forms: List[dict] = []
+        self._cur: Optional[dict] = None
+
+    def handle_starttag(self, tag, attrs):
+        a = {k.lower(): (v or "") for k, v in attrs}
+        if tag == "form":
+            self._cur = {"action": a.get("action", ""),
+                         "method": (a.get("method") or "GET").strip().upper() or "GET",
+                         "inputs": []}
+        elif self._cur is not None and tag in ("input", "textarea", "select", "button"):
+            name = a.get("name")
+            if name:
+                self._cur["inputs"].append(name)
+
+    def handle_endtag(self, tag):
+        if tag == "form" and self._cur is not None:
+            self.forms.append(self._cur)
+            self._cur = None
+
+
+def _extract_forms(html: str, base_url: str, domain: str) -> List[dict]:
+    """Same-origin ``{action, method, inputs}`` forms from one HTML page (bounded)."""
+    parser = _FormExtractor()
+    try:
+        parser.feed(html or "")
+    except Exception:  # noqa: BLE001 - malformed HTML must never break the crawl
+        return []
+    out: List[dict] = []
+    seen: set = set()
+    for f in parser.forms:
+        try:
+            action = urljoin(base_url, f["action"]) if f["action"] else base_url
+        except ValueError:
+            continue
+        if not action.startswith(("http://", "https://")) or not _same_site(action, domain):
+            continue
+        key = (action, f["method"])
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append({"action": action, "method": f["method"],
+                    "inputs": f["inputs"][:FORM_INPUT_CAP]})
+        if len(out) >= FORM_CAP:
+            break
+    return out
+
+
+def _looks_like_api(url: str) -> bool:
+    path = urlsplit(url).path.lower()
+    return bool(_API_PATH_RE.search(path)) or path.endswith(".json")
+
+
+def _api_endpoints_from(norm_urls: List[str], domain: str) -> List[str]:
+    """Same-origin API-shaped endpoints drawn from the already-collected URLs."""
+    out: List[str] = []
+    seen: set = set()
+    for u in norm_urls:
+        if not _same_site(u, domain) or not _looks_like_api(u):
+            continue
+        base = u.split("#")[0]
+        if base in seen:
+            continue
+        seen.add(base)
+        out.append(base)
+        if len(out) >= API_ENDPOINT_CAP:
+            break
+    return out
 
 
 def _same_site(url: str, domain: str) -> bool:
@@ -253,7 +341,8 @@ def _run_gau(domain: str, cancel: Optional[threading.Event], urls: set) -> Itera
 # Stage 3 — passive fetch + regex (pure Python, always runs)
 # ---------------------------------------------------------------------------
 def _run_passive(url: str, domain: str, cancel: Optional[threading.Event],
-                 urls: set, secrets: list, seen_secrets: set) -> Iterator[dict]:
+                 urls: set, secrets: list, seen_secrets: set,
+                 forms: list) -> Iterator[dict]:
     yield log("passive: fetching page and linked scripts ...")
     session = requests.Session()
     session.headers.update(_UA)
@@ -266,6 +355,8 @@ def _run_passive(url: str, domain: str, cancel: Optional[threading.Event],
     base_url = resp.url
     html = resp.text or ""
     _collect_from_text(html, base_url, urls, secrets, seen_secrets, source=base_url)
+    # Same-origin form discovery for the CSRF stage (pure HTML parse, no exec).
+    forms.extend(_extract_forms(html, base_url, domain))
 
     # Discover linked .js files from <script src=...>.
     js_srcs = re.findall(r"""<script[^>]+src=["']([^"']+)["']""", html, flags=re.IGNORECASE)
@@ -449,6 +540,7 @@ def stream(target: str, cancel: Optional[threading.Event] = None, **options) -> 
     secrets: list = []
     seen_secrets: set = set()
     params: set = set()
+    forms: list = []
 
     started = time.monotonic()
 
@@ -460,7 +552,7 @@ def stream(target: str, cancel: Optional[threading.Event] = None, **options) -> 
         yield from _run_gau(domain, cancel, urls)
     # Stage 3 — passive (always)
     if not _cancelled(cancel):
-        yield from _run_passive(url, domain, cancel, urls, secrets, seen_secrets)
+        yield from _run_passive(url, domain, cancel, urls, secrets, seen_secrets, forms)
 
     if _cancelled(cancel):
         yield log("⏹ Cancelled — returning partial attack surface.")
@@ -488,10 +580,16 @@ def stream(target: str, cancel: Optional[threading.Event] = None, **options) -> 
 
     params_discovered = sorted(params)
 
+    # Same-origin API endpoints for the JWT/API + GraphQL stage, drawn from the
+    # URLs already collected above (no extra fetching).
+    api_endpoints = _api_endpoints_from(norm_urls, domain)
+
     counts = {
         "urls": len(norm_urls),
         "parameterized_urls": len(parameterized),
         "params_discovered": len(params_discovered),
+        "forms": len(forms),
+        "api_endpoints": len(api_endpoints),
         "js_secrets": len(secrets),
     }
     elapsed = int(time.monotonic() - started)
@@ -509,6 +607,8 @@ def stream(target: str, cancel: Optional[threading.Event] = None, **options) -> 
         "urls": norm_urls,
         "parameterized_urls": parameterized,
         "params_discovered": params_discovered,
+        "forms": forms,
+        "api_endpoints": api_endpoints,
         "js_secrets": secrets,
         "counts": counts,
     })

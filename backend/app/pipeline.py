@@ -1074,7 +1074,12 @@ async def run_pipeline(
                     break
             has_token = bool(auth_cfg.get("token")) or "bearer" in (auth_cfg.get("auth_header") or "").lower()
             jwt_results = []
-            if has_token or (api_eps and _has_auth(config.auth)):
+            # Discovered API endpoints are audited even without operator auth:
+            # jwt_audit only runs the read-only GraphQL-introspection check when
+            # no identity is present (its auth/method-authz probes are gated on an
+            # identity internally), so this stays safe/non-destructive on an
+            # unauthenticated scan while lighting up GraphQL detection.
+            if has_token or api_eps:
                 opts = {
                     "token": auth_cfg.get("token", ""),
                     "auth_header": auth_cfg.get("auth_header", ""),
