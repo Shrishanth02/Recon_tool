@@ -31,7 +31,7 @@ import threading
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, AsyncIterator, Iterator
-from urllib.parse import parse_qsl, urlsplit
+from urllib.parse import parse_qsl, quote, urlsplit
 
 from . import bizlogic
 from . import oast as oast_mod
@@ -85,6 +85,13 @@ class PipelineConfig:
     max_nuclei_targets: int = 20
     # Maximum live web targets to dir-bust
     max_dirbust_targets: int = 5
+    # Maximum live web hosts to deep-crawl for the discovery corpus. Raised from
+    # the old hard-coded 1 so subdomains that httpx/nuclei already reached also
+    # get their parameters/URLs discovered; still bounded so reach can't explode.
+    max_crawl_seeds: int = 3
+    # Maximum Arjun-discovered hidden parameter names expanded into synthetic
+    # benign parameter entries per crawl result (bounds the synthetic corpus).
+    max_arjun_params: int = 20
     # Whether to attempt DNS zone transfer
     dns_zone_transfer: bool = True
     # Maximum discovered hosts to check for subdomain takeover
@@ -112,6 +119,11 @@ class PipelineConfig:
     # persisted. Fewer than 2 => IDOR stays suspected-only / skipped.
     auth_identities: list | None = None
 
+
+#: Placeholder value for a synthetic Arjun parameter entry. The active scanners
+#: substitute their own payloads into the parameter; this value is inert and only
+#: makes the parameter appear in the URL's query string.
+_BENIGN_PARAM_VALUE = "1"
 
 STAGE_NAMES = {
     1: "WHOIS Lookup",
@@ -699,31 +711,82 @@ async def run_pipeline(
             # can show whether the endpoint was authenticated.
             # ---------------------------------------------------------------- #
             emit_stage(10, "started")
-            crawl_seed = ctx["live_urls"][:1] or ([f"https://{domain}"] if domain else [])
-            param_entries: list[dict] = []  # {url, source, method, authenticated}
+            crawl_seed = (
+                ctx["live_urls"][: config.max_crawl_seeds]
+                or ([f"https://{domain}"] if domain else [])
+            )
+            param_entries: list[dict] = []   # {url, source, method, authenticated}
             discovered_urls: list[str] = []  # for IDOR (id-bearing) discovery
             api_endpoints: list[str] = []    # for JWT/API auth checks
             forms_all: list[dict] = []       # {action, method, inputs} for POST injection
+            bizlogic_sources: list[dict] = []  # crawl/auth_crawl results for the workflow model
             crawl_result = None
 
-            def _add_params(items, source: str, authenticated: bool) -> None:
-                for p in (items or []):
-                    u = p.get("url")
+            def _ingest(source: str, result: dict, *, authenticated: bool = False) -> None:
+                """Single funnel: fold one discovery producer's result into the
+                shared corpus. EVERY discovery source (crawl, auth_crawl, ffuf,
+                Arjun) flows through here, so a producer can never be silently
+                orphaned again. Nothing is scope/netguard-filtered here — each
+                consumer stage still validates every URL before it is touched, so
+                the filtering stays exactly where it was."""
+                if not result:
+                    return
+                # Parameterized URLs -> injection/SSRF/redirect corpus.
+                for p in (result.get("parameterized_urls") or []):
+                    u = p.get("url") if isinstance(p, dict) else p
                     if u:
-                        param_entries.append({
-                            "url": u, "source": source, "method": "GET",
-                            "authenticated": authenticated,
-                        })
+                        param_entries.append({"url": u, "source": source,
+                                              "method": "GET", "authenticated": authenticated})
                         discovered_urls.append(u)
+                # Plain discovered URLs -> IDOR/webaudit/role-matrix corpus.
+                for u in (result.get("urls") or []):
+                    if u:
+                        discovered_urls.append(u)
+                # ffuf/dirbuster content-discovery rows -> discovered_urls, and
+                # param_entries when a discovered URL carries a query string.
+                for row in (result.get("rows") or []):
+                    u = row.get("url") if isinstance(row, dict) else None
+                    if not u:
+                        continue
+                    discovered_urls.append(u)
+                    if urlsplit(u).query:
+                        param_entries.append({"url": u, "source": source,
+                                              "method": "GET", "authenticated": authenticated})
+                # auth_crawl only: API endpoints + forms (unchanged sources).
+                for u in (result.get("api_endpoints") or []):
+                    if u:
+                        api_endpoints.append(u)
+                for fm in (result.get("forms") or []):
+                    forms_all.append(fm)
+                # Arjun hidden parameter NAMES -> synthetic benign parameter
+                # entries against the crawled base, so injection/SSRF/redirect can
+                # exercise parameters that appear in no crawled URL.
+                base = result.get("target")
+                names = result.get("params_discovered") or []
+                if base and names:
+                    sep = "&" if urlsplit(base).query else "?"
+                    for name in names[: config.max_arjun_params]:
+                        if not name:
+                            continue
+                        synth = f"{base}{sep}{quote(str(name))}={_BENIGN_PARAM_VALUE}"
+                        param_entries.append({"url": synth, "source": "arjun",
+                                              "method": "GET", "authenticated": authenticated})
+                        discovered_urls.append(synth)
 
-            bizlogic_sources: list[dict] = []  # crawl/auth_crawl results for the workflow model
+            # ffuf content-discovery results (Stage 7) — fold the discovered paths
+            # back into the corpus so IDOR/webaudit/redirect/role-matrix can reach
+            # them (they were previously persisted and then discarded). Arjun/forms
+            # are absent from the ffuf shape, so this only adds URLs. ffuf results
+            # do NOT feed the business-logic model (that stays crawl/auth_crawl).
+            for ffuf_result in (ctx["stage_results"].get(7) or []):
+                _ingest("ffuf", ffuf_result)
+
             for url in crawl_seed:
                 if cancel.is_set():
                     break
                 crawl_result = _drain(crawl.stream(url, cancel=cancel), cancel, 10, queue, loop)
                 if crawl_result:
-                    _add_params(crawl_result.get("parameterized_urls"), "crawl", False)
-                    discovered_urls.extend(crawl_result.get("urls") or [])
+                    _ingest("crawl", crawl_result, authenticated=False)
                     bizlogic_sources.append({**crawl_result, "authenticated": False})
                     do_persist("crawl", url, crawl_result)
 
@@ -740,11 +803,7 @@ async def run_pipeline(
                         cancel, 10, queue, loop,
                     )
                     if ac:
-                        _add_params(ac.get("parameterized_urls"), "auth_crawl",
-                                    bool(ac.get("authenticated")))
-                        discovered_urls.extend(ac.get("urls") or [])
-                        api_endpoints.extend(ac.get("api_endpoints") or [])
-                        forms_all.extend(ac.get("forms") or [])
+                        _ingest("auth_crawl", ac, authenticated=bool(ac.get("authenticated")))
                         bizlogic_sources.append(ac)
                         do_persist("auth_crawl", url, ac)
 
