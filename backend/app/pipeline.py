@@ -35,6 +35,7 @@ from urllib.parse import parse_qsl, quote, urlsplit
 
 from . import bizlogic
 from . import oast as oast_mod
+from . import preflight
 from . import risk as risk_mod
 from . import scope as scope_mod
 from .database import SessionLocal
@@ -1306,6 +1307,36 @@ def _finish(ctx: dict, cancel: threading.Event, loop: asyncio.AbstractEventLoop,
     risk_score = _r["score"]
     risk_label = _r["rating"].upper()
 
+    # --- Coverage honesty: a 0-finding scan must not read as "clean" when a --- #
+    # capability could not run because its optional tool is absent. Reuse
+    # preflight (PATH availability) AND the injection stage's own ``tools`` marker
+    # (what actually ran THIS scan; authoritative when injection ran). Scanner
+    # behaviour is unchanged — this only reports what already happened.
+    tool_status = preflight.check_tools()
+    inj_tools = None
+    for _ir in ((ctx.get("stage_results") or {}).get(12) or []):
+        if isinstance(_ir, dict) and _ir.get("tools"):
+            inj_tools = _ir["tools"]
+            break
+
+    def _capability_ran(tool: str) -> bool:
+        # The injection marker is authoritative when injection ran; otherwise a
+        # capability "ran" iff its tool is installed (no targets != not tested).
+        if inj_tools is not None:
+            return bool(inj_tools.get(tool))
+        return bool(tool_status["optional"].get(tool))
+
+    not_tested: list[dict] = []
+    for tool, capability in (("sqlmap", "SQL injection"), ("dalfox", "Cross-site scripting")):
+        if not _capability_ran(tool):
+            not_tested.append({"capability": capability, "tool": tool,
+                               "reason": "tool not installed"})
+    coverage = {
+        "tools": tool_status["optional"],
+        "missing_optional": tool_status["missing_optional"],
+        "not_tested": not_tested,
+    }
+
     summary = {
         "target": ctx["domain"],
         "subdomains_found": len(ctx.get("subdomains", [])),
@@ -1314,6 +1345,7 @@ def _finish(ctx: dict, cancel: threading.Event, loop: asyncio.AbstractEventLoop,
         "severity_counts": severity_counts,
         "risk_score": risk_score,
         "risk_label": risk_label,
+        "coverage": coverage,
         "finished_at": _now(),
     }
 
