@@ -29,6 +29,7 @@ from sqlalchemy import (
     String,
     Text,
     func,
+    text,
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -90,6 +91,15 @@ class User(Base):
     password_hash: Mapped[str] = mapped_column(String(255), nullable=False)
     full_name: Mapped[str] = mapped_column(String(200), nullable=False, default="")
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    # True once ownership of the email has been PROVEN — by an SSO login through
+    # the org's admin-configured IdP (or a future verification flow). Password
+    # registration creates accounts as False (ownership unproven); login is NOT
+    # gated on this. It exists to close SSO account pre-hijacking: the first SSO
+    # adoption of an unverified account neutralizes any pre-set password and
+    # revokes its sessions (see app.sso.provision_sso_user).
+    email_verified: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=text("false")
+    )
     # Holds the TOTP secret ENCRYPTED at rest (app.secretbox, "enc:v1:" + Fernet
     # token) — widened from 64 to fit ciphertext. Legacy rows may still hold a
     # bare base32 plaintext secret; secretbox.decrypt_value passes those through.

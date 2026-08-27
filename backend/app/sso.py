@@ -373,7 +373,14 @@ def provision_sso_user(
 
     * Look up an existing :class:`~app.models.User` by ``email`` (case-insensitive).
     * If none exists, create one with a random (unusable) password hash — SSO
-      users never authenticate with a local password.
+      users never authenticate with a local password — and mark it
+      ``email_verified`` (this IdP login proves ownership of the address).
+    * If one exists but is NOT ``email_verified``, this is the first SSO adoption
+      of a possibly attacker-planted account: reset its password to a fresh
+      random hash and bump ``token_version`` to revoke any pre-existing sessions,
+      then mark it verified. This closes SSO account pre-hijacking. An
+      already-verified account is adopted untouched, so legitimate repeat SSO
+      logins never reset a password or churn sessions.
     * Ensure the user has a :class:`~app.models.Membership` in ``org``; when the
       membership is created it is granted the org's configured
       ``sso_default_role`` (falling back to ``"viewer"``).
@@ -387,18 +394,35 @@ def provision_sso_user(
 
     user = crud.get_user_by_email(db, email)
     created = False
+    evicted = False
     if user is None:
         # A long random secret that is hashed but never disclosed: the account
-        # exists but cannot be logged into with a password.
+        # exists but cannot be logged into with a password. Ownership of the
+        # email is proven by this IdP login, so the account is verified up front.
         random_password = secrets.token_urlsafe(32)
         user = models.User(
             email=email,
             password_hash=security.hash_password(random_password),
             full_name=full_name or "",
+            email_verified=True,
         )
         db.add(user)
         db.flush()  # assign user.id
         created = True
+    elif not getattr(user, "email_verified", False):
+        # ACCOUNT PRE-HIJACKING DEFENSE. An existing but UNVERIFIED account may
+        # have been planted by an attacker who pre-registered this email with a
+        # password they know. The org's admin-configured IdP has now proven the
+        # real owner controls the address, so evict any attacker foothold on the
+        # FIRST adoption: neutralize the local password and revoke every session
+        # minted before this login. Marking it verified makes this a one-time
+        # event, so a legitimate repeat SSO login never resets anything.
+        user.password_hash = security.hash_password(secrets.token_urlsafe(32))
+        crud.bump_token_version(db, user)  # revoke pre-existing (attacker) sessions
+        user.email_verified = True
+        db.add(user)
+        db.flush()
+        evicted = True
 
     default_role = (getattr(org, "sso_default_role", None) or "viewer").strip() or "viewer"
     membership = crud.get_membership(db, user.id, org.id)
@@ -413,6 +437,6 @@ def provision_sso_user(
         org.id,
         user.id,
         "sso_login",
-        f"provisioned={created} email={email} role={default_role}",
+        f"provisioned={created} evicted={evicted} email={email} role={default_role}",
     )
     return user

@@ -27,7 +27,7 @@ import pytest
 from sqlalchemy import create_engine, inspect, text
 
 BACKEND = Path(__file__).resolve().parents[1]
-HEAD_REVISION = "0018_exploit_approval_binding"
+HEAD_REVISION = "0019_user_email_verified"
 INITIAL_REVISION = "0001_initial"
 
 
@@ -166,6 +166,21 @@ def test_migrations_reproduce_orm_schema_without_create_all(target_url):
             orm_cols = set(Base.metadata.tables[table].columns.keys())
             drift = orm_cols - mig_cols
             assert not drift, f"{table}: columns in ORM missing from the migrated schema: {sorted(drift)}"
+    finally:
+        eng.dispose()
+
+
+@pytest.mark.parametrize("target_url", _TARGETS, indirect=True)
+def test_email_verified_column_present_and_not_null(target_url):
+    """0019 adds users.email_verified as a NOT NULL boolean (the SSO
+    pre-hijacking defense). Guards the specific column end to end on the real
+    migrated schema, on both SQLite and PostgreSQL."""
+    _run_alembic(target_url, "upgrade", "head")
+    eng = _engine(target_url)
+    try:
+        cols = {c["name"]: c for c in inspect(eng).get_columns("users")}
+        assert "email_verified" in cols, "0019 did not add users.email_verified"
+        assert cols["email_verified"]["nullable"] is False
     finally:
         eng.dispose()
 

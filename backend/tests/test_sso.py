@@ -188,3 +188,100 @@ def test_sso_login_404_when_master_switch_off(client):
     # SSO_ENABLED defaults OFF -> the whole surface 404s (existence-hiding).
     resp = client.get("/auth/sso/any-org/login")
     assert resp.status_code == 404
+
+
+# --------------------------------------------------------------------------- #
+# Account pre-hijacking (P1): evict-on-first-SSO-adoption.
+# A password account for an email carries email_verified=False until the org's
+# IdP proves ownership. The first SSO adoption of an unverified account must
+# neutralize any pre-set password and revoke its sessions; verified accounts and
+# repeat SSO logins are untouched; password login is never gated on the flag.
+# --------------------------------------------------------------------------- #
+def test_sso_adoption_of_unverified_password_account_evicts_attacker():
+    """NEGATIVE / attack-closed: an attacker pre-registers victim@corp.com with a
+    known password; the victim's first real SSO login evicts that foothold."""
+    db = SessionLocal()
+    try:
+        _u, org, _ws = crud.create_user_with_org(
+            db, "sso-owner1@example.com", "password123", "Owner"
+        )
+        db.commit()
+        # Attacker plants a password account for the victim's email.
+        victim, _vorg, _vws = crud.create_user_with_org(
+            db, "victim@corp.com", "attacker-known-pw", "Victim"
+        )
+        db.commit()
+        assert victim.email_verified is False           # unproven ownership
+        old_hash = victim.password_hash
+        old_version = victim.token_version
+
+        # The real owner logs in via the org's SSO for the first time.
+        u = sso.provision_sso_user(db, org, "victim@corp.com", "Victim")
+        db.commit()
+
+        assert u.id == victim.id                        # same account/data kept
+        assert u.email_verified is True                 # now proven
+        assert u.password_hash != old_hash              # attacker password reset
+        assert crud.authenticate(db, "victim@corp.com", "attacker-known-pw") is None
+        assert u.token_version == old_version + 1       # attacker sessions revoked
+    finally:
+        db.close()
+
+
+def test_sso_first_login_creates_verified_user():
+    """POSITIVE: an SSO-first account (no pre-existing row) is created verified."""
+    db = SessionLocal()
+    try:
+        _u, org, _ws = crud.create_user_with_org(
+            db, "sso-owner2@example.com", "password123", "Owner"
+        )
+        db.commit()
+        u = sso.provision_sso_user(db, org, "Fresh@Corp.com", "Fresh")
+        db.commit()
+        assert u.id is not None
+        assert u.email == "fresh@corp.com"
+        assert u.email_verified is True
+        assert crud.get_membership(db, u.id, org.id) is not None
+    finally:
+        db.close()
+
+
+def test_repeat_sso_login_does_not_reset_password_or_bump_version():
+    """POSITIVE: eviction is one-time; a verified account's repeat SSO login does
+    not reset its password or bump its token_version (no multi-device churn)."""
+    db = SessionLocal()
+    try:
+        _u, org, _ws = crud.create_user_with_org(
+            db, "sso-owner3@example.com", "password123", "Owner"
+        )
+        db.commit()
+        u1 = sso.provision_sso_user(db, org, "repeat@corp.com", "Repeat")
+        db.commit()
+        assert u1.email_verified is True
+        hash_after_first = u1.password_hash
+        ver_after_first = u1.token_version
+
+        u2 = sso.provision_sso_user(db, org, "repeat@corp.com", "Repeat")
+        db.commit()
+        assert u2.id == u1.id
+        assert u2.password_hash == hash_after_first     # unchanged
+        assert u2.token_version == ver_after_first      # unchanged
+        assert u2.email_verified is True
+    finally:
+        db.close()
+
+
+def test_password_only_user_login_unaffected_by_verified_flag():
+    """REGRESSION: login is NOT gated on email_verified — a password-only user
+    (never touched by SSO, so email_verified stays False) still authenticates."""
+    db = SessionLocal()
+    try:
+        user, _org, _ws = crud.create_user_with_org(
+            db, "pw-only@corp.com", "goodpass123", "PwOnly"
+        )
+        db.commit()
+        assert user.email_verified is False
+        authed = crud.authenticate(db, "pw-only@corp.com", "goodpass123")
+        assert authed is not None and authed.id == user.id
+    finally:
+        db.close()
