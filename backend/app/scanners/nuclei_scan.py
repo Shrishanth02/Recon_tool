@@ -144,18 +144,32 @@ def stream(
             f"[{finding['severity'].upper()}] {finding['name']} -> {finding['matched_at']}"
         )
 
-    if cancel is not None and cancel.is_set():
-        return
+    # Honesty on cancel/timeout: previously this returned early and emitted NO
+    # result, so a nuclei run that was killed before finishing looked identical to
+    # a clean, complete run that found nothing (a false-clean). nuclei can match a
+    # template late in the run, so a cut-off scan is NOT proof the target is clean.
+    # Always emit a result carrying whatever was captured, flagged incomplete, so
+    # the caller (and operator) knows the coverage was partial.
+    partial = cancel is not None and cancel.is_set()
 
     findings.sort(key=lambda f: SEVERITY_ORDER.get(f["severity"], 9))
     counts = {}
     for f in findings:
         counts[f["severity"]] = counts.get(f["severity"], 0) + 1
 
-    yield log(f"✔ {len(findings)} finding(s): " + (", ".join(f"{k}:{v}" for k, v in counts.items()) or "none"))
+    if partial:
+        yield log(
+            f"⚠ nuclei did not complete (cancelled/timed-out) — results are "
+            f"PARTIAL: {len(findings)} finding(s) captured so far, more may exist. "
+            f"This is NOT a clean result."
+        )
+    else:
+        yield log(f"✔ {len(findings)} finding(s): "
+                  + (", ".join(f"{k}:{v}" for k, v in counts.items()) or "none"))
     yield result({
         "targets": targets,
         "total": len(findings),
         "counts": counts,
         "findings": findings,
+        "complete": not partial,
     })
