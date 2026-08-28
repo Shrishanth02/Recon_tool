@@ -186,6 +186,46 @@ def _distinctive(body: str) -> Optional[str]:
     return toks[0][:80] if toks else None
 
 
+#: Path segments that mark an endpoint as a per-subject / private resource, and
+#: ones that mark it as a public catalogue / infra endpoint. Mirrors idor.py's
+#: sensitive/public object-type hints, applied to the URL path.
+_SENSITIVE_PATH_HINTS = frozenset({
+    "me", "profile", "account", "accounts", "user", "users", "customer", "customers",
+    "order", "orders", "invoice", "invoices", "payment", "payments", "billing",
+    "wallet", "settings", "session", "sessions", "admin", "ssn", "card", "cards",
+})
+#: Body markers that make a shared response clearly sensitive regardless of path:
+#: secret/credential keys and per-subject PII field names (as they appear in JSON
+#: or form bodies). Recovers real leaks whose URL vocabulary isn't in the hint
+#: lists (e.g. /api/v1/integrations/1024 -> {"webhook_secret": ...}). A bare email
+#: is deliberately NOT here (public contact/team pages carry emails) — an
+#: email-only shared body is surfaced at signal tier by the caller instead.
+#: Anchored on the KEY delimiter (``"?\s*[:=]``) rather than word boundaries, so
+#: snake_case compound keys are caught (``webhook_secret":``, ``db_password":``,
+#: ``client_secret=``) while a prefix use (``password_hint":``) is not.
+_SENSITIVE_BODY_RE = re.compile(
+    r'(?:access_token|refresh_token|id_token|session_token|api[_-]?key|client_secret'
+    r'|secret|private_key|password|passwd|ssn|social_security|credit_card|card_number'
+    r'|cvv|account_number|routing_number|date_of_birth|token|bearer)'
+    r'"?\s*[:=]',
+    re.I,
+)
+
+
+def _looks_sensitive(url: str, body: str) -> bool:
+    """STRONG sensitivity evidence for a shared (authed==anon) response: a
+    per-subject / private path segment, OR a secret/credential/PII field in the
+    body. Deliberately strict — a legitimately PUBLIC endpoint (catalogue,
+    config, health) returns identical content to all callers, which is the
+    classic ``_check_api_auth`` false positive; only STRONG evidence promotes to
+    a validated finding, and the ambiguous rest is surfaced as a low signal by
+    the caller (never dropped). Mirrors :func:`idor._sensitive`'s intent."""
+    segs = [s for s in urlsplit(url).path.lower().split("/") if s]
+    if any(s in _SENSITIVE_PATH_HINTS for s in segs):
+        return True
+    return bool(_SENSITIVE_BODY_RE.search(body or ""))
+
+
 def _identity_headers(identity: dict) -> dict:
     h: dict = {}
     ck = (identity.get("cookie") or "").strip()
@@ -214,14 +254,38 @@ def _check_api_auth(url: str, identity_headers: dict) -> Optional[dict]:
     if status == 200 and not any(h in (body or "").lower() for h in _LOGIN_HINTS):
         token = _distinctive(authed[1])
         if token and token in (body or ""):
+            path = urlsplit(url).path
+            if _looks_sensitive(url, authed[1]):
+                # Strong evidence the shared content is a per-subject / sensitive
+                # resource leaking to an anonymous caller — a real missing-auth bug.
+                return {
+                    "severity": "high", "name": f"API endpoint lacks authentication: {path}",
+                    "location": url, "cwe": ["CWE-306"], "cvss": 7.5,
+                    "detection_tier": "validated", "confidence": 85,
+                    "description": ("The endpoint returned the same SENSITIVE authenticated data to an "
+                                    "UNauthenticated request — it does not enforce authentication."),
+                    "evidence": {"url": url, "method": "GET", "status_authed": authed[0],
+                                 "status_anon": status, "shared_token": token,
+                                 "sensitivity_confirmed": True},
+                }
+            # Anon sees the SAME content, but sensitivity is NOT confirmed — this
+            # is normal for a PUBLIC endpoint (idor.py: "publicly accessible — not
+            # an IDOR"). DON'T inflate risk with a validated/high false positive,
+            # but DON'T drop it either (a real leak with unusual vocabulary would
+            # vanish): surface a low-severity SIGNAL (info => 0 risk weight) for a
+            # human to confirm.
             return {
-                "severity": "high", "name": f"API endpoint lacks authentication: {urlsplit(url).path}",
-                "location": url, "cwe": ["CWE-306"], "cvss": 7.5,
-                "detection_tier": "validated", "confidence": 85,
-                "description": ("The endpoint returned the same authenticated data to an UNauthenticated "
-                                "request — it does not enforce authentication."),
+                "severity": "info",
+                "name": f"API endpoint returns identical content to an anonymous request: {path}",
+                "location": url, "cwe": ["CWE-306"],
+                "detection_tier": "signal", "confidence": 30,
+                "description": ("The endpoint returned the same content to an unauthenticated request. "
+                                "This is expected for a PUBLIC endpoint and is a vulnerability only if "
+                                "the content is meant to be private — sensitivity was not confirmed. "
+                                "Verify manually."),
                 "evidence": {"url": url, "method": "GET", "status_authed": authed[0],
-                             "status_anon": status, "shared_token": token},
+                             "status_anon": status, "shared_token": token,
+                             "sensitivity_confirmed": False},
             }
     return None
 

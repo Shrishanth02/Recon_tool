@@ -9,6 +9,8 @@ token (no findings), malformed tokens, no-raw-token-in-evidence, API missing-aut
 import base64
 import json
 
+import pytest
+
 from app import crud
 from app.scanners import jwt_audit
 
@@ -120,6 +122,81 @@ def test_api_login_page_is_not_missing_auth(monkeypatch):
 
     monkeypatch.setattr(jwt_audit, "_http_get", fake)
     assert jwt_audit._check_api_auth("https://api.example.com/orders", {"Cookie": "s=1"}) is None
+
+
+# --------------------------------------------------------------------------- #
+# Public-endpoint false positive: anon seeing the SAME content is the signature
+# of a public resource, not missing auth (mirrors idor.py's anon_sees guard).
+# The FP fix DEMOTES the ambiguous case to a low signal (info => 0 risk weight)
+# rather than a validated/high finding — surfaced for a human, never inflating
+# risk, and never silently dropped.
+# --------------------------------------------------------------------------- #
+@pytest.mark.parametrize("path,body", [
+    ("/api/products", "catalog WIDGET1234567890 GADGET9876543210 price 9.99"),
+    ("/api/config", '{"theme": "SETTINGS1234567890", "locale": "en"}'),
+    ("/api/status", "ok BUILDHASH1234567890 uptime 1234 healthy true"),
+    ("/api/anything", "welcome PUBLICDATA1234567890 no personal info here"),
+    # A public page carrying an email must NOT promote to validated (bare email
+    # is too FP-prone) — it is a signal at most.
+    ("/api/contact", '{"support_note": "email us AAAAAAAAAAAA anytime"}'),
+])
+def test_api_public_endpoint_is_signal_not_validated(monkeypatch, path, body):
+    """A legitimately PUBLIC / sensitivity-unconfirmed endpoint must NOT be a
+    validated/high finding (that is the false positive). It is surfaced as a
+    low-severity signal that does not inflate risk."""
+    def fake(url, headers):
+        return (200, body)  # identical to authed and anon; not strongly sensitive
+
+    monkeypatch.setattr(jwt_audit, "_http_get", fake)
+    f = jwt_audit._check_api_auth(f"https://api.example.com{path}", {"Cookie": "s=1"})
+    assert f is not None
+    assert f["detection_tier"] == "signal"
+    assert f["severity"] == "info"                    # 0 risk weight -> no inflation
+    assert f["evidence"]["sensitivity_confirmed"] is False
+
+
+def test_api_protected_endpoint_denies_anon_no_finding(monkeypatch):
+    """A genuinely protected endpoint (anon denied) yields no finding at all."""
+    def fake(url, headers):
+        return (200, "private SHAREDDATA1234567890") if headers.get("Cookie") else (401, "unauthorized")
+
+    monkeypatch.setattr(jwt_audit, "_http_get", fake)
+    assert jwt_audit._check_api_auth("https://api.example.com/api/me", {"Cookie": "s=1"}) is None
+
+
+@pytest.mark.parametrize("path,body", [
+    # per-subject path (sensitive by URL) leaking to anon
+    ("/api/me", "profile SHAREDDATA1234567890 role admin"),
+    # unusual path, but the shared body carries a SECRET key -> real leak
+    ("/api/v1/integrations/1024", '{"webhook_secret": "whsec_SHAREDDATA1234567890"}'),
+    # config dumping a credential is NOT public -> real leak (client_secret is a
+    # sensitive key that, unlike "password", is not also a login-page hint)
+    ("/api/config", '{"client_secret": "SHAREDDATA1234567890"}'),
+])
+def test_api_sensitive_data_leak_is_validated(monkeypatch, path, body):
+    """EXISTING BEHAVIOR preserved (and false negatives recovered): a per-subject
+    or secret-bearing resource that returns the same data to an unauthenticated
+    request is still a validated missing-authentication finding."""
+    def fake(url, headers):
+        return (200, body)  # authed == anon, strongly sensitive content
+
+    monkeypatch.setattr(jwt_audit, "_http_get", fake)
+    f = jwt_audit._check_api_auth(f"https://api.example.com{path}", {"Cookie": "s=1"})
+    assert f and f["detection_tier"] == "validated" and f["severity"] == "high"
+    assert f["cwe"] == ["CWE-306"]
+    assert f["evidence"]["sensitivity_confirmed"] is True
+
+
+def test_api_unconfirmed_leak_is_signal_not_dropped(monkeypatch):
+    """No false NEGATIVE: an anon-readable endpoint whose vocabulary is unusual
+    and whose body has no obvious secret is still SURFACED (as a signal), never
+    silently dropped — so a real leak can't vanish."""
+    def fake(url, headers):
+        return (200, "internal DASHBOARD1234567890 revenue figures q3")
+
+    monkeypatch.setattr(jwt_audit, "_http_get", fake)
+    f = jwt_audit._check_api_auth("https://api.example.com/reports/q3", {"Cookie": "s=1"})
+    assert f is not None and f["detection_tier"] == "signal"
 
 
 # --------------------------------------------------------------------------- #
