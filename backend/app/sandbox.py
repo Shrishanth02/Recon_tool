@@ -63,6 +63,10 @@ _ALLOWED_ENV = frozenset({
     "USERPROFILE", "APPDATA", "LOCALAPPDATA", "PROGRAMFILES", "PROGRAMFILES(X86)",
     "PROGRAMDATA", "SYSTEMDRIVE", "HOMEDRIVE", "HOMEPATH", "COMPUTERNAME",
     "PROCESSOR_ARCHITECTURE", "PROCESSOR_ARCHITEW6432",
+    # Windows identity: getpass.getuser() (used by sqlmap and many tools) reads
+    # USERNAME on Windows; without it Python falls back to `import pwd` and
+    # crashes. Not a secret. (POSIX uses USER/LOGNAME above.)
+    "USERNAME", "USERDOMAIN",
 })
 
 

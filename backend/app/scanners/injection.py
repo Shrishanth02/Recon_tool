@@ -136,7 +136,13 @@ def _run_sqlmap(
         "--batch",             # never prompt — fully non-interactive
         "--level=2",
         "--risk=1",
-        "--smart",             # only probe params that look promising
+        # NB: deliberately NOT --smart. --smart runs only sqlmap's quick basic
+        # heuristic and SKIPS any parameter it doesn't immediately flag — which
+        # drops real error-free SQLi (boolean/UNION/time-based) whose payloads
+        # never emit a DB error (e.g. a string-interpolated LIKE clause). That is
+        # a false negative on the flagship capability, so every supplied
+        # parameter is tested for real. sqlmap still runs its own false-positive
+        # confirmation, so precision is unaffected.
         "--crawl=0",           # do NOT spider; test just this URL
         f"--timeout={_REQUEST_TIMEOUT}",
         "--retries=1",
@@ -154,6 +160,7 @@ def _run_sqlmap(
     current_param: Optional[dict] = None
     dbms: Optional[str] = None
     saw_injection = False
+    rc: int | None = None
 
     def _flush():
         if current_param is not None:
@@ -161,6 +168,7 @@ def _run_sqlmap(
 
     for ev in stream_command(cmd, cancel=cancel, max_seconds=_SQLMAP_MAX_SECONDS):
         if ev["type"] == "returncode":
+            rc = ev["data"]
             continue
         if ev["type"] != "log":
             yield ev
@@ -219,7 +227,17 @@ def _run_sqlmap(
         f["title"] = "SQL injection in parameter '%s' (%s)" % (f["param"], f["place"])
 
     if not findings and not saw_injection:
-        yield log("✔ sqlmap: no SQL injection confirmed on this URL.")
+        # Honesty: a non-zero exit means sqlmap CRASHED / was killed / never ran
+        # (e.g. missing runtime dep, unreachable target, timeout) — NOT that the
+        # URL is clean. Reporting a reassuring "no injection" checkmark there
+        # would be a false-clean: the capability was not actually exercised.
+        if rc not in (0, None):
+            yield log(
+                f"⚠ sqlmap did not complete (exit {rc}) — SQL injection was NOT "
+                f"tested on this URL (tool error/timeout, not a clean result)."
+            )
+        else:
+            yield log("✔ sqlmap: no SQL injection confirmed on this URL.")
     yield {"type": "_sqli", "data": findings}
 
 
@@ -266,8 +284,10 @@ def _run_dalfox(
         findings.append(entry)
         yield log(f"🚨 [XSS] {entry['type']} on param '{entry['param']}' -> {entry['url']}")
 
+    rc: int | None = None
     for ev in stream_command(cmd, cancel=cancel, max_seconds=_DALFOX_MAX_SECONDS):
         if ev["type"] == "returncode":
+            rc = ev["data"]
             continue
         if ev["type"] != "log":
             yield ev
@@ -313,7 +333,15 @@ def _run_dalfox(
             yield log(f"🚨 [XSS] {s}")
 
     if not findings:
-        yield log("✔ dalfox: no XSS confirmed on this URL.")
+        # Honesty (same rationale as sqlmap): a non-zero exit means dalfox did
+        # not actually complete the test — do not report a clean checkmark.
+        if rc not in (0, None):
+            yield log(
+                f"⚠ dalfox did not complete (exit {rc}) — XSS was NOT tested on "
+                f"this URL (tool error/timeout, not a clean result)."
+            )
+        else:
+            yield log("✔ dalfox: no XSS confirmed on this URL.")
     yield {"type": "_xss", "data": findings}
 
 
