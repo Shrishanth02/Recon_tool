@@ -236,8 +236,11 @@ worker thread and, on close, appends the terminal marker and sets a
 `sandbox.py` provides the seam for running scanner tools inside **ephemeral,
 hardened Docker containers** instead of directly on the host. When
 `SANDBOX_MODE="docker"`, `maybe_wrap()` wraps a scanner command in a
-`docker run` against `SCANNER_IMAGE` (built from `Dockerfile.worker`, which
-bundles `nmap`/`nuclei`/`httpx`/`ffuf`/`subfinder`) with hardening flags:
+`docker run` against `SCANNER_IMAGE` (default `reconx-scanner:latest`, built
+from `Dockerfile.worker` — which bundles `nmap`/`nuclei`/`httpx`/`ffuf`/
+`subfinder` and has no `ENTRYPOINT`, so `docker run <img> nmap …` runs the
+scanner directly; CI builds this image under the default tag) with hardening
+flags:
 
 - `--rm` — the container is destroyed the instant the tool exits.
 - `--network bridge` — outbound access for recon, but off the host netns.
@@ -247,9 +250,26 @@ bundles `nmap`/`nuclei`/`httpx`/`ffuf`/`subfinder`) with hardening flags:
 - `--cap-drop ALL` + `--security-opt no-new-privileges` — no Linux capabilities,
   no privilege escalation.
 
-At its `SANDBOX_MODE="none"` default `maybe_wrap()` is a no-op, preserving inline
-behavior. (A per-container egress allowlist is an operational TODO; the
-hardening flags and ephemerality are real today.)
+Scanners pass argv **scratch** files (nmap `-oX`, httpx `-l`, ffuf `-o`) created
+with `tempfile.mkstemp(prefix="reconx_…")` on the host and read them back after
+the run, and **static input** files by absolute path (ffuf `-w` → the SecLists
+wordlist). Because the container's `/tmp` is a private tmpfs and the image bundles
+only the app + tools (not SecLists), neither would be reachable inside the
+container. `build_docker_cmd()` therefore bridges both: each `reconx_` scratch
+file is bind-mounted **read-write** into `/reconx-io/`, and each absolute-path
+argv token that resolves to an existing host file is bind-mounted **read-only**
+into `/reconx-in/` (both dirs kept out of `/tmp` so the tmpfs never masks them),
+with the argv token rewritten to the in-container path. So an isolated scan reads
+its inputs and returns its outputs exactly as a host-mode scan does. Only those
+specific files are shared — targets are hostnames/URLs (never files) and the rest
+of the host FS is not exposed.
+
+Only container mode (`SANDBOX_MODE="docker"` with Docker available) actually
+wraps; the `process` default and `none` leave the argv unwrapped (`process`
+still applies the sanitized-env/scratch-cwd/CPU-rlimit `popen_hardening`). When a
+mode *requires* isolation it cannot provide, `stream_command` refuses (returncode
+`126`) rather than silently running unisolated. (A per-container egress allowlist
+is an operational TODO; the hardening flags and ephemerality are real today.)
 
 ### 7.4 SSRF netguard
 

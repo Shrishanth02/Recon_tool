@@ -27,6 +27,7 @@ import os
 import shutil
 import signal
 import subprocess
+import tempfile
 
 from .config import settings
 
@@ -181,23 +182,107 @@ def terminate_process_tree(proc) -> None:
 
 
 # --- Container wrapping (CONTAINER isolation; requires Docker) --------------- #
+# The scanners create their argv scratch files with ``tempfile.mkstemp`` in the
+# system temp dir under a shared ``reconx_`` prefix (nmap ``-oX`` output, httpx
+# ``-l`` input list, ffuf ``-o`` output). These are HOST paths baked into the
+# argv, then read back on the host after the run. Under ``--read-only --tmpfs
+# /tmp`` the container's ``/tmp`` is a fresh ephemeral tmpfs, so an input file the
+# host wrote is invisible inside the container and an output file the tool writes
+# never reaches the host — the isolated scan silently returns nothing. We bridge
+# each such file with a per-file bind mount into a dedicated container directory
+# (kept out of ``/tmp`` so the tmpfs never masks it) and rewrite that argv token
+# to the in-container path.
+#
+# Scanners also pass STATIC input files by absolute host path — notably ffuf's
+# wordlist (``-w`` -> config.WORDLIST, e.g. the SecLists ``common.txt``). Those
+# are not ``reconx_`` scratch and are NOT baked into the scanner image, so under a
+# ``--read-only`` container the tool cannot open them and (for ffuf) silently
+# returns nothing. Any absolute-path argv token that resolves to an existing
+# regular file on the host is therefore bind-mounted READ-ONLY into a separate
+# directory and its argv token rewritten, so an isolated scan reads its inputs
+# just as a host-mode scan does. (Targets are hostnames/URLs, not files, so they
+# never match; only real input files we deliberately pass do.)
+IO_MOUNT_DIR = "/reconx-io"    # scanner scratch (rw): outputs + app-written inputs
+IN_MOUNT_DIR = "/reconx-in"    # static inputs (ro): wordlists, etc.
+
+
+def _is_scanner_scratch(token: str) -> bool:
+    """True when ``token`` is a scanner-created scratch file we must bind-mount.
+
+    Precisely: an absolute path that lives directly in the system temp dir and
+    whose name carries the scanners' shared ``reconx_`` prefix. The prefix keeps
+    this from ever matching an unrelated argv token (e.g. a target that happens to
+    look like a path), and ``realpath`` on both sides makes it robust to a temp
+    dir that is itself a symlink (``/tmp`` -> ``/private/tmp``). The file need not
+    exist yet — ``realpath`` resolves the parent regardless — but for these
+    scanners ``mkstemp`` has already created it.
+    """
+    if not isinstance(token, str) or not os.path.isabs(token):
+        return False
+    parent = os.path.dirname(os.path.realpath(token))
+    tmp = os.path.realpath(tempfile.gettempdir())
+    return parent == tmp and os.path.basename(token).startswith("reconx_")
+
+
 def build_docker_cmd(inner_cmd: list[str], allow_hosts: list[str] | None = None) -> list[str]:
     """Wrap ``inner_cmd`` in a hardened, ephemeral ``docker run`` invocation.
 
     ``inner_cmd`` is the scanner command as it would run on the host; the result
-    is the full ``docker run ...`` argv. ``allow_hosts`` is reserved for a future
-    egress-allowlist (an operational network-policy concern, intentionally
+    is the full ``docker run ...`` argv. Scanner scratch files (see
+    :func:`_is_scanner_scratch`) are bind-mounted read-write and static input
+    files (absolute paths to existing regular files, e.g. the ffuf wordlist) are
+    bind-mounted read-only; in both cases the argv token is rewritten to the
+    in-container path, so an isolated scan reads its inputs and hands its outputs
+    back exactly as the host-mode scan does. ``allow_hosts`` is reserved for a
+    future egress-allowlist (an operational network-policy concern, intentionally
     deferred). The hardening flags and ephemerality below are real.
     """
     _ = allow_hosts
+    mounts: list[str] = []
+    argv: list[str] = []
+    mapped: dict[str, str] = {}
+    used: dict[str, set[str]] = {}
+
+    def _container_path(host_path: str, mount_dir: str) -> str:
+        # Give the file a stable, collision-free name inside ``mount_dir`` (two
+        # distinct host files sharing a basename would otherwise clobber).
+        claimed = used.setdefault(mount_dir, set())
+        base = os.path.basename(host_path)
+        name, i = base, 1
+        while name in claimed:
+            name, i = f"{i}_{base}", i + 1
+        claimed.add(name)
+        return f"{mount_dir}/{name}"
+
+    for token in inner_cmd:
+        if _is_scanner_scratch(token):
+            container_path = mapped.get(token)
+            if container_path is None:
+                container_path = _container_path(token, IO_MOUNT_DIR)
+                mapped[token] = container_path
+                # rw bind of the single file: the host tmpfile (created empty by
+                # mkstemp) is shared, nothing else from the host temp dir is.
+                mounts += ["-v", f"{token}:{container_path}"]
+            argv.append(container_path)
+        elif os.path.isabs(token) and os.path.isfile(token):
+            container_path = mapped.get(token)
+            if container_path is None:
+                container_path = _container_path(token, IN_MOUNT_DIR)
+                mapped[token] = container_path
+                # ro bind: a static input (wordlist, etc.) the tool only reads.
+                mounts += ["-v", f"{token}:{container_path}:ro"]
+            argv.append(container_path)
+        else:
+            argv.append(token)
     return [
         "docker", "run", "--rm",
         "--network", SANDBOX_NETWORK_MODE,
         "--memory", "512m", "--cpus", "1", "--pids-limit", "256",
         "--read-only", "--tmpfs", "/tmp",
         "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
+        *mounts,
         settings.SCANNER_IMAGE,
-        *inner_cmd,
+        *argv,
     ]
 
 

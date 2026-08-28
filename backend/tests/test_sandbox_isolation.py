@@ -16,6 +16,7 @@ is PENDING DOCKER.
 import os
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -108,6 +109,144 @@ def test_maybe_wrap_container_unavailable_does_not_wrap(monkeypatch):
     monkeypatch.setattr(sandbox.settings, "SANDBOX_MODE", "docker")
     monkeypatch.setattr(sandbox, "docker_available", lambda: False)
     assert sandbox.maybe_wrap(["nmap", "x"]) == ["nmap", "x"]  # can't wrap w/o docker
+
+
+# --------------------------------------------------------------------------- #
+# Container argv: image selection + scratch-file bind-mounting (P0)
+#
+# The scanners bake HOST tmpfile paths into their argv (nmap -oX, httpx -l, ffuf
+# -o) and read them back on the host. Under --read-only --tmpfs /tmp those paths
+# don't bridge into the container, so an isolated scan silently returns nothing.
+# build_docker_cmd must bind-mount each such file and rewrite its argv token to
+# the in-container path — while leaving everything else exactly as host mode.
+# --------------------------------------------------------------------------- #
+def _inner_argv(cmd: list[str]) -> list[str]:
+    """The tokens AFTER the image — i.e. what actually runs inside the container."""
+    return cmd[cmd.index(sandbox.settings.SCANNER_IMAGE) + 1:]
+
+
+def test_build_docker_cmd_selects_scanner_image_with_hardening(monkeypatch):
+    monkeypatch.setattr(sandbox.settings, "SCANNER_IMAGE", "reconx-scanner:latest")
+    cmd = sandbox.build_docker_cmd(["nmap", "-sV", "example.com"])
+    assert cmd[:3] == ["docker", "run", "--rm"]
+    assert "reconx-scanner:latest" in cmd
+    # No scratch file here → no bind mounts, argv passes through verbatim.
+    assert "-v" not in cmd
+    assert _inner_argv(cmd) == ["nmap", "-sV", "example.com"]
+    for flag in ("--read-only", "--tmpfs", "--cap-drop", "no-new-privileges",
+                 "--pids-limit", "--memory", "--cpus"):
+        assert flag in cmd, f"hardening flag {flag} missing"
+
+
+def test_build_docker_cmd_bindmounts_scratch_and_rewrites_argv():
+    """nmap-style output file: host tmpfile is bind-mounted and the argv token is
+    rewritten to the in-container path (the host path never reaches the tool)."""
+    fd, xml = tempfile.mkstemp(suffix=".xml", prefix="reconx_nmap_")
+    os.close(fd)
+    try:
+        cmd = sandbox.build_docker_cmd(["nmap", "-oX", xml, "example.com"])
+        cpath = f"{sandbox.IO_MOUNT_DIR}/{os.path.basename(xml)}"
+        # the file is bind-mounted host<->container...
+        assert "-v" in cmd
+        assert f"{xml}:{cpath}" in cmd
+        # ...the mount target is OUT of /tmp so the tmpfs cannot mask it...
+        assert cpath.startswith("/reconx-io/")
+        # ...and the containerized tool sees the CONTAINER path, never the host one.
+        inner = _inner_argv(cmd)
+        assert inner == ["nmap", "-oX", cpath, "example.com"]
+        assert xml not in inner
+    finally:
+        os.remove(xml)
+
+
+def test_build_docker_cmd_bridges_input_list_file():
+    """httpx-style input list: the host writes it, the container must READ it."""
+    fd, lst = tempfile.mkstemp(suffix=".txt", prefix="reconx_httpx_")
+    os.close(fd)
+    try:
+        cmd = sandbox.build_docker_cmd(["httpx", "-l", lst, "-json"])
+        cpath = f"{sandbox.IO_MOUNT_DIR}/{os.path.basename(lst)}"
+        assert f"{lst}:{cpath}" in cmd
+        assert _inner_argv(cmd) == ["httpx", "-l", cpath, "-json"]
+    finally:
+        os.remove(lst)
+
+
+def test_build_docker_cmd_readonly_mounts_static_input_file(tmp_path):
+    """ffuf-style static input (the wordlist): an absolute path to an EXISTING
+    host file that is NOT reconx_ scratch is bind-mounted READ-ONLY and rewritten,
+    so the tool can open it inside the --read-only container (previously it could
+    not — its SecLists path was neither bridged nor baked into the image)."""
+    wl = tmp_path / "common.txt"
+    wl.write_text("admin\nlogin\n", encoding="utf-8")
+    fd, out = tempfile.mkstemp(suffix=".json", prefix="reconx_ffuf_")
+    os.close(fd)
+    try:
+        cmd = sandbox.build_docker_cmd(
+            ["ffuf", "-u", "https://t/FUZZ", "-w", str(wl), "-of", "json", "-o", out]
+        )
+        wl_cpath = f"{sandbox.IN_MOUNT_DIR}/common.txt"
+        out_cpath = f"{sandbox.IO_MOUNT_DIR}/{os.path.basename(out)}"
+        # wordlist bridged READ-ONLY (:ro), output bridged read-write.
+        assert f"{wl}:{wl_cpath}:ro" in cmd
+        assert f"{out}:{out_cpath}" in cmd
+        # both argv tokens rewritten to their in-container paths; host paths gone.
+        inner = _inner_argv(cmd)
+        assert inner == ["ffuf", "-u", "https://t/FUZZ", "-w", wl_cpath,
+                         "-of", "json", "-o", out_cpath]
+        assert str(wl) not in inner and out not in inner
+    finally:
+        os.remove(out)
+
+
+def test_build_docker_cmd_nonexistent_and_non_file_tokens_passthrough(tmp_path):
+    """A non-existent absolute path, a URL, and plain values are not mounted —
+    only real input files we deliberately pass are."""
+    missing = str(tmp_path / "does_not_exist.txt")
+    cmd = sandbox.build_docker_cmd(
+        ["ffuf", "-w", missing, "-u", "https://t/FUZZ", "-fs", "0"]
+    )
+    assert "-v" not in cmd
+    assert _inner_argv(cmd) == ["ffuf", "-w", missing, "-u", "https://t/FUZZ", "-fs", "0"]
+
+
+def test_build_docker_cmd_dedupes_repeated_scratch_mounts():
+    fd, p = tempfile.mkstemp(suffix=".json", prefix="reconx_ffuf_")
+    os.close(fd)
+    try:
+        cmd = sandbox.build_docker_cmd(["ffuf", "-o", p, "-debug-log", p])
+        cpath = f"{sandbox.IO_MOUNT_DIR}/{os.path.basename(p)}"
+        assert cmd.count("-v") == 1                       # one mount for the file...
+        assert cmd.count(f"{p}:{cpath}") == 1
+        assert _inner_argv(cmd) == ["ffuf", "-o", cpath, "-debug-log", cpath]
+    finally:
+        os.remove(p)
+
+
+def test_is_scanner_scratch_precise_matching():
+    td = tempfile.gettempdir()
+    assert sandbox._is_scanner_scratch(os.path.join(td, "reconx_nmap_abc.xml"))
+    assert not sandbox._is_scanner_scratch(os.path.join(td, "other_abc.xml"))   # wrong prefix
+    assert not sandbox._is_scanner_scratch(os.path.join(td, "sub", "reconx_x"))  # not directly in tempdir
+    assert not sandbox._is_scanner_scratch("reconx_x")                           # relative
+    assert not sandbox._is_scanner_scratch(None)                                 # non-string
+
+
+def test_maybe_wrap_container_mode_bindmounts_scratch(monkeypatch):
+    """End-to-end through maybe_wrap: docker mode + a scratch argv → wrapped with
+    the scanner image AND the scratch file bridged/rewritten."""
+    monkeypatch.setattr(sandbox.settings, "SANDBOX_MODE", "docker")
+    monkeypatch.setattr(sandbox, "docker_available", lambda: True)
+    fd, xml = tempfile.mkstemp(suffix=".xml", prefix="reconx_nmap_")
+    os.close(fd)
+    try:
+        wrapped = sandbox.maybe_wrap(["nmap", "-oX", xml, "t"])
+        assert wrapped[0] == "docker"
+        cpath = f"{sandbox.IO_MOUNT_DIR}/{os.path.basename(xml)}"
+        assert f"{xml}:{cpath}" in wrapped
+        assert xml not in _inner_argv(wrapped)   # host path never runs in the container
+    finally:
+        os.remove(xml)
 
 
 def test_popen_hardening_posix_has_rlimit_and_new_session(monkeypatch):

@@ -60,3 +60,27 @@ def test_installer_reaches_the_build_context():
     di = _read(BACKEND / ".dockerignore")
     assert "*.sh" not in di, ".dockerignore must not exclude shell scripts"
     assert "install-scanners.sh" not in di
+
+
+def test_ci_builds_scanner_image_under_configured_default_tag():
+    """The advertised Docker-isolation mode runs ``SCANNER_IMAGE``; CI must build it.
+
+    The scanner image is the worker toolchain image — ``Dockerfile.worker`` carries
+    the scanners and has no ``ENTRYPOINT``, so ``docker run <img> nmap ...`` runs the
+    scanner directly. CI builds it under the exact tag the app defaults to, so the
+    isolation mode always has an image to run (previously nothing built that tag).
+    """
+    from app.config import settings
+
+    assert settings.SCANNER_IMAGE == "reconx-scanner:latest"
+    ci = _read(REPO / ".github" / "workflows" / "ci.yml")
+    assert ci, "ci.yml missing"
+    assert (
+        "docker build -t reconx-scanner:latest -f ./backend/Dockerfile.worker ./backend"
+        in ci
+    ), "CI must build the scanner image under the configured default tag"
+    # An ENTRYPOINT would swallow the scanner argv instead of running it as the cmd.
+    dw = _read(BACKEND / "Dockerfile.worker")
+    assert not any(
+        line.strip().startswith("ENTRYPOINT") for line in dw.splitlines()
+    ), "Dockerfile.worker must have no ENTRYPOINT so the scanner argv runs directly"

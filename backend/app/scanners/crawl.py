@@ -450,6 +450,22 @@ def _run_arjun(endpoints: List[str], cancel: Optional[threading.Event],
     if not endpoints:
         yield log("arjun: no suitable param-less endpoints to probe.")
         return
+    # Fail-closed isolation gate. arjun runs via a direct subprocess.run (it is not
+    # routed through base.stream_command), so unlike every other scanner it would
+    # otherwise execute on the HOST even under container isolation — a silent
+    # non-isolated path. It is not container-wrapped yet, so when the active policy
+    # is CONTAINER (everything else is isolated) or UNAVAILABLE (isolation required
+    # but absent → other scanners refuse), we SKIP this optional hidden-parameter
+    # pass rather than run it unisolated. NONE/PROCESS behaviour is unchanged.
+    iso_mode, iso_note = sandbox.effective_isolation()
+    if iso_mode in (sandbox.ISOLATION_CONTAINER, sandbox.ISOLATION_UNAVAILABLE):
+        yield log(
+            f"arjun: skipped — hidden-parameter discovery is not container-isolated "
+            f"yet and the active isolation policy ({iso_mode}"
+            + (f"; {iso_note}" if iso_note else "")
+            + ") forbids host execution."
+        )
+        return
     yield log(f"arjun: probing {len(endpoints)} endpoint(s) for hidden parameters ...")
     for ep in endpoints:
         if _cancelled(cancel):

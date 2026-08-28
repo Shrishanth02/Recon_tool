@@ -171,6 +171,13 @@ jobs:
         run: docker build -t reconx-backend:ci ./backend
       - name: Build worker image
         run: docker build -t reconx-worker:ci -f ./backend/Dockerfile.worker ./backend
+      # The Docker-isolation scanner image (RECONX_SCANNER_IMAGE, default
+      # reconx-scanner:latest) is the worker toolchain image: Dockerfile.worker
+      # carries nmap/httpx/ffuf and has no ENTRYPOINT, so `docker run <img> nmap
+      # ...` runs the scanner directly. Building it under the configured default
+      # tag proves the advertised isolation mode has an image to run.
+      - name: Build scanner image
+        run: docker build -t reconx-scanner:latest -f ./backend/Dockerfile.worker ./backend
       - name: Build frontend image
         run: docker build -t reconx-frontend:ci ./frontend
       # Static validation of the production compose (no containers started). Dummy

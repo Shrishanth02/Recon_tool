@@ -89,3 +89,57 @@ def test_crawl_forms_are_bounded(monkeypatch):
     _patch(monkeypatch, many)
     data = _result()
     assert len(data["forms"]) == crawl.FORM_CAP
+
+
+# --------------------------------------------------------------------------- #
+# arjun fail-closed isolation gate
+#
+# arjun runs via a direct subprocess.run (not base.stream_command), so it is the
+# one scanner that would otherwise execute on the HOST even under container
+# isolation. It is not container-wrapped yet, so it must SKIP (never run
+# unisolated) when the active policy is CONTAINER or UNAVAILABLE, and run only
+# under NONE/PROCESS.
+# --------------------------------------------------------------------------- #
+def test_arjun_fail_closed_under_container_and_unavailable(monkeypatch):
+    from app import sandbox
+
+    monkeypatch.setattr(crawl, "_which", lambda name: "/usr/bin/arjun")
+    calls = []
+
+    def spy_run(*a, **k):
+        calls.append(a)
+        raise AssertionError("arjun executed on the host despite the isolation policy")
+
+    monkeypatch.setattr(crawl.subprocess, "run", spy_run)
+
+    for mode in (sandbox.ISOLATION_CONTAINER, sandbox.ISOLATION_UNAVAILABLE):
+        calls.clear()
+        monkeypatch.setattr(
+            sandbox, "effective_isolation", lambda m=mode: (m, "docker unavailable")
+        )
+        events = list(crawl._run_arjun(["http://t/x"], None, set()))
+        assert not calls, f"arjun ran on the host under {mode}"
+        assert any("skipped" in str(e.get("data", "")).lower() for e in events), mode
+
+
+def test_arjun_runs_under_process_isolation(monkeypatch):
+    from app import sandbox
+
+    monkeypatch.setattr(crawl, "_which", lambda name: "/usr/bin/arjun")
+    calls = []
+
+    class _CP:
+        returncode = 0
+
+    def spy_run(cmd, *a, **k):
+        calls.append(cmd)
+        return _CP()
+
+    monkeypatch.setattr(crawl.subprocess, "run", spy_run)
+    monkeypatch.setattr(
+        sandbox, "effective_isolation", lambda: (sandbox.ISOLATION_PROCESS, "")
+    )
+    list(crawl._run_arjun(["http://t/x"], None, set()))
+    assert calls, "arjun did not run under process isolation"
+    # It runs the arjun binary directly on the host (NOT a docker wrapper).
+    assert calls[0][0] == "/usr/bin/arjun"
