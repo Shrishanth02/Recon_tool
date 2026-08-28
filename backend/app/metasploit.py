@@ -29,6 +29,7 @@ import re
 import time
 from typing import Any
 
+from . import netguard
 from .config import settings
 
 _SCHEME = re.compile(r"^[a-z]+://", re.I)
@@ -127,7 +128,7 @@ def run_exploit(target: str, *, cve: str | None = None, name: str | None = None,
     module is found or the daemon is unreachable, ``available``/``module`` reflect
     that and the caller falls back to the safe probe.
     """
-    host, port = _host_port(target)
+    _host, port = _host_port(target)  # host is re-derived + vetted below (rhost)
     mode = mode if mode in ("check", "exploit") else _mode()
     result: dict[str, Any] = {
         "engine": "metasploit",
@@ -140,6 +141,21 @@ def run_exploit(target: str, *, cve: str | None = None, name: str | None = None,
         "target": target,
         "non_destructive": mode == "check",
     }
+
+    # --- SSRF/rebinding gate for the OUT-OF-PROCESS resolver. ---------------- #
+    # msfrpcd re-resolves ``RHOSTS`` in its OWN process when the module fires, so
+    # the in-process getaddrinfo pin safe_http uses cannot reach it. Handing it a
+    # hostname would reopen a DNS-rebinding window: a low-TTL record that passed
+    # the router's validate at approval time could answer a private/metadata IP
+    # by the time the module executes. Resolve + vet ONCE here and hand Metasploit
+    # a vetted literal IP (never the hostname); refuse outright if it doesn't pass
+    # — mirroring the safe probe, which dials vips[0] directly for the same reason.
+    ok, why, vips = netguard.resolve_and_validate(target)
+    if not ok or not vips:
+        result["output"] = f"target refused by egress guard (netguard): {why}"
+        return result
+    rhost = vips[0]
+
     try:
         client = _client()
         _ = client.core.version
@@ -157,7 +173,8 @@ def run_exploit(target: str, *, cve: str | None = None, name: str | None = None,
     try:
         mtype, _, mpath = module_name.partition("/")
         mod = client.modules.use(mtype, mpath)
-        mod["RHOSTS"] = host
+        # Vetted literal IP, never the hostname — see the netguard gate above.
+        mod["RHOSTS"] = rhost
         if port:
             try:
                 mod["RPORT"] = port
