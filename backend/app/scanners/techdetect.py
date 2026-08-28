@@ -18,8 +18,12 @@ def stream(target: str, cancel: Optional[threading.Event] = None, **_) -> Iterat
 
     yield log(f"Requesting {url} ...")
     try:
+        # GET (not HEAD) so we capture the body ONCE through the netguard-pinned,
+        # redirect-guarded safe client, then hand that already-vetted HTML to
+        # builtwith below — builtwith must never do its OWN urllib fetch (see the
+        # _fingerprint note).
         response = safe_http.safe_request(
-            "HEAD",
+            "GET",
             url,
             headers={"User-Agent": "Mozilla/5.0 (RECON-X)"},
             timeout=15,
@@ -35,15 +39,21 @@ def stream(target: str, cancel: Optional[threading.Event] = None, **_) -> Iterat
         yield log(f"{key}: {value}")
 
     yield log("Fingerprinting technology stack ...")
-    # builtwith fetches the page with urllib and has NO timeout of its own, so a
-    # slow/unresponsive page would hang the scan forever. Run it in a worker
-    # thread and give up after a bound — the HTTP-header result is still returned.
+    # SSRF/rebinding: builtwith(url) would do its OWN urllib fetch — with its own
+    # DNS resolution and redirect-following, on a worker thread where the safe_http
+    # DNS pin (thread-local) does NOT apply — so it could reach a private/metadata
+    # IP that netguard already vetted the safe GET away from. Feed it the HTML we
+    # ALREADY fetched safely instead, so it parses that and never touches the
+    # network. (A bounded worker thread is kept as belt-and-suspenders for a
+    # pathological parse.)
+    _safe_html = response.text or ""
+    _safe_headers = dict(response.headers)
     tech = {}
     box: dict = {}
 
     def _fingerprint():
         try:
-            box["tech"] = builtwith(url)
+            box["tech"] = builtwith(url, headers=_safe_headers, html=_safe_html)
         except Exception as exc:  # noqa: BLE001 - builtwith can raise broadly
             box["error"] = str(exc)
 
