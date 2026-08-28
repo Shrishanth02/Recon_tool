@@ -127,6 +127,12 @@ _SENSITIVE_PROBES = [
     ("/actuator", "debug", [r'(?i)"_links"\s*:', r'(?i)"(?:health|metrics|env|beans)"\s*:'],
      "medium", "CWE-200"),
     ("/actuator/env", "debug", [r'(?i)"activeProfiles"', r'(?i)"propertySources"'], "high", "CWE-200"),
+    # Werkzeug/Flask interactive debugger left enabled in production (debug=True).
+    # Its console is a potential REMOTE CODE EXECUTION surface, not mere info
+    # disclosure — hence high + CWE-489 (Active Debug Code). ``__debugger__`` is a
+    # Werkzeug-specific marker; the title/console strings corroborate.
+    ("/console", "debug", [r"__debugger__", r"(?i)werkzeug\s+debugger",
+                           r"(?i)interactive\s+console"], "high", "CWE-489"),
     # --- API documentation, CWE-200 ---
     ("/swagger.json", "apidoc", [r'"swagger"\s*:\s*"', r'"openapi"\s*:\s*"'], "low", "CWE-200"),
     ("/openapi.json", "apidoc", [r'"openapi"\s*:\s*"', r'"swagger"\s*:\s*"'], "low", "CWE-200"),

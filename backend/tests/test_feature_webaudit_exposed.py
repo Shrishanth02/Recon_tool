@@ -94,6 +94,27 @@ def test_phpinfo_debug_endpoint_exposed(monkeypatch):
     assert len(hit) == 1 and hit[0]["name"].startswith("Exposed debug endpoint")
 
 
+def test_werkzeug_debug_console_exposed(monkeypatch):
+    # Flask/Werkzeug interactive debugger left enabled (debug=True) is a real RCE
+    # surface — must be a HIGH debug exposure, not just an info "discovered path".
+    # (Empirically found under-detected during VulnShop validation.)
+    f = _probe(monkeypatch, {"/console": Resp(200, "text/html",
+        "<html><head><title>Werkzeug Debugger</title></head><body>"
+        "<div id='__debugger__'>Interactive Console</div></body></html>")})
+    hit = _at(f, "/console")
+    assert len(hit) == 1
+    assert hit[0]["severity"] == "high" and hit[0]["cwe"] == "CWE-489"
+    assert hit[0]["name"].startswith("Exposed debug endpoint")
+
+
+def test_benign_console_page_not_flagged(monkeypatch):
+    # A normal app page living at /console (no Werkzeug markers) is NOT a debugger
+    # — it must not be reported (no false positive).
+    f = _probe(monkeypatch, {"/console": Resp(200, "text/html",
+        "<html><body><h1>Gaming Console Store</h1><p>Buy consoles here.</p></body></html>")})
+    assert _at(f, "/console") == []
+
+
 def test_swagger_apidoc_exposed(monkeypatch):
     f = _probe(monkeypatch, {"/swagger.json": Resp(200, "application/json",
         '{"swagger":"2.0","info":{"title":"x"},"paths":{"/a":{}}}')})
