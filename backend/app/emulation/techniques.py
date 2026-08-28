@@ -196,19 +196,25 @@ def _e4_network_discovery(base_url: str, ctx: dict[str, Any]) -> dict[str, str]:
     """TCP-connect probe of a few common ports; record the open set.
 
     Emulates a lightweight port sweep using :func:`socket.socket.connect_ex` —
-    each socket is opened and immediately closed with no data sent. The host is
-    taken from ``ctx["host"]`` (already scope/netguard validated by the router).
+    each socket is opened and immediately closed with no data sent. It dials the
+    VETTED IP (``ctx["vips"]``, from run_emulation's one-time
+    netguard.resolve_and_validate) rather than the hostname: a connect_ex on a
+    hostname resolves at the C level, bypassing the safe_http getaddrinfo pin, so
+    dialing the validated IP is what actually closes the DNS-rebinding window.
     """
     host = ctx.get("host") or ""
-    if not host:
-        return _result("skipped", "", "no host to probe")
+    vips = ctx.get("vips") or []
+    if not host or not vips:
+        return _result("skipped", "", "no vetted address to probe")
+    ip = vips[0]
+    fam = socket.AF_INET6 if ":" in ip else socket.AF_INET
 
     open_ports: list[int] = []
     for port in COMMON_PORTS:
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock = socket.socket(fam, socket.SOCK_STREAM)
         sock.settimeout(2.0)
         try:
-            if sock.connect_ex((host, port)) == 0:
+            if sock.connect_ex((ip, port)) == 0:
                 open_ports.append(port)
         except OSError:
             pass

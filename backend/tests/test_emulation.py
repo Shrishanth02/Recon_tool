@@ -12,8 +12,13 @@ import socket as real_socket
 import pytest
 import requests as real_requests
 
-from app import emulation
+from app import emulation, netguard
 from app.emulation import techniques as tq
+
+#: A stand-in public IP the emulation SSRF gate resolves the test target to, so
+#: the (now-mandatory) netguard.resolve_and_validate step passes hermetically and
+#: E4 has a vetted address to dial. No real DNS is performed.
+_VETTED_IP = "93.184.216.34"
 
 
 # --------------------------------------------------------------------------- #
@@ -98,9 +103,14 @@ class FakeSocketModule:
 
 
 def _patch_transport(monkeypatch, requests_fake, socket_fake):
-    """Redirect the technique module's HTTP + TCP transports to the fakes."""
+    """Redirect the technique module's HTTP + TCP transports to the fakes, and
+    stub the emulation SSRF gate to a vetted public IP so run_emulation proceeds
+    hermetically (no real DNS). A test can re-stub resolve_and_validate afterward
+    to exercise the refusal path."""
     monkeypatch.setattr(tq, "requests", requests_fake)
     monkeypatch.setattr(tq, "socket", socket_fake)
+    monkeypatch.setattr(netguard, "resolve_and_validate",
+                        lambda host: (True, "ok", [_VETTED_IP]))
 
 
 # --------------------------------------------------------------------------- #
@@ -392,3 +402,99 @@ def test_get_emulation_hidden_from_non_member(client, auth, make_user, safe_tran
         f"/workspaces/{auth['ws_id']}/emulations", headers=outsider["headers"]
     )
     assert listing.status_code == 404, listing.text
+
+
+# --------------------------------------------------------------------------- #
+# SSRF/rebinding gate (P0): run_emulation is the single chokepoint — a target
+# that fails netguard is refused (no technique makes a call), every requests
+# technique runs pinned, and the raw-socket technique (E4) dials the VETTED IP.
+# --------------------------------------------------------------------------- #
+class _RecordingSocket:
+    def __init__(self, connect_result=1):
+        self.connect_result = connect_result
+
+    def settimeout(self, _t):
+        pass
+
+    def connect_ex(self, addr):
+        self.dialed_addr = addr
+        return self.connect_result
+
+    def close(self):
+        pass
+
+
+class _RecordingSocketModule:
+    AF_INET = real_socket.AF_INET
+    AF_INET6 = real_socket.AF_INET6
+    SOCK_STREAM = real_socket.SOCK_STREAM
+
+    def __init__(self, connect_result=1):
+        self.connect_result = connect_result
+        self.dialed = []
+
+    def socket(self, *_a, **_k):
+        s = _RecordingSocket(self.connect_result)
+        self.dialed_holder = s
+        # record addresses as connect_ex is called
+        orig = s.connect_ex
+
+        def _ce(addr):
+            self.dialed.append(addr)
+            return orig(addr)
+
+        s.connect_ex = _ce
+        return s
+
+
+def test_run_emulation_refuses_egress_blocked_target(monkeypatch):
+    """A target netguard refuses (private/loopback/link-local) is not probed at
+    all: every technique is 'blocked' and NOTHING leaves the box."""
+    reqs = RecordingRequests(status_code=200)
+    sock = FakeSocketModule(connect_result=1)
+    _patch_transport(monkeypatch, reqs, sock)
+    monkeypatch.setattr(netguard, "resolve_and_validate",
+                        lambda host: (False, "loopback/private address", []))
+
+    out = emulation.run_emulation("http://169.254.169.254/", ["E1", "E4"])
+    assert out["executed"] == 0 and out["blocked"] == 2
+    assert all(r["status"] == "blocked" for r in out["results"])
+    assert reqs.calls == []          # no HTTP request was issued
+    assert sock.created == []        # no socket was opened
+
+
+def test_run_emulation_allowed_public_target_still_runs(monkeypatch):
+    """A legitimate public target still runs every technique (behaviour intact)."""
+    reqs = RecordingRequests(status_code=200)
+    sock = FakeSocketModule(connect_result=1)
+    _patch_transport(monkeypatch, reqs, sock)   # stubs resolve_and_validate -> allowed
+
+    out = emulation.run_emulation("http://example.com", ["E1"])
+    assert out["executed"] == 1 and out["blocked"] == 0
+
+
+def test_e4_dials_vetted_ip_not_hostname(monkeypatch):
+    """The raw-socket sweep must connect to the VETTED IP, never the hostname —
+    connect_ex on a hostname resolves at the C level and bypasses the pin."""
+    reqs = RecordingRequests()
+    rec = _RecordingSocketModule(connect_result=1)
+    _patch_transport(monkeypatch, reqs, rec)
+    monkeypatch.setattr(netguard, "resolve_and_validate",
+                        lambda host: (True, "ok", ["93.184.216.34"]))
+
+    emulation.run_emulation("http://example.com", ["E4"])
+    assert rec.dialed
+    assert all(addr[0] == "93.184.216.34" for addr in rec.dialed)   # vetted IP
+    assert all(addr[0] != "example.com" for addr in rec.dialed)
+
+
+def test_emulation_requests_forbid_redirects(monkeypatch):
+    """Every requests-based technique disables redirect following (no redirect
+    SSRF), and the run is pinned to the vetted IP for the duration."""
+    reqs = RecordingRequests(status_code=200)
+    sock = FakeSocketModule(connect_result=1)
+    _patch_transport(monkeypatch, reqs, sock)
+
+    emulation.run_emulation("http://example.com", ["E1", "E2", "E3", "E5"])
+    assert reqs.calls
+    assert all(c["kwargs"].get("allow_redirects") is False for c in reqs.calls)

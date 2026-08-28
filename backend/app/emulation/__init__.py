@@ -18,6 +18,7 @@ from __future__ import annotations
 
 from typing import Any, Callable, Iterable
 
+from .. import netguard, safe_http
 from .techniques import (
     TECHNIQUES,
     TECHNIQUES_BY_ID,
@@ -75,11 +76,34 @@ def run_emulation(
     """
     base_url = normalize_base_url(target)
     host = host_from_base_url(base_url)
-    ctx: dict[str, Any] = {"target": target, "base_url": base_url, "host": host}
+    # SSRF/rebinding gate. run_emulation is the SINGLE chokepoint every caller
+    # funnels through (the exploit probe, the purple engine, the standalone
+    # router), so resolving+vetting the host ONCE here and pinning every
+    # technique's outbound connection to those IPs guards them all. A target that
+    # fails is refused outright — no technique makes a network call. The vetted
+    # IPs are carried in ctx so the raw-socket technique (E4) can dial an IP
+    # directly (a connect_ex on a hostname resolves at the C level and bypasses
+    # the getaddrinfo pin).
+    ok, why, vips = netguard.resolve_and_validate(host) if host else (False, "no host", [])
+    ctx: dict[str, Any] = {"target": target, "base_url": base_url, "host": host,
+                           "vips": vips}
 
     selected = _select_techniques(technique_ids)
     results: list[dict[str, Any]] = []
     executed = blocked = failed = 0
+
+    if host and not ok:
+        for tech in selected:
+            results.append({
+                "id": tech["id"], "technique_id": tech["technique_id"],
+                "name": tech["name"], "tactic": tech["tactic"],
+                "status": "blocked",
+                "evidence": f"target refused by egress guard: {why}",
+                "detail": (f"{host} did not pass the SSRF/egress guard (netguard) "
+                           f"— no emulation probe was sent."),
+            })
+        return {"target": target, "results": results,
+                "executed": 0, "blocked": len(results), "failed": 0}
 
     for tech in selected:
         if cancel is not None and cancel():
@@ -92,7 +116,12 @@ def run_emulation(
             }
         else:
             try:
-                outcome = tech["run"](base_url, ctx)
+                # Pin the host to the vetted IPs for the duration of the
+                # technique's requests-based calls (E1/E2/E3/E5 use urllib3, which
+                # honours the getaddrinfo pin), so a DNS rebind cannot steer them
+                # to a private/metadata address. E4 dials the vetted IP directly.
+                with safe_http.pinned(host, vips):
+                    outcome = tech["run"](base_url, ctx)
             except Exception as exc:  # defensive: a technique must never abort the run
                 outcome = {
                     "status": "failed",
