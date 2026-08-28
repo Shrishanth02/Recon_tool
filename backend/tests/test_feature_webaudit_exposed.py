@@ -258,3 +258,79 @@ def test_derive_webaudit_exposed_file_is_vuln():
     out = crud.derive_findings("webaudit", result)
     assert out and out[0]["kind"] == "vuln" and out[0]["detection_tier"] == "validated"
     assert out[0]["confidence"] == 80 and "CWE-538" in str(out[0]["cwe"])
+
+
+# --------------------------------------------------------------------------- #
+# Over-tiering fix (P1): header / cookie / clickjacking / TLS-config
+# observations are HARDENING (excluded from the vuln risk score), while genuine
+# confirmed findings (exposed files, CORS-with-credentials, etc.) stay vuln.
+# --------------------------------------------------------------------------- #
+from app import risk  # noqa: E402
+
+
+class _HdrResp:
+    """requests.Response stand-in for the header/cookie/content check."""
+
+    def __init__(self, headers, status=200, body="<html>ok</html>", ctype="text/html"):
+        self.status_code = status
+        self.reason = "OK"
+        self.headers = dict(headers)
+        self.headers.setdefault("Content-Type", ctype)
+        self.text = body
+        self.content = body.encode()
+        # No getlist -> cookies read from the Set-Cookie header instead.
+        self.raw = type("_Raw", (), {"headers": {}})()
+
+
+def _header_findings(monkeypatch, headers, body="<html>ok</html>"):
+    monkeypatch.setattr(webaudit, "_get", lambda url, **kw: _HdrResp(headers, body=body))
+    findings, header_report = [], {}
+    list(webaudit._check_headers_cookies_content(BASE, findings, header_report))
+    return findings
+
+
+def test_missing_headers_and_cookie_are_hardening(monkeypatch):
+    # No security headers, an insecure cookie, no frame protection.
+    findings = _header_findings(monkeypatch, {"Set-Cookie": "sid=abc123"})
+    names = [f["name"] for f in findings]
+    assert any("Missing security header" in n for n in names)
+    assert any("Clickjacking" in n for n in names)
+    assert any("Insecure cookie flags" in n for n in names)
+    # EVERY finding from this check is a hardening observation, not a vuln.
+    assert findings and all(f.get("kind") == "hardening" for f in findings)
+
+
+def test_webaudit_hardening_findings_do_not_inflate_risk(monkeypatch):
+    # Drive the scanner, derive as the pipeline does, and score risk end to end.
+    findings = _header_findings(monkeypatch, {"Set-Cookie": "sid=abc123"})
+    derived = crud.derive_findings("webaudit", {"findings": findings})
+    assert derived and all(f["kind"] == "hardening" for f in derived)
+    # kind != "vuln" is excluded from the vuln risk score -> zero inflation.
+    assert risk.workspace_risk(derived)["score"] == 0
+
+
+def test_webaudit_exposed_file_is_still_vuln(monkeypatch):
+    # A genuine confirmed exposure keeps kind="vuln" and DOES score.
+    findings = _probe(monkeypatch, {"/.env": Resp(200, "text/plain", "SECRET_KEY=abcdef123456")})
+    derived = crud.derive_findings("webaudit", {"findings": findings})
+    env = [f for f in derived if f["location"].endswith("/.env")]
+    assert env and env[0]["kind"] == "vuln" and env[0]["detection_tier"] == "validated"
+    assert risk.workspace_risk(derived)["score"] > 0
+
+
+def test_weak_tls_config_findings_are_hardening():
+    # The two TLS best-practice findings (expiring-soon, weak version) are
+    # hardening; expired / verification-failed remain vuln. Assert via derive on
+    # representative finding dicts the scanner emits.
+    result = {"findings": [
+        {"severity": "medium", "name": "Weak TLS version negotiated: TLSv1.1",
+         "location": "h", "cwe": ["CWE-326"], "kind": "hardening"},
+        {"severity": "medium", "name": "TLS certificate expiring soon",
+         "location": "h", "cwe": ["CWE-298"], "kind": "hardening"},
+        {"severity": "high", "name": "TLS certificate expired",
+         "location": "h", "cwe": ["CWE-298"]},  # no kind -> vuln
+    ]}
+    out = {f["name"]: f for f in crud.derive_findings("webaudit", result)}
+    assert out["Weak TLS version negotiated: TLSv1.1"]["kind"] == "hardening"
+    assert out["TLS certificate expiring soon"]["kind"] == "hardening"
+    assert out["TLS certificate expired"]["kind"] == "vuln"

@@ -182,13 +182,22 @@ _MIN_BODY_BYTES = 12       # responses smaller than this are treated as empty
 _SAMPLE = 8192             # bytes of body inspected for a signature
 
 
-def _finding(severity, name, location, description, cwe=None, evidence=None):
+def _finding(severity, name, location, description, cwe=None, evidence=None, kind=None):
     f = {
         "severity": severity,
         "name": name,
         "location": location,
         "description": description,
     }
+    # ``kind="hardening"`` marks a best-practice / defense-in-depth observation
+    # (a missing header, a cookie flag, a weak-but-working TLS config) rather than
+    # a confirmed exploitable vulnerability. crud.derive_findings honours this and
+    # risk scoring excludes non-"vuln" kinds, so these no longer inflate the vuln
+    # risk score (they were previously stamped validated/vuln by the per-tool
+    # default). Genuine confirmed findings (exposed files, CORS-with-credentials,
+    # expired/invalid cert, directory listing) leave ``kind`` unset -> "vuln".
+    if kind:
+        f["kind"] = kind
     if cwe:
         f["cwe"] = cwe
     if evidence:
@@ -240,6 +249,7 @@ def _check_headers_cookies_content(url, findings, header_report) -> Iterator[dic
                         "http_status": resp.status_code,
                         "server": hdr_lower.get("server"),
                     },
+                    kind="hardening",
                 )
             )
 
@@ -259,6 +269,7 @@ def _check_headers_cookies_content(url, findings, header_report) -> Iterator[dic
                     "csp_frame_ancestors": ("present" if "frame-ancestors" in csp.lower() else "absent"),
                     "http_status": resp.status_code,
                 },
+                kind="hardening",
             )
         )
 
@@ -291,6 +302,7 @@ def _check_headers_cookies_content(url, findings, header_report) -> Iterator[dic
                     # Cookie NAME + missing flags only — never the value (which may
                     # be a session token).
                     evidence={"cookie": cname, "missing_flags": missing},
+                    kind="hardening",
                 )
             )
 
@@ -322,6 +334,7 @@ def _check_headers_cookies_content(url, findings, header_report) -> Iterator[dic
                         "http://, which browsers may block or which can be "
                         "tampered with in transit.",
                         "CWE-311",
+                        kind="hardening",
                     )
                 )
 
@@ -582,6 +595,7 @@ def _check_tls(url, findings) -> Iterator[dict]:
                             "CWE-298",
                             evidence={"not_after": not_after, "days_remaining": days,
                                       "tls_version": version},
+                            kind="hardening",
                         )
                     )
             except ValueError:
@@ -596,6 +610,7 @@ def _check_tls(url, findings) -> Iterator[dict]:
                     "considered insecure.",
                     "CWE-326",
                     evidence={"tls_version": version},
+                    kind="hardening",
                 )
             )
     except ssl.SSLCertVerificationError as exc:
