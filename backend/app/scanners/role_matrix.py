@@ -95,12 +95,22 @@ def _equivalent(a: str, b: str) -> bool:
 
 
 def _privilege(identity: dict, index: int) -> int:
-    """Privilege rank for an identity: an explicit non-negative ``privilege`` int
-    if supplied, else its position in the operator's list (earlier = lower)."""
+    """Privilege rank for an identity.
+
+    An explicit, operator-declared non-negative ``privilege`` int is the rank.
+    Otherwise the identity is an EQUAL-privilege peer (rank 0) — list POSITION is
+    NOT a privilege signal. Inferring "earlier = lower" from list order fabricated
+    a hierarchy the operator never asserted, so two same-role peers viewing a
+    shared page looked like a privilege escalation (a false positive). Anonymous
+    is ranked below all identities by the caller (-1), so genuine
+    unauthenticated-access escalation is still detected; and when the operator
+    DOES declare explicit ranks, differential-authorization between them still
+    works. ``index`` is accepted for call-site stability but intentionally unused.
+    """
     p = identity.get("privilege")
     if isinstance(p, int) and not isinstance(p, bool) and p >= 0:
         return p
-    return index
+    return 0
 
 
 def stream(target: str, cancel: Optional[threading.Event] = None, **options) -> Iterator[dict]:

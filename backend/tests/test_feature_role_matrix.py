@@ -48,8 +48,11 @@ def test_equivalent_and_privilege():
     assert rm._equivalent(ADMIN, "  " + ADMIN.replace("> ", ">  ") + "  ")  # whitespace-insensitive
     assert not rm._equivalent(HOME_A, HOME_B)           # per-user data differs
     assert rm._privilege({"privilege": 5}, 0) == 5
-    assert rm._privilege({}, 3) == 3
-    assert rm._privilege({"privilege": True}, 2) == 2   # bool is not a valid rank
+    # List POSITION is NOT a privilege signal — an identity with no explicit rank
+    # is an equal peer (0), never "lower" because it was listed first. This was
+    # the list-order false positive.
+    assert rm._privilege({}, 3) == 0
+    assert rm._privilege({"privilege": True}, 2) == 0   # bool is not a valid rank -> peer
 
 
 # --------------------------------------------------------------------------- #
@@ -114,6 +117,46 @@ def test_per_user_resources_not_flagged(monkeypatch):
 
     r = _run(monkeypatch, "https://x/account", USER_ADMIN, p, authenticated=True)
     assert r["findings"] == []
+
+
+# --------------------------------------------------------------------------- #
+# List-order-as-privilege false positive (P1) + explicit-rank detection kept.
+# --------------------------------------------------------------------------- #
+PEERS = [{"label": "alice", "cookie": "a=1"}, {"label": "bob", "cookie": "b=1"}]
+
+
+def test_peer_identities_no_explicit_privilege_not_flagged(monkeypatch):
+    """Two SAME-ROLE peers (no explicit privilege) both viewing the same shared
+    page, with anon redirected to login, must NOT be a privilege escalation. The
+    old code treated the earlier-listed identity as strictly lower privilege and
+    false-flagged it."""
+    def p(h):
+        if h.get("Cookie"):
+            return (200, ADMIN)          # both peers see the same shared page
+        return (302, "")                 # anon -> login -> denied (boundary exists)
+
+    r = _run(monkeypatch, "https://x/dashboard", PEERS, p, authenticated=True)
+    assert r["findings"] == []
+
+
+def test_explicit_privilege_escalation_still_flagged(monkeypatch):
+    """DETECTION PRESERVED: when the operator DECLARES ranks, a strictly
+    lower-privilege identity reaching the higher one's resource is still a
+    validated finding."""
+    ids = [{"label": "low", "cookie": "l=1", "privilege": 0},
+           {"label": "high", "cookie": "h=1", "privilege": 5}]
+
+    def p(h):
+        if h.get("Cookie"):
+            return (200, ADMIN)          # both authenticated see the admin resource
+        return (302, "")                 # anon denied -> boundary
+
+    r = _run(monkeypatch, "https://x/admin/users", ids, p)
+    f = r["findings"]
+    assert len(f) == 1
+    assert f[0]["detection_tier"] == "validated"
+    assert "low" in f[0]["evidence"]["escalating_principals"]
+    assert "high" not in f[0]["evidence"]["escalating_principals"]
 
 
 def test_login_page_not_counted_allowed(monkeypatch):
