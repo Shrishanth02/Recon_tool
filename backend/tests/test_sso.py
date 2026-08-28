@@ -8,6 +8,8 @@ router callback is driven end-to-end with ``exchange_code``/``fetch_userinfo``
 stubbed.
 """
 
+import pytest
+
 from app import crud, sso
 from app.config import settings as app_settings
 from app.database import SessionLocal
@@ -101,7 +103,8 @@ def test_fetch_userinfo_no_network(monkeypatch):
 
     class _FakeRequests:
         def get(self, url, **kw):
-            return _FakeResp({"email": "Carol@Corp.com", "name": "Carol", "sub": "42"})
+            return _FakeResp({"email": "Carol@Corp.com", "email_verified": True,
+                              "name": "Carol", "sub": "42"})
 
     monkeypatch.setattr(sso, "_requests", lambda: _FakeRequests())
 
@@ -283,5 +286,79 @@ def test_password_only_user_login_unaffected_by_verified_flag():
         assert user.email_verified is False
         authed = crud.authenticate(db, "pw-only@corp.com", "goodpass123")
         assert authed is not None and authed.id == user.id
+    finally:
+        db.close()
+
+
+# --------------------------------------------------------------------------- #
+# SSO hardening: unverified IdP email + deactivated account.
+# --------------------------------------------------------------------------- #
+@pytest.mark.parametrize("ev", [False, "false", None, "", "0"])
+def test_fetch_userinfo_rejects_unverified_email(monkeypatch, ev):
+    """The email is the JIT join key, so an IdP that has NOT verified it (claim
+    false or absent) must be refused — a misconfigured/attacker IdP cannot assert
+    an unowned email."""
+    monkeypatch.setattr(
+        sso, "oidc_discover",
+        lambda issuer, **kw: {"userinfo_endpoint": "https://idp.example/userinfo"},
+    )
+    payload = {"email": "victim@corp.com", "name": "V", "sub": "9"}
+    if ev is not None:
+        payload["email_verified"] = ev  # None => claim absent entirely
+
+    class _FakeRequests:
+        def get(self, url, **kw):
+            return _FakeResp(payload)
+
+    monkeypatch.setattr(sso, "_requests", lambda: _FakeRequests())
+    with pytest.raises(sso.SsoError):
+        sso.fetch_userinfo({"issuer": "https://idp.example"}, {"access_token": "at"})
+
+
+@pytest.mark.parametrize("ev", [True, "true", "True"])
+def test_fetch_userinfo_accepts_verified_email(monkeypatch, ev):
+    """A properly-configured IdP that verified the email is accepted (bool or
+    string 'true')."""
+    monkeypatch.setattr(
+        sso, "oidc_discover",
+        lambda issuer, **kw: {"userinfo_endpoint": "https://idp.example/userinfo"},
+    )
+
+    class _FakeRequests:
+        def get(self, url, **kw):
+            return _FakeResp({"email": "ok@corp.com", "email_verified": ev,
+                              "name": "OK", "sub": "1"})
+
+    monkeypatch.setattr(sso, "_requests", lambda: _FakeRequests())
+    info = sso.fetch_userinfo({"issuer": "https://idp.example"}, {"access_token": "at"})
+    assert info["email"] == "ok@corp.com"
+
+
+def test_sso_provision_refuses_deactivated_account():
+    """A deactivated account (is_active=False) must not be handed a session via
+    SSO, mirroring the password path — and with NO eviction side effect."""
+    db = SessionLocal()
+    try:
+        _u, org, _ws = crud.create_user_with_org(
+            db, "sso-owner4@example.com", "password123", "Owner"
+        )
+        db.commit()
+        victim, _vorg, _vws = crud.create_user_with_org(
+            db, "deact@corp.com", "somepass123", "Deact"
+        )
+        victim.is_active = False
+        db.add(victim)
+        db.commit()
+        old_hash = victim.password_hash
+        old_version = victim.token_version
+
+        with pytest.raises(sso.SsoError):
+            sso.provision_sso_user(db, org, "deact@corp.com", "Deact")
+
+        # Refused cleanly, before any create/evict: account is untouched.
+        refetched = crud.get_user_by_email(db, "deact@corp.com")
+        assert refetched.password_hash == old_hash
+        assert refetched.token_version == old_version
+        assert refetched.is_active is False
     finally:
         db.close()

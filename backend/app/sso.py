@@ -185,6 +185,16 @@ def exchange_code(cfg: Any, code: str, *, timeout: float = 10.0) -> dict[str, An
     return tokens
 
 
+def _claim_is_true(value: Any) -> bool:
+    """True iff an OIDC boolean claim is explicitly true (JSON bool or "true").
+
+    IdPs send booleans as a JSON ``true`` or, occasionally, the string
+    ``"true"``. Anything else — ``False``, ``"false"``, ``None``, absent — is
+    treated as NOT true (fail-closed).
+    """
+    return value is True or (isinstance(value, str) and value.strip().lower() == "true")
+
+
 def fetch_userinfo(cfg: Any, tokens: dict[str, Any], *, timeout: float = 10.0) -> dict[str, Any]:
     """Fetch the end-user's profile from the userinfo endpoint.
 
@@ -216,6 +226,15 @@ def fetch_userinfo(cfg: Any, tokens: dict[str, Any], *, timeout: float = 10.0) -
     sub = info.get("sub") or ""
     if not email:
         raise SsoError("OIDC userinfo did not include an email claim")
+    # The email is the JIT account-join key, so it MUST be proven-owned at the
+    # IdP. Require the OIDC `email_verified` claim to be explicitly true; refuse
+    # an email the IdP has not verified (claim false or absent). Without this a
+    # misconfigured or attacker-controlled IdP could assert an unowned email and
+    # have it map onto / create a local account.
+    if not _claim_is_true(info.get("email_verified")):
+        raise SsoError(
+            "OIDC userinfo email is not verified (email_verified missing or false)"
+        )
     return {"email": email, "name": name, "sub": sub}
 
 
@@ -393,6 +412,11 @@ def provision_sso_user(
         raise SsoError("Cannot provision an SSO user without an email")
 
     user = crud.get_user_by_email(db, email)
+    # Mirror the password path (crud.authenticate refuses is_active=False): a
+    # deactivated account must not be handed a session via SSO either. Checked
+    # BEFORE any create/evict so a disabled account triggers no side effects.
+    if user is not None and not user.is_active:
+        raise SsoError("Account is deactivated")
     created = False
     evicted = False
     if user is None:
