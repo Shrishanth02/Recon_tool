@@ -11,7 +11,13 @@ normal 404-ing site is unaffected.
 from app.scanners import dirbuster
 
 
-def test_dirbuster_ffuf_uses_autocalibration(monkeypatch):
+def test_dirbuster_ffuf_uses_autocalibration(monkeypatch, tmp_path):
+    # Hermetic: use a temp wordlist so the test never depends on the SecLists
+    # submodule being checked out (it is not, in CI) — otherwise dirbuster.stream
+    # returns early ("Wordlist not found") before the ffuf command is built.
+    wl = tmp_path / "wordlist.txt"
+    wl.write_text("admin\nrobots.txt\n", encoding="utf-8")
+    monkeypatch.setattr(dirbuster.config, "WORDLIST", wl)
     monkeypatch.setattr(dirbuster, "reachable", lambda u: True)
     captured = {}
 
