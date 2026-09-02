@@ -155,8 +155,16 @@ def _same_site(url: str, domain: str) -> bool:
         host = (urlparse(url).hostname or "").lower()
     except ValueError:
         return False
-    domain = (domain or "").lower()
-    return bool(host) and (host == domain or host.endswith("." + domain))
+    # ``host`` is a bare hostname (urlparse drops the port), but ``domain`` comes
+    # from clean_target and may carry a port for a non-standard-port target
+    # ("127.0.0.1:8201", "app.internal:8080"). Comparing the two directly would
+    # reject EVERY same-host link on such a target, collapsing the authenticated
+    # deep-crawl to a single page — so normalize the domain to a bare hostname too.
+    dom = (domain or "").lower()
+    dom_host = (urlparse("//" + dom).hostname or dom) if dom else dom
+    return bool(host) and bool(dom_host) and (
+        host == dom_host or host.endswith("." + dom_host)
+    )
 
 
 def _is_asset(url: str) -> bool:
