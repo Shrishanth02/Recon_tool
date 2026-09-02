@@ -44,6 +44,15 @@ def stream(target: str, cancel: Optional[threading.Event] = None, **_) -> Iterat
             "-w", str(wordlist),
             "-mc", "200,204,301,302,307,401,403",
             "-fs", "0",
+            # Auto-calibration: ffuf probes random non-existent paths up front and
+            # filters responses matching that baseline. Without it, a SPA / soft-404
+            # site that serves 200 + the same index.html for EVERY path (very
+            # common: Angular/React apps, custom 404s) makes every wordlist entry a
+            # "hit" — thousands of false "discovered path" findings. -ac keeps only
+            # genuinely distinct responses (e.g. a real /ftp of a different size),
+            # so a normal 404-ing site is unaffected while SPA catch-alls stop
+            # flooding false positives.
+            "-ac",
             "-of", "json",
             "-o", json_path,
         ]
