@@ -90,8 +90,10 @@ def stream(
 
     # stderr carries the progress stats, so merge it in and tell findings apart
     # from progress by shape (a finding has info/template-id; a stat has percent).
+    rc = None
     for ev in stream_command(cmd, cancel=cancel, merge_stderr=True):
         if ev["type"] == "returncode":
+            rc = ev.get("data")  # capture (do NOT discard) — see honesty note below
             continue
         if ev["type"] != "log":
             yield ev
@@ -144,13 +146,19 @@ def stream(
             f"[{finding['severity'].upper()}] {finding['name']} -> {finding['matched_at']}"
         )
 
-    # Honesty on cancel/timeout: previously this returned early and emitted NO
-    # result, so a nuclei run that was killed before finishing looked identical to
-    # a clean, complete run that found nothing (a false-clean). nuclei can match a
-    # template late in the run, so a cut-off scan is NOT proof the target is clean.
-    # Always emit a result carrying whatever was captured, flagged incomplete, so
-    # the caller (and operator) knows the coverage was partial.
-    partial = cancel is not None and cancel.is_set()
+    # Honesty on cancel / timeout / crash / missing-binary: nuclei can match a
+    # template late in a long run, so a run that did not FINISH is not proof the
+    # target is clean. base.stream_command SIGKILLs nuclei on a user cancel AND on
+    # a wall-clock timeout, reporting the non-zero exit status via the returncode
+    # event; a template-load error / panic also exits non-zero, and a missing
+    # binary yields rc 127 (plus an error event already forwarded above). Deriving
+    # `partial` from cancel ALONE (the old bug) let a timed-out or crashed run —
+    # whose returncode was discarded — report complete:true / "0 findings", a
+    # false-clean. Treat a non-zero exit as incomplete too (mirrors the sqlmap/
+    # dalfox rc-based honesty in injection.py). A clean finish is rc 0.
+    cancelled = cancel is not None and cancel.is_set()
+    errored = rc is not None and rc != 0
+    partial = cancelled or errored
 
     findings.sort(key=lambda f: SEVERITY_ORDER.get(f["severity"], 9))
     counts = {}
@@ -158,8 +166,9 @@ def stream(
         counts[f["severity"]] = counts.get(f["severity"], 0) + 1
 
     if partial:
+        reason = "cancelled/stopped" if cancelled else f"exited abnormally (code {rc})"
         yield log(
-            f"⚠ nuclei did not complete (cancelled/timed-out) — results are "
+            f"⚠ nuclei did not complete ({reason}) — results are "
             f"PARTIAL: {len(findings)} finding(s) captured so far, more may exist. "
             f"This is NOT a clean result."
         )
