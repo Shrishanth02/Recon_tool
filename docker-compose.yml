@@ -98,6 +98,20 @@ services:
       RECONX_SANDBOX_REQUIRED: ${SANDBOX_REQUIRED:-false}
       RECONX_REQUIRE_VERIFIED_ASSET: ${REQUIRE_VERIFIED_ASSET:-false}
       RECONX_BLOCK_PRIVATE_TARGETS: ${BLOCK_PRIVATE_TARGETS:-true}
+      # HTTP/WS-serving config — backend only (the worker runs no HTTP server).
+      # These MUST be passed through: without them the documented .env knobs never
+      # reach the container. CORS would fall back to the localhost dev origins
+      # (blocking a real-domain SPA), and — behind the production TLS reverse
+      # proxy — X-Forwarded-For would be untrusted, collapsing every client onto
+      # the proxy's single IP so the shared auth bucket (10/min) throttles ALL
+      # logins. Interpolated with :- defaults so a .env file is not required.
+      RECONX_ORIGINS: ${RECONX_ORIGINS:-http://localhost:5173,http://127.0.0.1:5173}
+      RECONX_RATE_LIMIT_ENABLED: ${RECONX_RATE_LIMIT_ENABLED:-true}
+      RECONX_RATE_LIMIT_PER_MINUTE: ${RECONX_RATE_LIMIT_PER_MINUTE:-120}
+      RECONX_RATE_LIMIT_AUTH_PER_MINUTE: ${RECONX_RATE_LIMIT_AUTH_PER_MINUTE:-10}
+      RECONX_RATE_LIMIT_SCAN_PER_MINUTE: ${RECONX_RATE_LIMIT_SCAN_PER_MINUTE:-20}
+      RECONX_RATE_LIMIT_WINDOW_SECONDS: ${RECONX_RATE_LIMIT_WINDOW_SECONDS:-60}
+      RECONX_RATE_LIMIT_TRUSTED_PROXIES: ${RECONX_RATE_LIMIT_TRUSTED_PROXIES:-}
     depends_on:
       postgres:
         condition: service_healthy

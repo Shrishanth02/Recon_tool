@@ -128,3 +128,52 @@ def test_compose_redis_url_is_authenticated():
 def test_env_example_documents_redis_password():
     env = _read(REPO_ROOT / ".env.example")
     assert "REDIS_PASSWORD=" in env, ".env.example must document REDIS_PASSWORD"
+
+
+# --------------------------------------------------------------------------- #
+# Production HTTP knobs must actually REACH the backend container.
+#
+# The app reads its CORS origins and proxy-aware rate-limit settings from the
+# environment, and .env.example documents them. But compose only injects the vars
+# its `environment:` list names (there is no `env_file:`), so if these are not
+# plumbed through, setting them in .env is silently ineffective:
+#   * RECONX_ORIGINS falls back to the localhost dev origins -> a real-domain SPA
+#     is CORS-blocked;
+#   * behind the production TLS reverse proxy, an untrusted X-Forwarded-For
+#     collapses every client onto the proxy's single IP, so the shared 10/min
+#     auth bucket throttles ALL logins.
+# --------------------------------------------------------------------------- #
+def _noncomment_mapping_keys(text: str) -> set[str]:
+    """Mapping keys (``key:``) from non-comment lines — a comment mentioning a
+    var must not count as it being plumbed through."""
+    keys: set[str] = set()
+    for ln in text.splitlines():
+        s = ln.strip()
+        if not s or s.startswith("#") or ":" not in s:
+            continue
+        keys.add(s.split(":", 1)[0].strip())
+    return keys
+
+
+def test_compose_plumbs_cors_origins_to_backend():
+    keys = _noncomment_mapping_keys(_compose_text())
+    assert "RECONX_ORIGINS" in keys, (
+        "docker-compose.yml does not pass RECONX_ORIGINS to the container, so the "
+        "documented .env CORS setting is silently ignored and a real-domain SPA "
+        "would be CORS-blocked."
+    )
+
+
+def test_compose_plumbs_proxy_aware_rate_limit_to_backend():
+    keys = _noncomment_mapping_keys(_compose_text())
+    # The trusted-proxy CIDR is the load-bearing one: behind a TLS reverse proxy,
+    # without it every client buckets under the proxy IP and the shared auth
+    # limiter (10/min) throttles all logins.
+    assert "RECONX_RATE_LIMIT_TRUSTED_PROXIES" in keys, (
+        "docker-compose.yml does not pass RECONX_RATE_LIMIT_TRUSTED_PROXIES, so "
+        "behind the production TLS proxy every client buckets under the proxy IP "
+        "and the shared auth limiter throttles all logins."
+    )
+    assert "RECONX_RATE_LIMIT_ENABLED" in keys, (
+        "the rate-limit family is not plumbed through to the backend container"
+    )
