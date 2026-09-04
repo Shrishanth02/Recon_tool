@@ -195,7 +195,7 @@ def _run_sqlmap(
                 "url": url,
             }
             saw_injection = True
-            yield log(f"🚨 [SQLi] injectable parameter: {m.group('param')} ({m.group('place')})")
+            yield log(f"[ALERT] [SQLi] injectable parameter: {m.group('param')} ({m.group('place')})")
             continue
 
         m = _RE_TYPE.match(line)
@@ -233,11 +233,11 @@ def _run_sqlmap(
         # would be a false-clean: the capability was not actually exercised.
         if rc not in (0, None):
             yield log(
-                f"⚠ sqlmap did not complete (exit {rc}) — SQL injection was NOT "
+                f"[WARN] sqlmap did not complete (exit {rc}) — SQL injection was NOT "
                 f"tested on this URL (tool error/timeout, not a clean result)."
             )
         else:
-            yield log("✔ sqlmap: no SQL injection confirmed on this URL.")
+            yield log("[OK] sqlmap: no SQL injection confirmed on this URL.")
     yield {"type": "_sqli", "data": findings}
 
 
@@ -282,7 +282,7 @@ def _run_dalfox(
             "severity": (obj.get("severity") or "").lower() or None,
         }
         findings.append(entry)
-        yield log(f"🚨 [XSS] {entry['type']} on param '{entry['param']}' -> {entry['url']}")
+        yield log(f"[ALERT] [XSS] {entry['type']} on param '{entry['param']}' -> {entry['url']}")
 
     rc: int | None = None
     for ev in stream_command(cmd, cancel=cancel, max_seconds=_DALFOX_MAX_SECONDS):
@@ -330,18 +330,18 @@ def _run_dalfox(
                 "cwe": "CWE-79",
                 "severity": None,
             })
-            yield log(f"🚨 [XSS] {s}")
+            yield log(f"[ALERT] [XSS] {s}")
 
     if not findings:
         # Honesty (same rationale as sqlmap): a non-zero exit means dalfox did
         # not actually complete the test — do not report a clean checkmark.
         if rc not in (0, None):
             yield log(
-                f"⚠ dalfox did not complete (exit {rc}) — XSS was NOT tested on "
+                f"[WARN] dalfox did not complete (exit {rc}) — XSS was NOT tested on "
                 f"this URL (tool error/timeout, not a clean result)."
             )
         else:
-            yield log("✔ dalfox: no XSS confirmed on this URL.")
+            yield log("[OK] dalfox: no XSS confirmed on this URL.")
     yield {"type": "_xss", "data": findings}
 
 
@@ -507,7 +507,7 @@ def stream(
 
     for url in targets:
         if cancel is not None and cancel.is_set():
-            yield log("⏹ Cancelled.")
+            yield log("[STOPPED] Cancelled.")
             break
 
         if sqlmap is not None:
@@ -520,7 +520,7 @@ def stream(
                     yield ev
 
         if cancel is not None and cancel.is_set():
-            yield log("⏹ Cancelled.")
+            yield log("[STOPPED] Cancelled.")
             break
 
         if dalfox is not None:
@@ -553,7 +553,7 @@ def stream(
     summary = ", ".join(
         f"{k}:{counts[k]}" for k in ("critical", "high", "medium", "low") if counts[k]
     ) or "none"
-    yield log(f"✔ Injection testing complete — {len(findings)} finding(s): {summary}")
+    yield log(f"[OK] Injection testing complete — {len(findings)} finding(s): {summary}")
 
     yield result({
         "target": targets[0] if len(targets) == 1 else targets,

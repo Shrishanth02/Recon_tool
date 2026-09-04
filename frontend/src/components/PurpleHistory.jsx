@@ -7,15 +7,6 @@ import {
   fetchPurpleReportHtml,
 } from "../api/client";
 
-const STAGE_ICON = {
-  done: "✓",
-  error: "✕",
-  skipped: "⏭",
-  stopped: "⏹",
-  running: "…",
-  started: "…",
-};
-
 const RISK_TONE = {
   CRITICAL: "danger",
   HIGH: "warn",
@@ -277,7 +268,7 @@ export default function PurpleHistory({ workspaceId }) {
                                           st.status || "done"
                                         }`}
                                       >
-                                        {STAGE_ICON[st.status] || "•"} {st.status}
+                                        {st.status}
                                       </span>
                                     </summary>
                                     {Array.isArray(st.logs) && st.logs.length > 0 && (

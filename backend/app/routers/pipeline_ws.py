@@ -215,7 +215,7 @@ async def ws_pipeline(websocket: WebSocket):
                 "scope-denied", f"pipeline {target}: {reason}",
             )
             db.commit()
-            await reject(f"⛔ {reason}")
+            await reject(f"[BLOCKED] {reason}")
             return
 
         # SSRF / egress safety on the root target (mirrors every other scan path;
@@ -228,14 +228,14 @@ async def ws_pipeline(websocket: WebSocket):
                 "pipeline-target-blocked", f"pipeline {target}: {nreason}",
             )
             db.commit()
-            await reject(f"⛔ {nreason}")
+            await reject(f"[BLOCKED] {nreason}")
             return
 
         # Billing quota
         org = crud.get_org(db, workspace.org_id)
         allowed, reason = billing.check_quota(db, org, "scan")
         if not allowed:
-            await reject(f"⛔ {reason}")
+            await reject(f"[BLOCKED] {reason}")
             return
 
         # Build config from request overrides. NOTE: ``auth`` is TRANSIENT — it is
@@ -311,7 +311,7 @@ async def ws_pipeline(websocket: WebSocket):
 
         # Accumulate the full stage-by-stage process so the run can be replayed
         # from history. Logs are tail-capped per stage (nuclei streams thousands
-        # of progress lines) — the trailing ✔ summary line is what we keep.
+        # of progress lines) — the trailing [OK] summary line is what we keep.
         process: dict = {"stages": {}, "summary": {}}
 
         def _save_process() -> None:
@@ -382,7 +382,7 @@ async def ws_pipeline(websocket: WebSocket):
                     except Exception as exc:  # noqa: BLE001
                         await websocket.send_json({
                             "type": "pipeline_log", "stage": 0,
-                            "data": f"⚠ validation step error: {exc}",
+                            "data": f"[WARN] validation step error: {exc}",
                         })
                     # P1b: cross-scanner correlation (pure DB, no network).
                     try:
@@ -392,7 +392,7 @@ async def ws_pipeline(websocket: WebSocket):
                         db.rollback()
                         await websocket.send_json({
                             "type": "pipeline_log", "stage": 0,
-                            "data": f"⚠ correlation step error: {exc}",
+                            "data": f"[WARN] correlation step error: {exc}",
                         })
                     # Authoritative risk: recompute from the PERSISTED, validated,
                     # correlated, deduplicated findings using the same scorer the

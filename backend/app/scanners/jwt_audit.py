@@ -429,14 +429,14 @@ def stream(target: str, cancel: Optional[threading.Event] = None, **options) -> 
             f = _check_api_auth(u, identity_headers)
             if f:
                 findings.append(f)
-                yield log(f"  🚨 unauthenticated access to {u}")
+                yield log(f"  [ALERT] unauthenticated access to {u}")
             # Method-level authorization (non-destructive probes) + GraphQL.
             for mf in _check_method_authz(u, identity_headers):
                 findings.append(mf)
-                yield log(f"  🚨 {mf['name']}")
+                yield log(f"  [ALERT] {mf['name']}")
         # GraphQL introspection is a read-only query — safe with or without auth.
         for gf in _graphql_check(u, identity_headers):
             findings.append(gf)
-            yield log(f"  ⚠ {gf['name']}")
+            yield log(f"  [WARN] {gf['name']}")
 
     yield result({"target": target, "token_analyzed": token_analyzed, "findings": findings})

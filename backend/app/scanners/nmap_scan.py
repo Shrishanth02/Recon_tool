@@ -136,7 +136,7 @@ def stream(target: str, scan_type: str = "quick", cancel: Optional[threading.Eve
             yield error(data["error"])
             return
 
-        yield log(f"✔ Parsed {data.get('open_ports', 0)} open port(s).")
+        yield log(f"[OK] Parsed {data.get('open_ports', 0)} open port(s).")
         yield result(data)
     finally:
         try:

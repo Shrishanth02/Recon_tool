@@ -704,7 +704,7 @@ def generate_purple(
   }}
 </style></head>
 <body>
-<button class="print-btn" onclick="window.print()">⭳ Save as PDF</button>
+<button class="print-btn" onclick="window.print()">Save as PDF</button>
 <div class="page">
 
   <!-- ============================ COVER ============================ -->

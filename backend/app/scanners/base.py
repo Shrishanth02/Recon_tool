@@ -136,9 +136,9 @@ def stream_command(
         shutil.rmtree(scratch, ignore_errors=True)
 
     if timed_out.is_set():
-        yield log(f"⏱ Scan exceeded the {int(max_seconds)}s time limit and was stopped.")
+        yield log(f"[TIMEOUT] Scan exceeded the {int(max_seconds)}s time limit and was stopped.")
     elif cancelled:
-        yield log("⏹ Scan cancelled by user.")
+        yield log("[STOPPED] Scan cancelled by user.")
 
     yield {"type": "returncode", "data": proc.returncode}
 

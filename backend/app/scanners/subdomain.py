@@ -30,5 +30,5 @@ def stream(target: str, cancel: Optional[threading.Event] = None, **_) -> Iterat
         return
 
     found = sorted(set(found))
-    yield log(f"✔ Found {len(found)} subdomain(s).")
+    yield log(f"[OK] Found {len(found)} subdomain(s).")
     yield result({"domain": domain, "count": len(found), "subdomains": found})

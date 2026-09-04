@@ -219,12 +219,12 @@ def stream(target: str, cancel: Optional[threading.Event] = None, **options) -> 
     waf_name = _detect_waf(baseline)
     waf_detected = waf_name is not None
     if waf_detected:
-        yield log(f"✔ WAF detected: {waf_name}")
+        yield log(f"[OK] WAF detected: {waf_name}")
     else:
         yield log("No WAF signature found in baseline response (may still block on attack patterns).")
 
     if cancel is not None and cancel.is_set():
-        yield log("⏹ Cancelled by user.")
+        yield log("[STOPPED] Cancelled by user.")
         return
 
     # ---- 3. Category probes ------------------------------------------------
@@ -234,7 +234,7 @@ def stream(target: str, cancel: Optional[threading.Event] = None, **options) -> 
 
     for name, payload in _CATEGORY_TESTS:
         if cancel is not None and cancel.is_set():
-            yield log("⏹ Cancelled by user.")
+            yield log("[STOPPED] Cancelled by user.")
             break
 
         probe_url = _add_marker_param(url, payload)
@@ -274,7 +274,7 @@ def stream(target: str, cancel: Optional[threading.Event] = None, **options) -> 
 
         if blocked:
             blocked_count += 1
-            yield log(f"  {name}: BLOCKED (status {resp.status_code}) ✔")
+            yield log(f"  {name}: BLOCKED (status {resp.status_code}) [OK]")
         else:
             yield log(f"  {name}: PASSED THROUGH (status {resp.status_code}) — hardening signal")
             findings.append({
@@ -298,7 +298,7 @@ def stream(target: str, cancel: Optional[threading.Event] = None, **options) -> 
     total = len(_CATEGORY_TESTS)
     coverage_pct = round((blocked_count / total) * 100) if total else 0
     yield log(
-        f"✔ Coverage: {blocked_count}/{total} categories blocked ({coverage_pct}%). "
+        f"[OK] Coverage: {blocked_count}/{total} categories blocked ({coverage_pct}%). "
         f"WAF detected: {waf_detected}"
     )
 

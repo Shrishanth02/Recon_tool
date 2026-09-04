@@ -60,7 +60,7 @@ export default function ScopeBar() {
             className="scope-chip scope-chip-warn"
             title="No scope is set, so EVERY target is allowed. Add a target below (or type * ) to define this engagement's scope."
           >
-            ⚠ unrestricted — every target allowed
+            Warning: unrestricted — every target allowed
           </span>
         )}
         {scope.map((s) => (

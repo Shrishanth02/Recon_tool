@@ -47,5 +47,5 @@ def stream(target: str, cancel: Optional[threading.Event] = None, **_) -> Iterat
         yield error(f"WHOIS lookup failed: {exc}")
         return
 
-    yield log(f"✔ Registrar: {data['registrar']}")
+    yield log(f"[OK] Registrar: {data['registrar']}")
     yield result(data)

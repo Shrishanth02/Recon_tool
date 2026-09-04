@@ -2289,7 +2289,9 @@
   color: #fff;
   flex-shrink: 0;
 }
-.pipeline-stage-spinner { font-size: 16px; flex-shrink: 0; }
+.pipeline-stage-spinner { font-size: 16px; flex-shrink: 0; display: inline-flex; align-items: center; justify-content: center; width: 16px; }
+/* Semantic stage-status indicator dot (replaces informal status emoji). */
+.pipeline-stage-dot { width: 9px; height: 9px; border-radius: 50%; display: inline-block; box-shadow: 0 0 0 2px color-mix(in srgb, currentColor 8%, transparent); }
 .pipeline-stage-name {
   flex: 1;
   font-size: 13.5px;

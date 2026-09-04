@@ -54,7 +54,8 @@ export function usePipeline(onComplete) {
   const timerRef = useRef(null);
   const startedRef = useRef(0);
   const completeRef = useRef(onComplete);
-  completeRef.current = onComplete;
+  // Keep the latest onComplete without touching the ref during render.
+  useEffect(() => { completeRef.current = onComplete; });
 
   const stopTimer = () => {
     if (timerRef.current) {
@@ -73,7 +74,7 @@ export function usePipeline(onComplete) {
 
   const startPipeline = useCallback(({ target, workspaceId, config }) => {
     if (wsRef.current) {
-      try { wsRef.current.close(); } catch (_) {}
+      try { wsRef.current.close(); } catch { /* ignore */ }
     }
     setStatus("connecting");
     setStages(initStages());
@@ -164,7 +165,7 @@ export function usePipeline(onComplete) {
   useEffect(() => {
     return () => {
       stopTimer();
-      if (wsRef.current) try { wsRef.current.close(); } catch (_) {}
+      if (wsRef.current) try { wsRef.current.close(); } catch { /* ignore */ }
     };
   }, []);
 

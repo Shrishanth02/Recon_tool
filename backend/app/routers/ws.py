@@ -183,7 +183,7 @@ async def ws_scan(websocket: WebSocket):
                 "scope-denied", f"{tool_id} {target}: {reason}",
             )
             db.commit()
-            await reject(f"⛔ {reason}")
+            await reject(f"[BLOCKED] {reason}")
             return
 
         # --- Verified-asset gate (Phase 2) ---------------------------------- #
@@ -195,7 +195,7 @@ async def ws_scan(websocket: WebSocket):
                 "asset-denied", f"{tool_id} {target}",
             )
             db.commit()
-            await reject("⛔ Target is not a verified asset for this workspace.")
+            await reject("[BLOCKED] Target is not a verified asset for this workspace.")
             return
 
         # --- Billing quota gate (Phase 3) ----------------------------------- #
@@ -210,7 +210,7 @@ async def ws_scan(websocket: WebSocket):
                 "quota-denied", f"scan: {reason}",
             )
             db.commit()
-            await reject(f"⛔ {reason}")
+            await reject(f"[BLOCKED] {reason}")
             return
 
         # --- Delegate execution to the shared core -------------------------- #

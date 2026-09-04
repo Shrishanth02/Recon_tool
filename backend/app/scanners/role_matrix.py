@@ -192,7 +192,7 @@ def stream(target: str, cancel: Optional[threading.Event] = None, **options) -> 
                     "matrix": [{"principal": m[0], "access": m[2]} for m in matrix],
                 },
             })
-            yield log(f"  🚨 broken access control at {path}: {who} == '{hi_label}'")
+            yield log(f"  [ALERT] broken access control at {path}: {who} == '{hi_label}'")
 
     yield result({
         "target": url,

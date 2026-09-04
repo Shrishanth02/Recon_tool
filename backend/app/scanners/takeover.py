@@ -189,7 +189,7 @@ def stream(target: str, cancel: Optional[threading.Event] = None, **options) -> 
             f"resource at {provider['name']}."
         )
         if fp_hit:
-            yield log(f"  🚨 provider {provider['name']} unclaimed-fingerprint matched")
+            yield log(f"  [ALERT] provider {provider['name']} unclaimed-fingerprint matched")
             findings.append({
                 "severity": "high",
                 "name": f"Subdomain takeover: {host} ({provider['name']})",
@@ -210,7 +210,7 @@ def stream(target: str, cancel: Optional[threading.Event] = None, **options) -> 
                 },
             })
         elif dangling and provider["dangling_vulnerable"]:
-            yield log(f"  ⚠ dangling CNAME to {provider['name']} (target does not resolve)")
+            yield log(f"  [WARN] dangling CNAME to {provider['name']} (target does not resolve)")
             findings.append({
                 "severity": "high",
                 "name": f"Potential subdomain takeover: {host} ({provider['name']})",

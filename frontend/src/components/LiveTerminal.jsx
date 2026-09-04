@@ -3,8 +3,9 @@ import Icon from "./Icon";
 
 function lineClass(line) {
   if (line.startsWith("$ ")) return "ln-cmd";
-  if (line.startsWith("✔")) return "ln-ok";
-  if (line.startsWith("⏹")) return "ln-warn";
+  if (line.startsWith("[OK]")) return "ln-ok";
+  if (line.startsWith("[WARN]") || line.startsWith("[ALERT]") || line.startsWith("[FAIL]")
+      || line.startsWith("[BLOCKED]") || line.startsWith("[TIMEOUT]") || line.startsWith("[STOPPED]")) return "ln-warn";
   const l = line.toLowerCase();
   if (l.includes("open")) return "ln-ok";
   if (l.includes("filtered") || l.includes("closed")) return "ln-dim";
@@ -12,7 +13,7 @@ function lineClass(line) {
   return "";
 }
 
-export default function LiveTerminal({ logs, isRunning, status }) {
+export default function LiveTerminal({ logs, isRunning }) {
   const bodyRef = useRef(null);
   const [stick, setStick] = useState(true);
 

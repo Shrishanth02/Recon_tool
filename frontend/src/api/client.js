@@ -87,7 +87,7 @@ async function request(path, { method = "GET", body, headers, raw, skipAuthRetry
   let res = await fetch(`${HTTP_BASE}${path}`, build());
 
   if (res.status === 401 && onUnauthorized && !skipAuthRetry) {
-    let refreshed = false;
+    let refreshed;
     try {
       refreshed = await onUnauthorized();
     } catch {

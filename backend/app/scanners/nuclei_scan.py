@@ -52,7 +52,7 @@ def stream(
             return
         (live if reachable(t) else dead).append(t)
     for d in dead:
-        yield log(f"⚠ {d} did not respond (host down or blocking) — skipping.")
+        yield log(f"[WARN] {d} did not respond (host down or blocking) — skipping.")
     if not live:
         yield error(
             "No target responded — the host(s) appear to be down or blocking "
@@ -114,7 +114,7 @@ def stream(
         # A progress/stats line (from -stats-json) — surface it, don't count it.
         if "percent" in obj or ("requests" in obj and "total" in obj):
             yield log(
-                f"⏳ {obj.get('percent', '?')}% · {obj.get('requests', 0)} requests"
+                f"{obj.get('percent', '?')}% · {obj.get('requests', 0)} requests"
                 f" · {obj.get('matched', 0)} matched · {obj.get('rps', 0)} req/s"
             )
             continue
@@ -168,12 +168,12 @@ def stream(
     if partial:
         reason = "cancelled/stopped" if cancelled else f"exited abnormally (code {rc})"
         yield log(
-            f"⚠ nuclei did not complete ({reason}) — results are "
+            f"[WARN] nuclei did not complete ({reason}) — results are "
             f"PARTIAL: {len(findings)} finding(s) captured so far, more may exist. "
             f"This is NOT a clean result."
         )
     else:
-        yield log(f"✔ {len(findings)} finding(s): "
+        yield log(f"[OK] {len(findings)} finding(s): "
                   + (", ".join(f"{k}:{v}" for k, v in counts.items()) or "none"))
     yield result({
         "targets": targets,

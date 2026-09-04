@@ -164,7 +164,7 @@ def stream(target: str, cancel: Optional[threading.Event] = None, **_) -> Iterat
     behind_cdn, cdn_name, _edge, _hdrs = _fingerprint_cdn(f"https://{domain}")
     edge_ips = set(_resolve(domain, "A"))
     if behind_cdn:
-        yield log(f"⚠ Behind CDN/WAF: {cdn_name} (edge IPs: {', '.join(edge_ips) or 'n/a'})")
+        yield log(f"[WARN] Behind CDN/WAF: {cdn_name} (edge IPs: {', '.join(edge_ips) or 'n/a'})")
     else:
         yield log(f"No CDN signature detected; edge IPs: {', '.join(edge_ips) or 'n/a'}")
 
@@ -196,7 +196,7 @@ def stream(target: str, cancel: Optional[threading.Event] = None, **_) -> Iterat
             if ip not in edge_ips:
                 candidates.setdefault(ip, host)
 
-    yield log(f"✔ {len(candidates)} non-edge candidate IP(s) collected — validating…")
+    yield log(f"[OK] {len(candidates)} non-edge candidate IP(s) collected — validating…")
 
     # 4) Validate candidates by vhost probe.
     confirmed: list[dict] = []
@@ -207,7 +207,7 @@ def stream(target: str, cancel: Optional[threading.Event] = None, **_) -> Iterat
         if v:
             v["source"] = src
             confirmed.append(v)
-            yield log(f"  ➜ {ip} answers {domain} (HTTP {v['status']}, {v['confidence']}) via {src}")
+            yield log(f"  -> {ip} answers {domain} (HTTP {v['status']}, {v['confidence']}) via {src}")
 
     if confirmed:
         best = sorted(confirmed, key=lambda x: 0 if x["confidence"] == "high" else 1)[0]
@@ -215,13 +215,13 @@ def stream(target: str, cancel: Optional[threading.Event] = None, **_) -> Iterat
             f"Likely origin: {best['ip']}. Point the deep scan at this IP "
             f"(Host: {domain}) to test the app directly instead of the CDN edge."
         )
-        yield log(f"✔ {len(confirmed)} confirmed origin candidate(s). {rec}")
+        yield log(f"[OK] {len(confirmed)} confirmed origin candidate(s). {rec}")
     else:
         rec = (
             "No origin confirmed. The origin may be firewalled to CDN-only, or "
             "allow-list your scanner IP at the CDN to scan through the front door."
         )
-        yield log("✔ No origin confirmed via passive methods.")
+        yield log("[OK] No origin confirmed via passive methods.")
 
     yield result({
         "domain": domain,

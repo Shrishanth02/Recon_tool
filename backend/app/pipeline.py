@@ -238,14 +238,14 @@ def _drain(
             elif kind == "error":
                 loop.call_soon_threadsafe(
                     queue.put_nowait,
-                    {"type": "pipeline_log", "stage": stage, "data": f"⚠ {ev['data']}"},
+                    {"type": "pipeline_log", "stage": stage, "data": f"[WARN] {ev['data']}"},
                 )
             # returncode events are silently swallowed
     except Exception as exc:  # noqa: BLE001 - one raising scanner must not abort the run
         logger.warning("pipeline stage %s scanner raised: %s", stage, exc)
         loop.call_soon_threadsafe(
             queue.put_nowait,
-            {"type": "pipeline_log", "stage": stage, "data": f"⚠ stage error: {exc}"},
+            {"type": "pipeline_log", "stage": stage, "data": f"[WARN] stage error: {exc}"},
         )
     return result_data
 
@@ -354,7 +354,7 @@ async def run_pipeline(
                 {
                     "type": "pipeline_log",
                     "stage": 0,
-                    "data": f"⚠ Failed to persist {tool} result for {tool_target}: {exc}",
+                    "data": f"[WARN] Failed to persist {tool} result for {tool_target}: {exc}",
                 },
             )
 
@@ -416,7 +416,7 @@ async def run_pipeline(
             do_persist("ssrf", u, {"target": u, "findings": [finding]})
             loop.call_soon_threadsafe(queue.put_nowait, {
                 "type": "pipeline_log", "stage": SUMMARY_STAGE,
-                "data": f"🚨 blind SSRF confirmed via OAST callback on '{param}' ({u})",
+                "data": f"[ALERT] blind SSRF confirmed via OAST callback on '{param}' ({u})",
             })
 
     def worker() -> None:
@@ -500,7 +500,7 @@ async def run_pipeline(
                     {
                         "type": "pipeline_log",
                         "stage": 2,
-                        "data": "⚠ No in-scope hosts to probe. Skipping remaining stages.",
+                        "data": "[WARN] No in-scope hosts to probe. Skipping remaining stages.",
                     },
                 )
                 _finish(ctx, cancel, loop, queue)
@@ -540,7 +540,7 @@ async def run_pipeline(
                     {
                         "type": "pipeline_log",
                         "stage": 3,
-                        "data": "⚠ No live hosts found. Skipping remaining stages.",
+                        "data": "[WARN] No live hosts found. Skipping remaining stages.",
                     },
                 )
                 _finish(ctx, cancel, loop, queue)

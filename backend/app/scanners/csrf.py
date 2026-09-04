@@ -273,7 +273,7 @@ def stream(target: str, cancel: Optional[threading.Event] = None, **options) -> 
                         f"invalid, so nothing was created or modified."),
                     "evidence": {**ev, "validation_result": "not_enforced"},
                 })
-                yield log(f"  🚨 CSRF not enforced ({method} -> HTTP {f_status})")
+                yield log(f"  [ALERT] CSRF not enforced ({method} -> HTTP {f_status})")
             elif 200 <= f_status < 300 and samesite:
                 # The probe sends the session cookie explicitly; a real browser
                 # would withhold it cross-site, so this is NOT exploitable proof.
@@ -290,7 +290,7 @@ def stream(target: str, cancel: Optional[threading.Event] = None, **options) -> 
                         f"finding is not proof of an exploitable CSRF. Verify manually."),
                     "evidence": {**ev, "validation_result": "samesite_mitigated"},
                 })
-                yield log(f"  ⚠ invalid token accepted, but SameSite is set (HTTP {f_status})")
+                yield log(f"  [WARN] invalid token accepted, but SameSite is set (HTTP {f_status})")
             else:
                 findings.append({
                     "severity": "medium",
@@ -304,7 +304,7 @@ def stream(target: str, cancel: Optional[threading.Event] = None, **options) -> 
                         f"check ran (input validation, authorization). Verify manually."),
                     "evidence": {**ev, "validation_result": "inconclusive"},
                 })
-                yield log(f"  ⚠ origin made no difference, but both requests "
+                yield log(f"  [WARN] origin made no difference, but both requests "
                           f"failed (HTTP {f_status}) — inconclusive")
     elif method not in _PROBE_METHODS:
         # DELETE: state-changing, but no request body can make it safe to send.

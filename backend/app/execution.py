@@ -156,7 +156,7 @@ async def stream(job: Job, *, on_persist: OnPersist) -> AsyncIterator[dict[str, 
     """
     allowed, reason = netguard.validate_targets(job.target)
     if not allowed:
-        yield {"type": "error", "data": f"⛔ {reason}"}
+        yield {"type": "error", "data": f"[BLOCKED] {reason}"}
         yield {"type": "done"}
         return
 

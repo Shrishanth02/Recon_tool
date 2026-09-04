@@ -385,7 +385,7 @@ def stream(target: str, cancel: Optional[threading.Event] = None, **options) -> 
     try:
         from playwright.sync_api import sync_playwright
     except Exception as exc:
-        yield log(f"⚠ Playwright is not available ({exc.__class__.__name__}) — "
+        yield log(f"[WARN] Playwright is not available ({exc.__class__.__name__}) — "
                   "returning empty result (install playwright + chromium to enable).")
         yield result(_empty_result(url, domain, login_method))
         return
@@ -414,7 +414,7 @@ def stream(target: str, cancel: Optional[threading.Event] = None, **options) -> 
         try:
             browser = playwright.chromium.launch(headless=True)
         except Exception as exc:
-            yield log(f"⚠ Could not launch headless Chromium ({exc.__class__.__name__}) — "
+            yield log(f"[WARN] Could not launch headless Chromium ({exc.__class__.__name__}) — "
                       "returning empty result (try `playwright install chromium`).")
             yield result(_empty_result(url, domain, login_method))
             return
@@ -436,7 +436,7 @@ def stream(target: str, cancel: Optional[threading.Event] = None, **options) -> 
         try:
             context.route("**/*", lambda route: _guard_route(route, blocked_navigations))
         except Exception as exc:  # noqa: BLE001
-            yield log(f"⚠ could not install navigation SSRF guard ({exc.__class__.__name__}).")
+            yield log(f"[WARN] could not install navigation SSRF guard ({exc.__class__.__name__}).")
 
         # Cookie auth: set the raw cookie string on the target domain.
         if cookie:
@@ -522,7 +522,7 @@ def stream(target: str, cancel: Optional[threading.Event] = None, **options) -> 
                 page.goto(url, timeout=NAV_TIMEOUT_MS, wait_until="domcontentloaded")
                 page.wait_for_timeout(SETTLE_MS)
             except Exception as exc:
-                yield log(f"⚠ Could not open entry point ({exc.__class__.__name__}) — "
+                yield log(f"[WARN] Could not open entry point ({exc.__class__.__name__}) — "
                           "continuing with whatever loaded.")
 
         # ---- Verify auth ---------------------------------------------------
@@ -548,13 +548,13 @@ def stream(target: str, cancel: Optional[threading.Event] = None, **options) -> 
 
         while queue:
             if _cancelled(cancel):
-                yield log("⏹ Cancelled — returning partial attack surface.")
+                yield log("[STOPPED] Cancelled — returning partial attack surface.")
                 break
             if pages_visited >= MAX_PAGES:
                 yield log(f"Reached page cap ({MAX_PAGES}) — stopping crawl.")
                 break
             if (time.monotonic() - started) > WALL_CLOCK_SECONDS:
-                yield log(f"⏱ Reached the {WALL_CLOCK_SECONDS}s wall-clock cap — stopping crawl.")
+                yield log(f"[TIMEOUT] Reached the {WALL_CLOCK_SECONDS}s wall-clock cap — stopping crawl.")
                 break
 
             current, depth = queue.pop(0)
@@ -635,7 +635,7 @@ def stream(target: str, cancel: Optional[threading.Event] = None, **options) -> 
 
     except Exception as exc:
         # Absolute backstop — never let the scanner crash the run.
-        yield log(f"⚠ Auth-crawl encountered an error ({exc.__class__.__name__}: {exc}); "
+        yield log(f"[WARN] Auth-crawl encountered an error ({exc.__class__.__name__}: {exc}); "
                   "returning what was collected.")
     finally:
         try:
@@ -684,7 +684,7 @@ def stream(target: str, cancel: Optional[threading.Event] = None, **options) -> 
     }
     elapsed = int(time.monotonic() - started)
     yield log(
-        f"✔ Authenticated attack surface: {counts['urls']} URLs, "
+        f"[OK] Authenticated attack surface: {counts['urls']} URLs, "
         f"{counts['parameterized_urls']} parameterized, {counts['forms']} form(s), "
         f"{counts['api_endpoints']} API endpoint(s), "
         f"{counts['params_discovered']} params, {counts['js_secrets']} secret hit(s) "
@@ -693,7 +693,7 @@ def stream(target: str, cancel: Optional[threading.Event] = None, **options) -> 
 
     if blocked_navigations:
         yield log(
-            f"⚠ SSRF guard aborted {len(blocked_navigations)} request(s) to "
+            f"[WARN] SSRF guard aborted {len(blocked_navigations)} request(s) to "
             "private/metadata destination(s) — never contacted, never scraped."
         )
 

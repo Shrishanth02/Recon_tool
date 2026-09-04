@@ -144,7 +144,7 @@ def stream(target: str, cancel: Optional[threading.Event] = None, **options) -> 
                     f"server-side request. Non-destructive reflective test only."),
                 "evidence": ev,
             })
-            yield log(f"  🚨 reflective SSRF confirmed on '{name}'")
+            yield log(f"  [ALERT] reflective SSRF confirmed on '{name}'")
         else:
             note = ("blind SSRF cannot be confirmed without an OAST/callback provider"
                     if not oast.available() else "no reflection observed")

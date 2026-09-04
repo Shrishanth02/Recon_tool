@@ -33,5 +33,5 @@ def stream(target: str, cancel: Optional[threading.Event] = None, **_) -> Iterat
     for domain in domains:
         yield log(domain)
 
-    yield log(f"✔ Found {len(domains)} domain(s).")
+    yield log(f"[OK] Found {len(domains)} domain(s).")
     yield result({"ip": ip, "count": len(domains), "domains": domains})

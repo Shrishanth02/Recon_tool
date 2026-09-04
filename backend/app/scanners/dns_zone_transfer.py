@@ -98,7 +98,7 @@ def stream(target: str, cancel: Optional[threading.Event] = None, **_) -> Iterat
         import dns.zone  # noqa: F401
         import dns.resolver  # noqa: F401
     except Exception as exc:  # noqa: BLE001
-        yield log(f"⚠ dnspython is not available ({exc}) — skipping DNS zone transfer check.")
+        yield log(f"[WARN] dnspython is not available ({exc}) — skipping DNS zone transfer check.")
         yield result({
             "domain": domain,
             "vulnerable": False,
@@ -113,7 +113,7 @@ def stream(target: str, cancel: Optional[threading.Event] = None, **_) -> Iterat
 
     nameservers = _get_nameservers(domain)
     if not nameservers:
-        yield log("⚠ No nameservers found (domain does not resolve or has no NS records).")
+        yield log("[WARN] No nameservers found (domain does not resolve or has no NS records).")
         yield result({
             "domain": domain,
             "vulnerable": False,
@@ -138,7 +138,7 @@ def stream(target: str, cancel: Optional[threading.Event] = None, **_) -> Iterat
 
         ns_ips = _resolve_ips(ns)
         if not ns_ips:
-            yield log(f"⚠ Could not resolve an IP for {ns} — skipping.")
+            yield log(f"[WARN] Could not resolve an IP for {ns} — skipping.")
             continue
 
         transferred = False
@@ -151,7 +151,7 @@ def stream(target: str, cancel: Optional[threading.Event] = None, **_) -> Iterat
                     dns.query.xfr(ns_ip, domain, timeout=_XFR_TIMEOUT)
                 )
             except Exception as exc:  # noqa: BLE001 — refused, timeout, connreset, etc.
-                yield log(f"✔ {ns} ({ns_ip}) refused zone transfer (expected). [{exc}]")
+                yield log(f"[OK] {ns} ({ns_ip}) refused zone transfer (expected). [{exc}]")
                 continue
 
             # Success — flatten the zone into printable record strings.
@@ -171,7 +171,7 @@ def stream(target: str, cancel: Optional[threading.Event] = None, **_) -> Iterat
             all_records.extend(records)
             # CRITICAL log line — preserved verbatim for alerting/detection.
             yield log(
-                f"⚠ ZONE TRANSFER SUCCEEDED via {ns} ({ns_ip})! "
+                f"[WARN] ZONE TRANSFER SUCCEEDED via {ns} ({ns_ip})! "
                 f"Got {len(records)} record(s)."
             )
             break  # one successful IP is enough for this nameserver
@@ -186,11 +186,11 @@ def stream(target: str, cancel: Optional[threading.Event] = None, **_) -> Iterat
     vulnerable = bool(vulnerable_ns)
     if vulnerable:
         yield log(
-            f"🚨 CRITICAL: Zone transfer is possible via: {', '.join(vulnerable_ns)}\n"
+            f"[ALERT] CRITICAL: Zone transfer is possible via: {', '.join(vulnerable_ns)}\n"
             f"   This exposes ALL DNS records to any external attacker."
         )
     else:
-        yield log("✔ No nameserver allowed zone transfer.")
+        yield log("[OK] No nameserver allowed zone transfer.")
 
     yield result({
         "domain": domain,

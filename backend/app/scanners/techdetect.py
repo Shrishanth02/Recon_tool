@@ -67,7 +67,7 @@ def stream(target: str, cancel: Optional[threading.Event] = None, **_) -> Iterat
     else:
         tech = box.get("tech") or {}
 
-    yield log(f"✔ Detected {len(tech)} technology categor(ies).")
+    yield log(f"[OK] Detected {len(tech)} technology categor(ies).")
     yield result({
         "url": url,
         "status_code": response.status_code,

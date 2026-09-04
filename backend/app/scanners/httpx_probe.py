@@ -117,7 +117,7 @@ def stream(target: str, cancel: Optional[threading.Event] = None, **_) -> Iterat
                     pass
 
         rows.sort(key=lambda r: (r["status"] or 0))
-        yield log(f"✔ {len(rows)} live host(s).")
+        yield log(f"[OK] {len(rows)} live host(s).")
         yield result({"probed": len(targets), "alive": len(rows), "rows": rows})
     finally:
         try:

@@ -123,7 +123,7 @@ def test_stream_ssrf_target_errors_and_skips_scanner(monkeypatch):
 
     types = [e["type"] for e in events]
     assert types == ["error", "done"]
-    assert "⛔" in events[0]["data"]
+    assert "[BLOCKED]" in events[0]["data"]
     # Scanner never invoked and nothing persisted for a blocked target.
     assert calls == []
     assert persisted == []

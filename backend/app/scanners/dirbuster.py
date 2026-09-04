@@ -87,7 +87,7 @@ def stream(target: str, cancel: Optional[threading.Event] = None, **_) -> Iterat
             })
 
         rows.sort(key=lambda r: (r["status"] or 0, r["path"]))
-        yield log(f"✔ Found {len(rows)} path(s).")
+        yield log(f"[OK] Found {len(rows)} path(s).")
         yield result({"target": url, "found": len(rows), "rows": rows})
     finally:
         try:

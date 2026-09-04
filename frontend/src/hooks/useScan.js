@@ -17,7 +17,8 @@ export function useScan(onComplete) {
   const startedRef = useRef(0);
   const stateRef = useRef({ logs: [], result: null, error: null, tool: null, target: null });
   const completeRef = useRef(onComplete);
-  completeRef.current = onComplete;
+  // Keep the latest onComplete without touching the ref during render.
+  useEffect(() => { completeRef.current = onComplete; });
 
   const stopTimer = () => {
     if (timerRef.current) {
@@ -51,7 +52,7 @@ export function useScan(onComplete) {
   const startScan = useCallback(
     ({ tool, target, options, workspaceId, projectId }) => {
       if (wsRef.current) {
-        try { wsRef.current.close(); } catch (_) {}
+        try { wsRef.current.close(); } catch { /* ignore */ }
       }
       stateRef.current = { logs: [], result: null, error: null, tool, target, scanId: null };
       setLogs([]);
@@ -78,7 +79,7 @@ export function useScan(onComplete) {
 
       ws.onmessage = (event) => {
         let msg;
-        try { msg = JSON.parse(event.data); } catch (_) { return; }
+        try { msg = JSON.parse(event.data); } catch { return; }
 
         switch (msg.type) {
           case "start": {
@@ -156,7 +157,7 @@ export function useScan(onComplete) {
     return () => {
       stopTimer();
       if (wsRef.current) {
-        try { wsRef.current.close(); } catch (_) {}
+        try { wsRef.current.close(); } catch { /* ignore */ }
       }
     };
   }, []);

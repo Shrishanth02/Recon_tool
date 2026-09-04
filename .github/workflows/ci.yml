@@ -160,6 +160,12 @@ jobs:
           node-version: "20"
       - name: Install dependencies
         run: npm ci
+      # Release gate: ESLint must pass (fails the job on any error). Advisory
+      # React-plugin rules are configured as warnings in eslint.config.js and do
+      # not fail here; genuine errors (unused vars, empty blocks, ref-access
+      # during render, etc.) do.
+      - name: Lint (eslint)
+        run: npm run lint
       - name: Build
         run: npm run build
 

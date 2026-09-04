@@ -239,7 +239,7 @@ export default function EngagementMenu({ disabled }) {
             <div className="eng-scope-chips">
               {unrestricted && (
                 <span className="scope-chip scope-chip-warn">
-                  ⚠ unrestricted — every target allowed
+                  Warning: unrestricted — every target allowed
                 </span>
               )}
               {scope.map((s) => (

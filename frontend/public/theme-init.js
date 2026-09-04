@@ -6,7 +6,7 @@
   try {
     var t = localStorage.getItem("reconx.theme");
     document.documentElement.setAttribute("data-theme", t === "dark" ? "dark" : "light");
-  } catch (e) {
+  } catch {
     document.documentElement.setAttribute("data-theme", "light");
   }
 })();

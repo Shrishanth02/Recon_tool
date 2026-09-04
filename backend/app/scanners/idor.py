@@ -351,7 +351,7 @@ def stream(target: str, cancel: Optional[threading.Event] = None, **options) -> 
             anon = _http_get(url, {})
             if (anon and anon[0] == 200 and _sensitive(url, oid, anon[1])
                     and _enumerable_anon(url, oid, anon[1], cancel)):
-                yield log(f"  🚨 {url}: unauthenticated access to enumerable object ({oid})")
+                yield log(f"  [ALERT] {url}: unauthenticated access to enumerable object ({oid})")
                 findings.append(_unauth_finding(url, oid, anon))
                 continue
 
@@ -391,7 +391,7 @@ def stream(target: str, cancel: Optional[threading.Event] = None, **options) -> 
             yield log(f"{url}: resource is publicly accessible — not an IDOR")
             continue
         if b_sees:
-            yield log(f"  🚨 IDOR: identity {labels[1]} can read identity {labels[0]}'s resource {url}")
+            yield log(f"  [ALERT] IDOR: identity {labels[1]} can read identity {labels[0]}'s resource {url}")
             findings.append({
                 "severity": "high",
                 "name": f"IDOR: cross-user resource access ({oid})",

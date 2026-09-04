@@ -383,7 +383,7 @@ def _run_passive(url: str, domain: str, cancel: Optional[threading.Event],
         if jr.status_code == 200 and jr.text:
             _collect_from_text(jr.text, base_url, urls, secrets, seen_secrets, source=jsu)
     if secrets:
-        yield log(f"passive: ⚠ {len(secrets)} possible secret(s) matched in page/JS.")
+        yield log(f"passive: [WARN] {len(secrets)} possible secret(s) matched in page/JS.")
 
 
 # ---------------------------------------------------------------------------
@@ -548,7 +548,7 @@ def stream(target: str, cancel: Optional[threading.Event] = None, **options) -> 
         if reachable(url):
             yield log("Target is reachable.")
         else:
-            yield log("⚠ Target did not respond to a probe — active stages may find little.")
+            yield log("[WARN] Target did not respond to a probe — active stages may find little.")
     except Exception:
         pass
 
@@ -571,7 +571,7 @@ def stream(target: str, cancel: Optional[threading.Event] = None, **options) -> 
         yield from _run_passive(url, domain, cancel, urls, secrets, seen_secrets, forms)
 
     if _cancelled(cancel):
-        yield log("⏹ Cancelled — returning partial attack surface.")
+        yield log("[STOPPED] Cancelled — returning partial attack surface.")
 
     # ---- Normalize / dedupe -------------------------------------------------
     norm_urls = sorted(u for u in urls if isinstance(u, str) and u.startswith(("http://", "https://")))
@@ -610,7 +610,7 @@ def stream(target: str, cancel: Optional[threading.Event] = None, **options) -> 
     }
     elapsed = int(time.monotonic() - started)
     yield log(
-        f"✔ Attack surface: {counts['urls']} URLs, "
+        f"[OK] Attack surface: {counts['urls']} URLs, "
         f"{counts['parameterized_urls']} parameterized, "
         f"{counts['params_discovered']} params, "
         f"{counts['js_secrets']} secret hit(s) — in {elapsed}s."

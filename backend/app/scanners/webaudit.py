@@ -700,7 +700,7 @@ def stream(target, cancel: Optional[threading.Event] = None, **options) -> Itera
     missing = [k for k, v in header_report.items() if v is None]
 
     yield log(
-        f"✔ WebAudit complete: {counts['total']} finding(s) "
+        f"[OK] WebAudit complete: {counts['total']} finding(s) "
         f"({counts.get('high', 0)} high, {counts.get('medium', 0)} medium)."
     )
     yield result(

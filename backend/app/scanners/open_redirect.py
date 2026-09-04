@@ -180,7 +180,7 @@ def stream(target: str, cancel: Optional[threading.Event] = None, **options) -> 
                     "off_origin": True,
                 },
             })
-            yield log(f"  🚨 open redirect confirmed on '{name}' ({method})")
+            yield log(f"  [ALERT] open redirect confirmed on '{name}' ({method})")
         # Same-origin / no redirect -> not an open redirect (nothing reported).
 
     yield result({"target": url, "tested_params": tested, "findings": findings})
