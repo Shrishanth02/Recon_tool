@@ -71,13 +71,61 @@ def is_unconfirmed(status: str) -> bool:
 # Evidence redaction — never leak secrets into a shareable report.
 # --------------------------------------------------------------------------- #
 _SECRET_KEY_RE = re.compile(r"(pass|secret|token|authorization|auth|cookie|api[-_]?key|private[-_]?key|bearer)", re.I)
-_SECRET_VAL_RE = re.compile(
-    r"(authorization:\s*bearer\s+)[A-Za-z0-9._~+/=-]{8,}"
-    r"|(api[-_]?key\"?\s*[:=]\s*\"?)[A-Za-z0-9._-]{12,}"
-    r"|eyJ[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{6,}"  # JWT
-    r"|(password\"?\s*[:=]\s*\"?)[^\"'\s,}&]{3,}",
+
+# --- Secret redaction for captured text (e.g. an exposed-file response body). --- #
+# A scanner may legitimately capture a response body as proof (nuclei's `response`
+# field for an exposed /.env or db_backup.sql). The body itself carries the very
+# secrets the finding is about, so the REPORT must scrub them while keeping the
+# non-secret structure (which key leaked, what kind of file) as useful evidence.
+
+# 1) KEY=VALUE / KEY: VALUE where the KEY NAME implies a secret — keep the key and
+#    delimiter, redact only the value (covers .env / config / JSON / query-string).
+_SECRET_ASSIGN_RE = re.compile(
+    r"([A-Za-z0-9_.\-]*"
+    r"(?:secret|passwd|password|api[_-]?key|access[_-]?key|private[_-]?key|"
+    r"app[_-]?key|secret[_-]?key|client[_-]?secret|auth[_-]?token|session|apikey|token)"
+    r"[A-Za-z0-9_.\-]*"
+    r"\"?\s*[:=]\s*\"?)"
+    r"([^\s\"',}&]{4,})",
     re.I,
 )
+# 2) High-confidence provider TOKEN SHAPES, redacted wherever they appear (even
+#    with no key), plus JWTs and Authorization: Bearer headers.
+_TOKEN_SHAPE_RE = re.compile(
+    r"(?:sk|pk|rk)_(?:live|test)_[A-Za-z0-9]{6,}"       # Stripe-style keys
+    r"|AKIA[0-9A-Z]{16}"                                 # AWS access key id
+    r"|gh[pousr]_[A-Za-z0-9]{20,}"                       # GitHub tokens
+    r"|xox[baprs]-[A-Za-z0-9-]{10,}"                     # Slack tokens
+    r"|AIza[0-9A-Za-z_\-]{20,}"                          # Google API key
+    r"|eyJ[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{6,}",  # JWT
+)
+_BEARER_RE = re.compile(r"(authorization:\s*bearer\s+)[A-Za-z0-9._~+/=-]{8,}", re.I)
+# 3) PEM private-key blocks — redact the whole block.
+_PEM_RE = re.compile(
+    r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z0-9 ]*PRIVATE KEY-----", re.I
+)
+# 4) Plaintext credentials in a SQL dump: redact the quoted literals inside an
+#    INSERT INTO an identity/credential table (usernames, passwords, emails). Kept
+#    conservative — only fires for tables whose name implies accounts/credentials.
+_SQL_CRED_RE = re.compile(
+    r"(insert\s+into\s+`?\w*"
+    r"(?:user|account|credential|member|login|admin|password|customer)\w*`?\b[^;]*?\bvalues\b)"
+    r"([^;]*)",
+    re.I,
+)
+_SQL_QUOTED_RE = re.compile(r"'(?:[^'\\]|\\.)*'")
+
+
+def _redact_text(s: str) -> str:
+    """Scrub secrets from a free-text string, preserving non-secret structure."""
+    s = _PEM_RE.sub("[REDACTED]", s)
+    s = _BEARER_RE.sub(lambda m: m.group(1) + "[REDACTED]", s)
+    s = _SECRET_ASSIGN_RE.sub(lambda m: m.group(1) + "[REDACTED]", s)
+    s = _TOKEN_SHAPE_RE.sub("[REDACTED]", s)
+    s = _SQL_CRED_RE.sub(
+        lambda m: m.group(1) + _SQL_QUOTED_RE.sub("'[REDACTED]'", m.group(2)), s
+    )
+    return s
 
 
 def redact(value):
@@ -93,7 +141,7 @@ def redact(value):
     if isinstance(value, list):
         return [redact(v) for v in value]
     if isinstance(value, str):
-        return _SECRET_VAL_RE.sub(lambda m: (m.group(1) or m.group(2) or m.group(3) or "") + "[REDACTED]", value)
+        return _redact_text(value)
     return value
 
 

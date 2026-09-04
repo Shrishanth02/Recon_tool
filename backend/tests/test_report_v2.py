@@ -197,6 +197,47 @@ def test_evidence_secret_is_redacted():
     assert "[REDACTED]" in html
 
 
+def test_exposed_file_response_secrets_are_redacted():
+    """A captured response body (e.g. nuclei evidence for an exposed /.env or SQL
+    dump) must have its secrets redacted: env-style KEY=VALUE secrets, provider
+    token shapes, PEM keys, and plaintext credentials in a SQL INSERT — while
+    non-secret structural context (APP_ENV, DB_HOST) is preserved as useful proof."""
+    # Provider-token fixtures are assembled from split literals so the SOURCE file
+    # holds no scannable secret pattern (GitHub push-protection blocks e.g. a
+    # contiguous sk_live_ Stripe key); the runtime strings still exercise redaction.
+    stripe = "sk_" "live_" "51HxxxPlaceholderTokenValue"
+    aws = "AKIA" "IOSFODNN7EXAMPLE"
+    body = (
+        "APP_ENV=production\n"
+        "APP_KEY=base64:R4nD0mLyG3n3r4t3dK3yTh4tSh0uldNotL3ak==\n"
+        "DB_HOST=127.0.0.1\n"
+        "DB_PASSWORD=Sup3rS3cr3tDbP4ss!\n"
+        f"STRIPE_SECRET={stripe}\n"
+        "JWT_SECRET=an0th3r-l3ak3d-s3cr3t\n"
+        f"AWS={aws}\n"
+        "-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQ\n-----END RSA PRIVATE KEY-----\n"
+        "INSERT INTO users VALUES (1,'admin','admin123','admin@voltmart.test',1);"
+    )
+    f = {**_confirmed_env(), "evidence": {"response": body}}
+    html = report.generate({"name": "t"}, [f], SCANS, tools=TOOLS)
+    for secret in ("R4nD0mLyG3n3r4t3dK3y", "Sup3rS3cr3tDbP4ss", stripe,
+                   "an0th3r-l3ak3d-s3cr3t", aws, "MIIEowIBAAKCAQ", "admin123"):
+        assert secret not in html, f"leaked secret: {secret}"
+    assert "[REDACTED]" in html
+    assert "production" in html          # APP_ENV kept — non-secret context preserved
+
+
+def test_redact_unit_env_token_and_sql():
+    """Unit-level: rm.redact scrubs env secrets, token shapes and SQL creds."""
+    stripe = "sk_" "live_" "ABCDEF123456"          # split literal, see note above
+    out = str(rm.redact({"response":
+        "APP_KEY=base64:LEAKVALUE12345\n" f"STRIPE={stripe}\n"
+        "INSERT INTO accounts VALUES (1,'bob','s3cr3tpw');"}))
+    for s in ("LEAKVALUE12345", stripe, "s3cr3tpw"):
+        assert s not in out, f"leaked: {s}"
+    assert "[REDACTED]" in out
+
+
 def test_rendering_is_xss_safe():
     evil = {"name": "<script>alert(1)</script>", "severity": "high", "kind": "vuln",
             "detection_tier": "validated", "location": "https://x.com/<img src=x onerror=alert(1)>",

@@ -73,11 +73,19 @@ def _sqlmap_cmd() -> Optional[List[str]]:
         path = shutil.which(exe)
         if path:
             return [path]
-    # Fall back to the importable package (`pip install sqlmap`).
+    # Fall back to the importable package (`pip install sqlmap`) — but only if it
+    # is actually RUNNABLE as `python -m sqlmap`, i.e. it exposes a __main__. A
+    # squatted/placeholder `sqlmap` package is importable (find_spec("sqlmap")
+    # succeeds) yet has no __main__, so `python -m sqlmap` fails at runtime. Trust-
+    # ing find_spec("sqlmap") alone made the scan report tools.sqlmap=True for such
+    # a package and then return no findings — a scan-level false-clean ("sqlmap ran,
+    # no SQLi") when sqlmap never ran. Requiring sqlmap.__main__ (present in a real
+    # install) treats the placeholder as ABSENT, consistent with preflight.
     try:
         import importlib.util
 
-        if importlib.util.find_spec("sqlmap") is not None:
+        if (importlib.util.find_spec("sqlmap") is not None
+                and importlib.util.find_spec("sqlmap.__main__") is not None):
             import sys
 
             return [sys.executable, "-m", "sqlmap"]
