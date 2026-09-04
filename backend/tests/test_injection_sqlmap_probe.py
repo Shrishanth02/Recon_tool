@@ -1,51 +1,71 @@
-"""Regression: the sqlmap availability probe must not treat a broken/placeholder
-`sqlmap` package (importable but NOT runnable via `python -m sqlmap`) as usable.
+"""Regression: sqlmap availability probe (app.scanners.injection._sqlmap_cmd).
 
-A squatted or partial `sqlmap` pip package ships an importable ``sqlmap/__init__.py``
-with no ``__main__``. The old probe returned ``[python, -m, sqlmap]`` for it, so the
-scan reported ``tools.sqlmap = True`` while the command actually fails at runtime —
-a scan-level false-clean ("sqlmap ran, found no SQLi" when it never ran). The probe
-must require ``sqlmap.__main__`` (present in a real install) so such a package reads
-as ABSENT, consistent with ``preflight.check_tools`` (which only trusts the binary).
+The probe must find a RUNNABLE sqlmap and reject a non-runnable one:
+  * a console script / sqlmap.py on PATH        -> use it;
+  * an importable package with __main__         -> `python -m sqlmap`;
+  * the OFFICIAL PyPI package (sqlmap/sqlmap.py, thin __init__, no __main__,
+    console script often off-PATH) -> run its bundled sqlmap.py directly;
+  * a bare/placeholder package (just __init__.py, no sqlmap.py, no __main__)
+    -> ABSENT, so the scan never reports tools.sqlmap=True for a tool that
+       cannot run (which would be a scan-level false-clean).
 """
 import importlib.util
+import sys
+import types
 
 from app.scanners import injection
 
 
-def test_placeholder_sqlmap_package_without_main_is_absent(monkeypatch):
-    """Importable `sqlmap` with NO `__main__` -> _sqlmap_cmd() returns None."""
-    monkeypatch.setattr(injection.shutil, "which", lambda *_a, **_k: None)
+def _spec_for_dir(path):
+    """A minimal ModuleSpec-like object pointing at a package directory."""
+    s = types.SimpleNamespace()
+    s.origin = str(path / "__init__.py")
+    s.submodule_search_locations = [str(path)]
+    return s
+
+
+def _patch_probe(monkeypatch, *, which=None, pkg_dir=None, has_main=False):
+    monkeypatch.setattr(injection.shutil, "which", which or (lambda *_a, **_k: None))
     real = importlib.util.find_spec
 
     def fake(name, *a, **k):
         if name == "sqlmap":
-            return real("os")          # truthy spec: "importable"
+            return _spec_for_dir(pkg_dir) if pkg_dir is not None else None
         if name == "sqlmap.__main__":
-            return None                # NOT runnable via python -m
+            return object() if has_main else None
         return real(name, *a, **k)
 
     monkeypatch.setattr(importlib.util, "find_spec", fake)
+
+
+def test_bare_placeholder_package_is_absent(monkeypatch, tmp_path):
+    """Package with only __init__.py (no sqlmap.py, no __main__) -> None."""
+    (tmp_path / "__init__.py").write_text("# placeholder\n")
+    _patch_probe(monkeypatch, pkg_dir=tmp_path, has_main=False)
     assert injection._sqlmap_cmd() is None
 
 
-def test_runnable_sqlmap_package_with_main_is_used(monkeypatch):
-    """Importable `sqlmap` WITH `__main__` -> used via `python -m sqlmap`."""
-    monkeypatch.setattr(injection.shutil, "which", lambda *_a, **_k: None)
-    real = importlib.util.find_spec
-
-    def fake(name, *a, **k):
-        if name in ("sqlmap", "sqlmap.__main__"):
-            return real("os")          # both truthy
-        return real(name, *a, **k)
-
-    monkeypatch.setattr(importlib.util, "find_spec", fake)
+def test_official_pypi_package_runs_bundled_sqlmap_py(monkeypatch, tmp_path):
+    """Official shape: sqlmap/sqlmap.py present, no __main__ -> run sqlmap.py."""
+    (tmp_path / "__init__.py").write_text("# thin init\n")
+    (tmp_path / "sqlmap.py").write_text("# entry\n")
+    _patch_probe(monkeypatch, pkg_dir=tmp_path, has_main=False)
     cmd = injection._sqlmap_cmd()
-    assert cmd is not None and cmd[-2:] == ["-m", "sqlmap"]
+    assert cmd is not None
+    assert cmd[0] == sys.executable
+    assert cmd[-1].endswith("sqlmap.py")
 
 
-def test_sqlmap_binary_on_path_is_preferred(monkeypatch):
-    """A real sqlmap console script on PATH is used directly (no package probe)."""
+def test_package_with_dunder_main_uses_module_form(monkeypatch, tmp_path):
+    """A package exposing __main__ is run as `python -m sqlmap`."""
+    (tmp_path / "__init__.py").write_text("# init\n")
+    (tmp_path / "__main__.py").write_text("# main\n")
+    _patch_probe(monkeypatch, pkg_dir=tmp_path, has_main=True)
+    assert injection._sqlmap_cmd() == [sys.executable, "-m", "sqlmap"]
+
+
+def test_binary_on_path_is_preferred(monkeypatch):
+    """A real sqlmap console script on PATH wins over the package probe."""
     monkeypatch.setattr(
         injection.shutil, "which",
         lambda exe, *_a, **_k: "/usr/bin/sqlmap" if exe == "sqlmap" else None,

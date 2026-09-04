@@ -36,8 +36,10 @@ The ``result`` payload shape::
 """
 
 import json
+import os
 import re
 import shutil
+import sys
 import threading
 from typing import Iterator, List, Optional
 
@@ -64,31 +66,41 @@ _MAX_FINDINGS = 200
 def _sqlmap_cmd() -> Optional[List[str]]:
     """Return the argv prefix that launches sqlmap, or None if unavailable.
 
-    sqlmap ships in several shapes: a console script (``sqlmap``), a standalone
-    ``sqlmap.py``, or an importable Python package runnable via
-    ``python -m sqlmap``. We probe them in that order and return the first that
-    exists so the rest of the module doesn't care how it was installed.
+    sqlmap ships in several shapes: a console script (``sqlmap`` / ``sqlmap.exe``),
+    a standalone ``sqlmap.py``, or an importable Python package. We probe them in
+    order and return the first that is ACTUALLY RUNNABLE.
+
+    Crucially, the official PyPI package (``pip install sqlmap``) installs the tool
+    as ``sqlmap/sqlmap.py`` with only a thin ``__init__.py`` (no ``__main__``), and
+    its console script lands in a Scripts dir that is often NOT on PATH. So neither
+    ``shutil.which("sqlmap")`` nor ``python -m sqlmap`` finds it, and SQL injection
+    would be silently skipped even though sqlmap is installed. We therefore also
+    invoke the package's ``sqlmap.py`` directly. A bare/placeholder package (just an
+    ``__init__.py``, no ``sqlmap.py`` and no ``__main__``) still resolves to None, so
+    a non-runnable package never reports as available (no scan-level false-clean).
     """
     for exe in ("sqlmap", "sqlmap.py"):
         path = shutil.which(exe)
         if path:
             return [path]
-    # Fall back to the importable package (`pip install sqlmap`) — but only if it
-    # is actually RUNNABLE as `python -m sqlmap`, i.e. it exposes a __main__. A
-    # squatted/placeholder `sqlmap` package is importable (find_spec("sqlmap")
-    # succeeds) yet has no __main__, so `python -m sqlmap` fails at runtime. Trust-
-    # ing find_spec("sqlmap") alone made the scan report tools.sqlmap=True for such
-    # a package and then return no findings — a scan-level false-clean ("sqlmap ran,
-    # no SQLi") when sqlmap never ran. Requiring sqlmap.__main__ (present in a real
-    # install) treats the placeholder as ABSENT, consistent with preflight.
     try:
         import importlib.util
 
-        if (importlib.util.find_spec("sqlmap") is not None
-                and importlib.util.find_spec("sqlmap.__main__") is not None):
-            import sys
-
-            return [sys.executable, "-m", "sqlmap"]
+        spec = importlib.util.find_spec("sqlmap")
+        if spec is not None:
+            # (a) real console package runnable as `python -m sqlmap`.
+            if importlib.util.find_spec("sqlmap.__main__") is not None:
+                return [sys.executable, "-m", "sqlmap"]
+            # (b) official PyPI package: run its bundled sqlmap.py directly.
+            pkgdir = None
+            if spec.submodule_search_locations:
+                pkgdir = list(spec.submodule_search_locations)[0]
+            elif spec.origin:
+                pkgdir = os.path.dirname(spec.origin)
+            if pkgdir:
+                script = os.path.join(pkgdir, "sqlmap.py")
+                if os.path.isfile(script):
+                    return [sys.executable, script]
     except Exception:  # noqa: BLE001 — any import machinery hiccup ⇒ treat as absent
         pass
     return None
