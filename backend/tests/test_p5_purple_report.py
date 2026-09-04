@@ -122,21 +122,23 @@ def test_generate_purple_renders_coverage_and_gap():
 
 
 def test_generate_purple_triage_unavailable_note():
-    """A disabled triage payload renders the 'triage unavailable' note + reason."""
+    """A disabled triage payload OMITS the AI section entirely (V2): no misleading
+    'AI triage unavailable' note is rendered when triage did not run."""
     html = report.generate_purple(
         _project(), _findings(), [], _coverage(),
         triage={"enabled": False, "reason": "ANTHROPIC_API_KEY not configured"},
     )
     assert isinstance(html, str)
-    assert "triage unavailable" in html.lower()
-    assert "ANTHROPIC_API_KEY not configured" in html
+    assert "triage unavailable" not in html.lower()
+    assert "Remediation priorities" not in html
 
 
 def test_generate_purple_triage_none_is_unavailable():
-    """triage=None is treated as unavailable and does not crash."""
+    """triage=None omits the AI section (no 'unavailable' note) and does not crash."""
     html = report.generate_purple(_project(), _findings(), [], _coverage(), triage=None)
     assert isinstance(html, str)
-    assert "triage unavailable" in html.lower()
+    assert "triage unavailable" not in html.lower()
+    assert "Remediation priorities" not in html
 
 
 def test_generate_purple_renders_triage_actions():
@@ -164,12 +166,11 @@ def test_generate_purple_handles_empty_inputs():
     html = report.generate_purple({"name": "Empty Engagement"}, [], [], {}, triage=None)
     assert isinstance(html, str)
     assert "Empty Engagement" in html
-    # coverage_pct is None -> rendered as "n/a".
-    assert "n/a" in html
-    # Empty coverage => the matrix shows the "no techniques" placeholder.
-    assert "No emulated techniques" in html
+    # Empty coverage => ATT&CK validation is reported as NOT performed (V2: no
+    # misleading empty 0-detected/0-missed/0-emulated matrix).
+    assert "was not performed" in html
     # Empty findings => the findings placeholder.
-    assert "No findings recorded." in html
+    assert "No confirmed or potential findings recorded." in html
 
 
 def test_generate_purple_handles_none_coverage_and_branding():
@@ -208,7 +209,7 @@ def test_purple_report_route_member_readable(client, auth):
     assert resp.status_code == 200, resp.text
     ctype = resp.headers.get("content-type", "")
     assert "html" in ctype.lower()
-    assert "Coverage" in resp.text
+    assert "coverage" in resp.text.lower()  # testing-coverage / ATT&CK coverage content present
 
 
 # --------------------------------------------------------------------------- #
@@ -265,10 +266,11 @@ def test_purple_report_renders_triage_section_when_triage_ran(client, auth):
 
 
 def test_purple_report_triage_unavailable_when_no_triage(client, auth):
-    """With no persisted triage, the section still shows 'unavailable' (unchanged
-    behaviour) — the fix must not make an absent triage render as present."""
+    """With no persisted triage, the AI section is OMITTED (V2): an absent triage
+    must not render as present, and no misleading 'unavailable' note appears."""
     resp = client.get(
         f"/workspaces/{auth['ws_id']}/purple-report", headers=auth["headers"]
     )
     assert resp.status_code == 200, resp.text
-    assert "AI triage unavailable" in resp.text
+    assert "AI triage unavailable" not in resp.text
+    assert "Remediation priorities" not in resp.text

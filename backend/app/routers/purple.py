@@ -25,6 +25,7 @@ from .. import (
     crud,
     models,
     netguard,
+    preflight,
     purple,
     report,
     schemas,
@@ -228,8 +229,10 @@ def workspace_purple_report(
     triage = {**triage_row.data, "enabled": True} if triage_row else None
     org = crud.get_org(db, ws.org_id)
     branding = crud.org_branding(org)
+    _pf = preflight.check_tools()
+    tools = {**_pf.get("required", {}), **_pf.get("optional", {})}
     return HTMLResponse(
         report.generate_purple(
-            project, findings, scans, coverage, triage=triage, branding=branding
+            project, findings, scans, coverage, triage=triage, branding=branding, tools=tools
         )
     )

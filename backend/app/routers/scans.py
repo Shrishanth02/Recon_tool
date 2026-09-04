@@ -17,7 +17,7 @@ from fastapi import APIRouter, Depends, HTTPException, Path, Query, status
 from fastapi.responses import HTMLResponse
 from sqlalchemy.orm import Session
 
-from .. import billing, crud, execution, models, report, schemas, scope, security
+from .. import billing, crud, execution, models, preflight, report, schemas, scope, security
 from ..deps import Principal, get_current_user, get_db, get_principal, get_workspace_for_user
 from ..scanners import TOOLS, get_scanner
 
@@ -310,4 +310,8 @@ def workspace_report(
     # rendered report is byte-identical to before for unbranded orgs.
     org = crud.get_org(db, ws.org_id)
     branding = crud.org_branding(org)
-    return HTMLResponse(report.generate(project, findings, scans, branding=branding))
+    # Tool availability drives the honest coverage matrix (e.g. SQLi -> NOT TESTED
+    # when sqlmap is absent). Merge required+optional into a flat {tool: present}.
+    _pf = preflight.check_tools()
+    tools = {**_pf.get("required", {}), **_pf.get("optional", {})}
+    return HTMLResponse(report.generate(project, findings, scans, branding=branding, tools=tools))
