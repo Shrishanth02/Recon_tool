@@ -206,8 +206,10 @@ COVERAGE_AREAS = [
 ]
 
 
-def _coverage(scanners_run: set, tools: dict | None, area_has_confirmed: dict, area_has_signal: dict) -> list:
+def _coverage(scanners_run: set, tools: dict | None, area_has_confirmed: dict,
+              area_has_signal: dict, failed_scanners: set | None = None) -> list:
     tools = tools or {}
+    failed_scanners = failed_scanners or set()
     rows = []
     for area, scanner, tool in COVERAGE_AREAS:
         if scanner not in scanners_run:
@@ -217,10 +219,18 @@ def _coverage(scanners_run: set, tools: dict | None, area_has_confirmed: dict, a
             rows.append({"area": area, "status": "NOT TESTED", "result": "Tool unavailable",
                          "limitation": f"{tool} not installed on the scan host"})
         elif area_has_confirmed.get(area):
+            # A confirmed finding is proof the scanner did useful work here, even if
+            # another run of it errored — so this wins over the failed-scan guard.
             rows.append({"area": area, "status": "TESTED", "result": "Finding(s) confirmed", "limitation": ""})
         elif area_has_signal.get(area):
             rows.append({"area": area, "status": "PARTIAL", "result": "Candidate(s) detected — not validated",
                          "limitation": "Requires manual/second-identity/OAST validation"})
+        elif scanner in failed_scanners:
+            # The scanner ran but every run errored AND produced no finding for this
+            # area — results are unavailable, so it must NOT read as clean. Distinct
+            # from "No finding".
+            rows.append({"area": area, "status": "NOT TESTED", "result": "Scan failed",
+                         "limitation": f"the {scanner} scan errored; results unavailable — treat as not tested"})
         else:
             rows.append({"area": area, "status": "TESTED", "result": "No finding", "limitation": ""})
     return rows
@@ -314,7 +324,21 @@ def build_model(project: dict, findings: list, scans: list,
         return d
 
     # Coverage: which areas ran / were tested.
-    scanners_run = {(s.get("tool") or "").strip() for s in (scans or []) if s.get("tool")}
+    scans_list = scans or []
+    scanners_run = {(s.get("tool") or "").strip() for s in scans_list if s.get("tool")}
+    # A scanner "succeeded" if it has >=1 run whose status is done/partial (or no
+    # status at all — the DB default is 'done', and legacy callers omit it). A
+    # scanner whose EVERY run errored/failed/is-still-running produced no usable
+    # result, so its areas must not render as clean (false-clean guard).
+    _OK_STATUS = {"done", "complete", "completed", "success", "ok", "partial", "finished"}
+    scanner_ok: dict[str, bool] = {}
+    for s in scans_list:
+        t = (s.get("tool") or "").strip()
+        if not t:
+            continue
+        st = (s.get("status") or "done").strip().lower()
+        scanner_ok[t] = scanner_ok.get(t, False) or (st in _OK_STATUS)
+    failed_scanners = {t for t in scanners_run if not scanner_ok.get(t, True)}
     area_conf, area_sig = {}, {}
     for g in confirmed:
         for a in _areas_for(g):
@@ -322,7 +346,7 @@ def build_model(project: dict, findings: list, scans: list,
     for g in potential:
         for a in _areas_for(g):
             area_sig[a] = True
-    coverage_matrix = _coverage(scanners_run, tools, area_conf, area_sig)
+    coverage_matrix = _coverage(scanners_run, tools, area_conf, area_sig, failed_scanners)
     not_tested = [r for r in coverage_matrix if r["status"] == "NOT TESTED"]
 
     # Aggregate hardening per (asset, finding-name) — one row per distinct condition.

@@ -104,6 +104,35 @@ def test_scanner_not_run_is_not_tested():
     assert nmap["status"] == "NOT TESTED"
 
 
+def test_area_marked_not_tested_when_its_scan_errored():
+    """A scan that RAN but ERRORED must not render as 'TESTED / No finding' — that
+    would be a false-clean. It is NOT TESTED (scan failed)."""
+    m = rm.build_model({"name": "t"}, [], [{"tool": "ssrf", "status": "failed"}], tools=TOOLS)
+    ssrf = [r for r in m["coverage_matrix"] if r["area"] == "SSRF"][0]
+    assert ssrf["status"] == "NOT TESTED"
+    assert "fail" in (ssrf["result"] + ssrf["limitation"]).lower()
+
+
+def test_errored_scan_does_not_hide_a_successful_one():
+    """If the same scanner has one errored and one successful run, the area is
+    still TESTED (a good run exists)."""
+    m = rm.build_model(
+        {"name": "t"}, [],
+        [{"tool": "ssrf", "status": "failed"}, {"tool": "ssrf", "status": "done"}],
+        tools=TOOLS,
+    )
+    ssrf = [r for r in m["coverage_matrix"] if r["area"] == "SSRF"][0]
+    assert ssrf["status"] == "TESTED"
+
+
+def test_missing_scan_status_is_treated_as_successful():
+    """Back-compat: a scan record with no status field is assumed successful (the
+    DB default is 'done'), so existing callers keep their TESTED result."""
+    m = rm.build_model({"name": "t"}, [], [{"tool": "ssrf"}], tools=TOOLS)
+    ssrf = [r for r in m["coverage_matrix"] if r["area"] == "SSRF"][0]
+    assert ssrf["status"] == "TESTED"
+
+
 # ------------------------- conditional ATT&CK / AI -------------------------- #
 def test_attck_absent_when_no_emulation():
     html = report.generate_purple({"name": "t", "scope": ["x.com"]}, [_confirmed_env()], SCANS, {}, tools=TOOLS)
