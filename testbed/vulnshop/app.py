@@ -8,8 +8,14 @@ concrete things to find. Every weakness marked "VULN:" below is deliberate.
 See README.md for the full vulnerability -> scanner map.
 """
 
+import base64
+import hashlib
+import hmac
+import json as _json
 import os
 import sqlite3
+import urllib.error
+import urllib.request
 from datetime import datetime, timezone
 
 from flask import (
@@ -390,6 +396,118 @@ def swagger():
             "/api/orders": {"get": {"summary": "List orders"}},
         },
     })
+
+
+# --------------------------------------------------------------------------- #
+# VULN: application-logic lab (planted for scanner validation)
+#   JWT weaknesses, SSRF, open redirect, discoverable params, and a
+#   broken-access-control (role-differential) endpoint. All deliberate.
+# --------------------------------------------------------------------------- #
+def _b64url(raw: bytes) -> str:
+    return base64.urlsafe_b64encode(raw).rstrip(b"=").decode()
+
+
+def _make_jwt(header: dict, payload: dict, secret):
+    h = _b64url(_json.dumps(header, separators=(",", ":")).encode())
+    p = _b64url(_json.dumps(payload, separators=(",", ":")).encode())
+    if secret is None:  # VULN: alg:none -> unsigned token
+        return f"{h}.{p}."
+    sig = hmac.new(secret.encode(), f"{h}.{p}".encode(), hashlib.sha256).digest()
+    return f"{h}.{p}.{_b64url(sig)}"
+
+
+@app.route("/api/token")
+def api_token():
+    # VULN: HS256 signed with the trivial secret 'secret'; no exp; a sensitive
+    # claim ('password') sits in the (base64, non-encrypted) payload.
+    token = _make_jwt(
+        {"alg": "HS256", "typ": "JWT"},
+        {"sub": "alice", "role": "user", "password": "password1"},
+        "secret",
+    )
+    return jsonify({"token": token})
+
+
+@app.route("/api/token/none")
+def api_token_none():
+    # VULN: server issues an UNSIGNED (alg:none) token, no exp, admin claim.
+    token = _make_jwt(
+        {"alg": "none", "typ": "JWT"},
+        {"sub": "admin", "role": "admin", "admin": True},
+        None,
+    )
+    return jsonify({"token": token})
+
+
+@app.route("/fetch")
+def fetch_url():
+    # VULN: SSRF — the server fetches an arbitrary user-supplied URL and reflects
+    # the response body straight back to the caller.
+    url = request.args.get("url", "")
+    if not url:
+        return _text("Provide ?url=<target> to fetch.")
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "VoltMart-Fetcher"})
+        with urllib.request.urlopen(req, timeout=5) as r:  # noqa: S310 - intentional SSRF
+            body = r.read(200000).decode("utf-8", "replace")
+    except (urllib.error.URLError, ValueError, OSError) as exc:
+        body = f"fetch error: {exc}"
+    return _text(body)
+
+
+@app.route("/go")
+def go_redirect():
+    # VULN: open redirect (CWE-601) — 'next' (or 'url') is passed straight to
+    # redirect() with no allow-list / same-origin check. 'url' is referenced
+    # nowhere on the site (a hidden param — needs active discovery to find).
+    nxt = request.args.get("next") or request.args.get("url") or "/"
+    return redirect(nxt)
+
+
+@app.route("/promo/redirect")
+def promo_redirect():
+    # VULN: open redirect reachable via a LINKED 'next' param (discoverable by
+    # passive crawling / parameter discovery).
+    return redirect(request.args.get("next") or "/")
+
+
+@app.route("/lab")
+def lab():
+    # A crawlable page that links a parameterized endpoint (so parameter
+    # discovery has something to extract) and references it again from JS. It also
+    # links /api/lookup with NO parameter — the endpoint honours a HIDDEN 'debug'
+    # param referenced nowhere, so only active brute-forcing (arjun) finds it.
+    return Response(
+        "<!doctype html><html><body><h1>Promotions</h1>"
+        "<a href='/promo/redirect?next=/account'>Continue to your account</a>"
+        "<a href='/api/lookup'>Lookup</a>"
+        "<script>var promo = '/promo/redirect?next=/deals';</script>"
+        "</body></html>",
+        mimetype="text/html",
+    )
+
+
+@app.route("/api/lookup")
+def api_lookup():
+    # Discoverable endpoint that honours a HIDDEN 'debug' query param (referenced
+    # nowhere on the site) and reflects it — so hidden-parameter brute force
+    # (arjun) can discover 'debug' via the response differential.
+    debug = request.args.get("debug")
+    if debug is not None:
+        return jsonify({"ok": True, "debug_echo": debug, "trace": "enabled"})
+    return jsonify({"ok": True})
+
+
+@app.route("/admin/users.json")
+def admin_users_json():
+    # VULN: broken access control (role-differential / missing function-level
+    # authorization). Looks admin-only and DENIES anonymous callers, but returns
+    # the full user table to ANY logged-in user — no is_admin check.
+    if not session.get("uid"):
+        return redirect(url_for("login", next="/admin/users.json"))
+    db = get_db()
+    users = db.execute("SELECT id, username, email, is_admin FROM users").fetchall()
+    return jsonify([dict(u) for u in users])
 
 
 # --------------------------------------------------------------------------- #

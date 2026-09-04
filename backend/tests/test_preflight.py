@@ -18,6 +18,18 @@ def _patch_which(monkeypatch, present: set):
         preflight.shutil, "which",
         lambda name: f"/usr/bin/{name}" if name in present else None,
     )
+    # preflight's sqlmap/arjun availability also defers to the scanners' own
+    # discovery (which finds pip-installed, off-PATH tools). For these which-based
+    # tests to fully control availability, gate those fallbacks on `present` too —
+    # otherwise a real local sqlmap/arjun install would leak into the result.
+    monkeypatch.setattr(
+        "app.scanners.injection._sqlmap_cmd",
+        lambda: ["sqlmap"] if "sqlmap" in present else None,
+    )
+    monkeypatch.setattr(
+        "app.scanners.crawl._which",
+        lambda name: f"/x/{name}" if name in present else None,
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -89,3 +101,45 @@ def test_missing_binary_yields_clear_error_event():
         for e in events
     ), events
     assert any(e.get("type") == "returncode" and e.get("data") == 127 for e in events)
+
+
+# --------------------------------------------------------------------------- #
+# preflight must AGREE with the scanners' actual tool discovery. sqlmap and arjun
+# install via pip with a console script that lands in a Scripts dir off PATH (and
+# sqlmap's package has no __main__), so shutil.which alone misses them — but the
+# injection/crawl scanners find and RUN them. If preflight disagreed, the report's
+# coverage matrix would mark e.g. "SQL Injection: NOT TESTED / tool unavailable"
+# for a scan that actually ran sqlmap and produced a Confirmed finding.
+# --------------------------------------------------------------------------- #
+def test_preflight_agrees_with_scanner_tool_discovery():
+    """Environment-independent invariant: preflight's sqlmap/arjun availability
+    equals what the scanners can actually run (both False in CI, both True on a
+    box with the pip packages installed off-PATH)."""
+    from app.scanners import crawl
+    from app.scanners.injection import _sqlmap_cmd
+
+    opt = preflight.check_tools()["optional"]
+    assert opt["sqlmap"] == (_sqlmap_cmd() is not None)
+    assert opt["arjun"] == (crawl._which("arjun") is not None)
+
+
+def test_preflight_reports_pip_tool_when_scanner_can_run_it(monkeypatch):
+    """shutil.which sees nothing on PATH, but the scanners' own discovery says
+    sqlmap and arjun are runnable -> preflight MUST report them available, while a
+    tool nothing can run stays unavailable."""
+    monkeypatch.setattr(preflight.shutil, "which", lambda *_a, **_k: None)
+    monkeypatch.setattr(
+        "app.scanners.injection._sqlmap_cmd",
+        lambda: ["python", "/x/sqlmap/sqlmap.py"],
+    )
+    monkeypatch.setattr(
+        "app.scanners.crawl._which",
+        lambda name: "/x/Scripts/arjun.exe" if name == "arjun" else None,
+    )
+    status = preflight.check_tools()
+    assert status["optional"]["sqlmap"] is True
+    assert status["optional"]["arjun"] is True
+    assert status["optional"]["whois"] is False        # nothing can run it
+    assert status["required"]["nmap"] is False          # a required binary off PATH
+    assert "sqlmap" not in status["missing_optional"]
+    assert "arjun" not in status["missing_optional"]

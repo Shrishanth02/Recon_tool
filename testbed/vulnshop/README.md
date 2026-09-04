@@ -64,10 +64,22 @@ It's a genuine dynamic app, not a static mock:
 | 15 | **IDOR** — any order viewable | `GET /order/<id>` | manual/educational |
 | 16 | Plaintext password storage + weak creds | DB / login | manual/educational |
 | 17 | Several open service ports | host | nmap |
+| 18 | **JWT** `alg:none` (unsigned) + admin claim | `GET /api/token/none` | jwt (static analysis, CWE-347) |
+| 19 | **JWT** weak HMAC secret, no `exp`, sensitive claim | `GET /api/token` | jwt (static analysis, CWE-613/522/326) |
+| 20 | **SSRF** — server fetches a user-supplied URL and reflects it | `GET /fetch?url=` | ssrf (reflective validation, CWE-918) |
+| 21 | **Open redirect** (unvalidated `next`/`url`) | `GET /go?next=`, `GET /promo/redirect?next=` | open_redirect (CWE-601) |
+| 22 | **Hidden parameter** (referenced nowhere — needs active discovery) | `GET /api/lookup?debug=`, `GET /go?url=` | arjun / parameter discovery |
+| 23 | **Broken access control** (role-differential — any logged-in user, looks admin-only) | `GET /admin/users.json` | role_matrix (CWE-285/862) |
 
 Items 13–16 are classic app-logic bugs our **recon/nuclei** scanners won't
 auto-flag — they're here to prove the app is genuinely dynamic and to give a
 manual-testing surface. Items 1–12 and 17 are what the tool should light up.
+
+Items 18–23 are the **application-logic lab** (added for scanner validation).
+The JWT, SSRF, open-redirect, hidden-parameter and role-differential detections
+are driven with per-scanner **options** (a supplied token, request identities,
+discovered params), so they run through the pipeline or the WS `/ws/scan` path —
+the simple `GET /scan/{tool}` REST endpoint only forwards `scan_type`/`severity`.
 
 ## How to test with RECON-X
 

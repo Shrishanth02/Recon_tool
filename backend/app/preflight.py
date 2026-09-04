@@ -43,7 +43,31 @@ OPTIONAL_TOOLS: dict[str, str] = {
 
 
 def _present(tool: str) -> bool:
-    return shutil.which(tool) is not None
+    """Whether a scanner tool is actually runnable on this host.
+
+    ``shutil.which`` covers binaries on PATH, but a couple of tools install via
+    ``pip`` with a console script that lands in a Scripts dir off the interpreter's
+    PATH (and sqlmap's package ships no ``__main__``). ``shutil.which`` misses those,
+    yet the injection/crawl scanners locate and RUN them. preflight MUST agree with
+    the scanners here — otherwise the report's coverage matrix would mark an area
+    "NOT TESTED / tool unavailable" for a tool that actually ran and produced a
+    Confirmed finding. So for those tools we defer to the scanner's own discovery
+    (imported locally so preflight has no import-time dependency on the scanners).
+    """
+    if shutil.which(tool) is not None:
+        return True
+    try:
+        if tool == "sqlmap":
+            from .scanners.injection import _sqlmap_cmd
+
+            return _sqlmap_cmd() is not None
+        if tool == "arjun":
+            from .scanners.crawl import _which as _crawl_which
+
+            return _crawl_which("arjun") is not None
+    except Exception:  # noqa: BLE001 — tool discovery must never break preflight
+        pass
+    return False
 
 
 def check_tools() -> dict:
