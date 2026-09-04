@@ -9,12 +9,8 @@
     <!-- External (not inline) so the CSP can keep a strict script-src 'self';
          render-blocking in <head>, so it still applies the theme before paint. -->
     <script src="/theme-init.js"></script>
-    <link rel="preconnect" href="https://fonts.googleapis.com" />
-    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-    <link
-      href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap"
-      rel="stylesheet"
-    />
+    <!-- Native OS UI typography (Segoe UI on Windows, system fallbacks elsewhere) —
+         no external webfont dependency; matches the enterprise/endpoint look. -->
     <title>RedOpsX · Offensive Security Platform</title>
   </head>
   <body>

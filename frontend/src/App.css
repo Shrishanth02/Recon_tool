@@ -2330,7 +2330,7 @@
 .pipeline-stage-body { border-top: 1px solid var(--border); }
 
 .pipeline-stage-logs {
-  font-family: var(--font-mono, 'JetBrains Mono', monospace);
+  font-family: var(--font-mono, Consolas, monospace);
   font-size: 12px;
   line-height: 1.6;
   padding: 10px 14px;

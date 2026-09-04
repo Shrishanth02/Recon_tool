@@ -6,8 +6,8 @@
 :root {
   --radius: 12px;
   --radius-sm: 8px;
-  --font-sans: "Inter", system-ui, -apple-system, "Segoe UI", sans-serif;
-  --font-mono: "JetBrains Mono", ui-monospace, "Cascadia Code", monospace;
+  --font-sans: "Segoe UI", system-ui, -apple-system, BlinkMacSystemFont, Roboto, "Helvetica Neue", Arial, sans-serif;
+  --font-mono: Consolas, "Cascadia Mono", "Cascadia Code", ui-monospace, "SFMono-Regular", Menlo, "Liberation Mono", monospace;
 }
 
 /* -------------------------------------------------------------------
